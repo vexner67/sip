@@ -52,9 +52,13 @@ typedef struct { int64_t lo, hi; } sip_range;
  * - «атомарные» объекты (строки, массивы чисел) не содержат указателей,
  *   их не сканируют: случайное число не удержит мусор.
  *
- * Сборка запускается, когда занятая память превышает порог: вдвое больше того,
- * что пережило прошлую сборку, но не меньше 64 МБ. Короткие программы обычно
+ * Первая сборка — когда куча дорастёт до 64 МБ; следующая — когда программа займёт
+ * ещё столько новых блоков, сколько пережило сборку (но не меньше 64 МБ). Свободные
+ * места в старых блоках при этом расходуются бесплатно. Короткие программы обычно
  * не собирают мусор ни разу.
+ *
+ * Блок по адресу находится за O(1): куски выровнены на 4 МБ, карта кусков хранит
+ * байт на каждые 4 МБ адресов.
  *
  * SIP_GC=off выключает сборку, SIP_GC_STATS=1 печатает статистику в конце,
  * SIP_GC_MIN=0 собирает мусор как можно чаще (для проверки самого сборщика).
@@ -114,6 +118,8 @@ SIP_GV(size_t sip_nempty); SIP_GV(size_t sip_empty_cap);
 SIP_GV(sip_large *sip_larges);      /* большие объекты, по возрастанию адреса */
 SIP_GV(size_t sip_nlarge); SIP_GV(size_t sip_large_cap);
 SIP_GV(uintptr_t sip_lo, = UINTPTR_MAX); SIP_GV(uintptr_t sip_hi, = 0);
+/* карта кусков: байт на каждые 4 МБ адресов от sip_cmap_lo; 1 — там кусок (куски выровнены на 4 МБ) */
+SIP_GV(uint8_t *sip_cmap); SIP_GV(uintptr_t sip_cmap_lo); SIP_GV(size_t sip_cmap_n);
 
 SIP_GV(size_t sip_heap_used);       /* блоки в работе + большие объекты */
 SIP_GV(size_t sip_gc_min, = (size_t)64 << 20);  /* порог не ниже этого (SIP_GC_MIN, в МБ) */
@@ -156,11 +162,29 @@ static void sip_gc_init(void *stack_top) {
 
 /* ---- куски и блоки ---- */
 
+/* отметить кусок в карте; карта растёт, чтобы покрыть его адрес (1 байт на 4 МБ — даже 1 ТБ разброса это 256 КБ) */
+static void sip_cmap_add(uintptr_t p) {
+    uintptr_t k = p / SIP_CHUNK;
+    uintptr_t lo = sip_cmap_n ? sip_cmap_lo : k, hi = sip_cmap_n ? sip_cmap_lo + sip_cmap_n : k + 1;
+    if (k < lo) lo = k;
+    if (k >= hi) hi = k + 1;
+    if (lo != sip_cmap_lo || hi - lo != sip_cmap_n) {
+        uint8_t *m = calloc((size_t)(hi - lo), 1);
+        if (!m) sip_oom();
+        if (sip_cmap_n) memcpy(m + (sip_cmap_lo - lo), sip_cmap, sip_cmap_n);
+        free(sip_cmap);
+        sip_cmap = m;
+        sip_cmap_lo = lo;
+        sip_cmap_n = (size_t)(hi - lo);
+    }
+    sip_cmap[k - lo] = 1;
+}
+
 static void sip_new_chunk(void) {
-    size_t len = SIP_CHUNK + SIP_BLK;
+    size_t len = SIP_CHUNK * 2;  /* с запасом, чтобы выровнять кусок на 4 МБ */
     char *raw = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (raw == MAP_FAILED) sip_oom();
-    char *p = (char *)(((uintptr_t)raw + SIP_BLK - 1) & ~(uintptr_t)(SIP_BLK - 1));
+    char *p = (char *)(((uintptr_t)raw + SIP_CHUNK - 1) & ~(uintptr_t)(SIP_CHUNK - 1));
     if (p > raw) munmap(raw, (size_t)(p - raw));
     char *end = p + SIP_CHUNK;
     if (raw + len > end) munmap(end, (size_t)(raw + len - end));
@@ -172,6 +196,7 @@ static void sip_new_chunk(void) {
     size_t i = sip_nchunks++;
     while (i > 0 && sip_chunks[i - 1] > p) { sip_chunks[i] = sip_chunks[i - 1]; i--; }
     sip_chunks[i] = p;
+    sip_cmap_add((uintptr_t)p);
     if ((uintptr_t)p < sip_lo) sip_lo = (uintptr_t)p;
     if ((uintptr_t)end > sip_hi) sip_hi = (uintptr_t)end;
     if (sip_nchunks * SIP_CHUNK_BLKS > sip_empty_cap) {  /* в запас могут вернуться все блоки */
@@ -267,14 +292,8 @@ static inline void *sip_alloc_atomic(size_t n) { return sip_alloc_k(n, 1); }
 
 /* блок или большой объект, внутри которого лежит адрес (или NULL) */
 static inline sip_blk *sip_find_blk(uintptr_t w) {
-    size_t lo = 0, hi = sip_nchunks;
-    while (lo < hi) {
-        size_t mid = (lo + hi) / 2;
-        if ((uintptr_t)sip_chunks[mid] <= w) lo = mid + 1; else hi = mid;
-    }
-    if (lo == 0) return NULL;
-    uintptr_t c = (uintptr_t)sip_chunks[lo - 1];
-    if (w >= c + SIP_CHUNK) return NULL;
+    uintptr_t k = w / SIP_CHUNK - sip_cmap_lo;  /* адрес ниже карты даёт огромное k */
+    if (k >= sip_cmap_n || !sip_cmap[k]) return NULL;
     sip_blk *b = (sip_blk *)(w & ~(uintptr_t)(SIP_BLK - 1));
     return b->cls == SIP_FREE_CLS ? NULL : b;
 }
@@ -484,8 +503,11 @@ SIP_NOSAN __attribute__((noinline)) static void sip_gc_collect(void) {
     sip_mark_globals();
     sip_mark_drain();
     size_t live = sip_sweep();
-    size_t next = live * 2;
-    sip_gc_next = next > sip_gc_min ? next : sip_gc_min;
+    /* следующая сборка — когда выделим ещё max(live, min) в новых блоках; свободные места в старых блоках
+     * идут в счёт бесплатно. Цена сборки пропорциональна live, так что на байт выделенной памяти она
+     * не растёт с размером кучи. SIP_GC_MIN=0 — собирать на каждом новом блоке. */
+    size_t grow = !sip_gc_min ? 0 : live > sip_gc_min ? live : sip_gc_min;
+    sip_gc_next = sip_heap_used + grow;
     sip_gc_count++;
     if (sip_gc_stats) {
         clock_gettime(CLOCK_MONOTONIC, &t1);
