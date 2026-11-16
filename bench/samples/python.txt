@@ -1,0 +1,152 @@
+### fizzbuzz
+for i in range(1, 101):
+    if i % 15 == 0:
+        print("FizzBuzz")
+    elif i % 3 == 0:
+        print("Fizz")
+    elif i % 5 == 0:
+        print("Buzz")
+    else:
+        print(i)
+
+### sum_even_squares
+def sum_even_squares(nums: list[int]) -> int:
+    return sum(n * n for n in nums if n % 2 == 0)
+
+### user_class
+from dataclasses import dataclass
+
+@dataclass
+class User:
+    name: str
+    age: int
+    email: str
+
+    def is_adult(self) -> bool:
+        return self.age >= 18
+
+    def greet(self) -> str:
+        return f"Hello, {self.name}!"
+
+### word_freq
+from collections import Counter
+
+def top_words(path: str, n: int = 10) -> list[tuple[str, int]]:
+    with open(path) as f:
+        words = f.read().lower().split()
+    return Counter(words).most_common(n)
+
+### http_json
+import requests
+
+def get_user_name(user_id: int) -> str | None:
+    try:
+        resp = requests.get(f"https://api.example.com/users/{user_id}", timeout=5)
+        resp.raise_for_status()
+        return resp.json()["name"]
+    except (requests.RequestException, KeyError) as e:
+        print(f"error: {e}")
+        return None
+
+### shapes_match
+import math
+from dataclasses import dataclass
+
+@dataclass
+class Circle:
+    r: float
+
+@dataclass
+class Rect:
+    w: float
+    h: float
+
+@dataclass
+class Triangle:
+    b: float
+    h: float
+
+Shape = Circle | Rect | Triangle
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return math.pi * r * r
+        case Rect(w, h):
+            return w * h
+        case Triangle(b, h):
+            return 0.5 * b * h
+
+### csv_groupby
+import csv
+from collections import defaultdict
+
+def avg_salary_by_dept(path: str) -> dict[str, float]:
+    groups = defaultdict(list)
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            groups[row["dept"]].append(float(row["salary"]))
+    return {dept: sum(v) / len(v) for dept, v in groups.items()}
+
+### fib_memo
+from functools import cache
+
+@cache
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+### parse_config
+import json
+
+DEFAULTS = {"host": "localhost", "port": 8080, "debug": False}
+
+def load_config(path: str) -> dict:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return dict(DEFAULTS)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"bad config: {e}")
+    return {**DEFAULTS, **data}
+
+### concurrent_fetch
+import asyncio
+import aiohttp
+
+async def fetch(session: aiohttp.ClientSession, url: str) -> int:
+    async with session.get(url) as resp:
+        return resp.status
+
+async def fetch_all(urls: list[str]) -> list[int]:
+    async with aiohttp.ClientSession() as session:
+        return await asyncio.gather(*(fetch(session, u) for u in urls))
+
+### binary_search
+def binary_search(items: list[int], target: int) -> int:
+    lo, hi = 0, len(items) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if items[mid] == target:
+            return mid
+        if items[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+
+### cli_greet
+import argparse
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("name")
+    parser.add_argument("--times", type=int, default=1)
+    args = parser.parse_args()
+    for _ in range(args.times):
+        print(f"Hello, {args.name}!")
+
+if __name__ == "__main__":
+    main()

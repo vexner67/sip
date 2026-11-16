@@ -1,0 +1,56 @@
+### fizzbuzz
+∀ i ∈ 1‥100 → print(i%15=0 ? "FizzBuzz" : i%3=0 ? "Fizz" : i%5=0 ? "Buzz" : i)
+
+### sum_even_squares
+λ sum_even_squares(nums ∷ [ℤ]) → ℤ ≔ ∑ { n² | n ∈ nums, n%2=0 }
+
+### user_class
+τ User ⟨ name ∷ 𝕊, age ∷ ℤ, email ∷ 𝕊 ⟩
+  λ is_adult → 𝔹 ≔ .age ≥ 18
+  λ greet → 𝕊 ≔ "Hello, {.name}!"
+
+### word_freq
+λ top_words(path ∷ 𝕊, n ≔ 10) → [(𝕊, ℤ)] ≔ read(path) ▷ lower ▷ words ▷ count ▷ top(n)
+
+### http_json
+λ get_user_name(id ∷ ℤ) → 𝕊? ≔
+  http.get("https://api.example.com/users/{id}", timeout ≔ 5) ▷ json ▷ ⟦"name"⟧ ⁇ (e ↦ print("error: {e}"); ∅)
+
+### shapes_match
+τ Shape ≔ Circle(r ∷ ℝ) ∣ Rect(w ∷ ℝ, h ∷ ℝ) ∣ Triangle(b ∷ ℝ, h ∷ ℝ)
+
+λ area(s ∷ Shape) → ℝ ≔ s ≫
+  Circle(r) ↦ π·r²
+  Rect(w, h) ↦ w·h
+  Triangle(b, h) ↦ ½·b·h
+
+### csv_groupby
+λ avg_salary_by_dept(path ∷ 𝕊) → {𝕊 ↦ ℝ} ≔
+  csv.read(path) ▷ ⊞(r ↦ r.dept) ▷ ∀ᵥ(rs ↦ μ(rs ▷ ∀(r ↦ ℝ(r.salary))))
+
+### fib_memo
+@cache
+λ fib(n ∷ ℤ) → ℤ ≔ n < 2 ? n : fib(n-1) + fib(n-2)
+
+### parse_config
+DEFAULTS ≔ ⟨ host ≔ "localhost", port ≔ 8080, debug ≔ ⊥ ⟩
+
+λ load_config(path ∷ 𝕊) → ⟨⟩ ≔ read(path) ▷ json.parse ≫
+  ✗NotFound ↦ DEFAULTS
+  ✗ParseError(e) ↦ ⚠("bad config: {e}")
+  ✓data ↦ DEFAULTS ∪ data
+
+### concurrent_fetch
+⟳ λ fetch_all(urls ∷ [𝕊]) → [ℤ] ≔ urls ▷ ∀(http.get) ▷ ⟳∀ ▷ ∀(r ↦ r.status)
+
+### binary_search
+λ binary_search(items ∷ [ℤ], target ∷ ℤ) → ℤ
+  lo, hi ≔ 0, #items - 1
+  ⟲ lo ≤ hi
+    mid ≔ (lo + hi) ÷ 2
+    items[mid] = target ? ↩ mid
+    items[mid] < target ? lo ≔ mid + 1 : hi ≔ mid - 1
+  -1
+
+### cli_greet
+λ main(name ∷ 𝕊, times ≔ 1) ≔ ∀ _ ∈ 1‥times → print("Hello, {name}!")

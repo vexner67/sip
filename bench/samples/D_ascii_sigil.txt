@@ -1,0 +1,54 @@
+### fizzbuzz
+@i 1..100 : print(i%15==0 ? "FizzBuzz" : i%3==0 ? "Fizz" : i%5==0 ? "Buzz" : i)
+
+### sum_even_squares
+\sum_even_squares(nums [i]) i = nums ?{_%2==0} *{_*_} +/
+
+### user_class
+%User{name s, age i, email s}
+  \is_adult b = .age >= 18
+  \greet s = "Hello, {.name}!"
+
+### word_freq
+\top_words(path s, n=10) [(s,i)] = read(path) | lower | words | count | top(n)
+
+### http_json
+\get_user_name(id i) s? = http.get("https://api.example.com/users/{id}", timeout=5) | json | ["name"] !! {print("error: {_}"); nil}
+
+### shapes_match
+%Shape = Circle(r f) | Rect(w f, h f) | Triangle(b f, h f)
+
+\area(s Shape) f = s ~
+  Circle(r) -> pi*r*r
+  Rect(w,h) -> w*h
+  Triangle(b,h) -> 0.5*b*h
+
+### csv_groupby
+\avg_salary_by_dept(path s) {s:f} = csv.read(path) | group{_.dept} | mapv{_ *{f(_.salary)} | avg}
+
+### fib_memo
+@cache
+\fib(n i) i = n<2 ? n : fib(n-1) + fib(n-2)
+
+### parse_config
+DEFAULTS = {host:"localhost", port:8080, debug:F}
+
+\load_config(path s) {} = read(path) | json.parse ~
+  !NotFound -> DEFAULTS
+  !ParseError(e) -> fail("bad config: {e}")
+  data -> DEFAULTS + data
+
+### concurrent_fetch
+&\fetch_all(urls [s]) [i] = urls *{http.get(_)} &all *{_.status}
+
+### binary_search
+\binary_search(items [i], target i) i
+  lo, hi = 0, #items-1
+  @ lo<=hi
+    mid = (lo+hi)/2
+    items[mid]==target ? ^mid
+    items[mid]<target ? lo=mid+1 : hi=mid-1
+  -1
+
+### cli_greet
+\main(name s, times=1) = @_ 1..times : print("Hello, {name}!")

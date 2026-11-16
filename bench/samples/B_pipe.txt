@@ -1,0 +1,81 @@
+### fizzbuzz
+for i in 1..100 {
+  print(match (i % 3, i % 5) {
+    (0, 0) => "FizzBuzz",
+    (0, _) => "Fizz",
+    (_, 0) => "Buzz",
+    _ => i,
+  })
+}
+
+### sum_even_squares
+fn sum_even_squares(nums: [int]) -> int =
+  nums |> filter(n => n % 2 == 0) |> map(n => n * n) |> sum
+
+### user_class
+type User { name: str, age: int, email: str }
+
+impl User {
+  fn is_adult(self) -> bool = self.age >= 18
+  fn greet(self) -> str = "Hello, {self.name}!"
+}
+
+### word_freq
+fn top_words(path: str, n = 10) -> [(str, int)] =
+  read(path) |> lower |> words |> count |> top(n)
+
+### http_json
+fn get_user_name(id: int) -> str? =
+  http.get("https://api.example.com/users/{id}", timeout: 5)
+    |> json
+    |> get("name")
+    |> catch(e => { print("error: {e}"); nil })
+
+### shapes_match
+type Shape = Circle(r: float) | Rect(w: float, h: float) | Triangle(b: float, h: float)
+
+fn area(s: Shape) -> float = match s {
+  Circle(r) => pi * r * r,
+  Rect(w, h) => w * h,
+  Triangle(b, h) => 0.5 * b * h,
+}
+
+### csv_groupby
+fn avg_salary_by_dept(path: str) -> {str: float} =
+  csv.read(path)
+    |> group_by(r => r.dept)
+    |> map_values(rs => rs |> map(r => float(r.salary)) |> avg)
+
+### fib_memo
+@cache
+fn fib(n: int) -> int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+
+### parse_config
+let DEFAULTS = { host: "localhost", port: 8080, debug: false }
+
+fn load_config(path: str) -> dict = match read(path) |> json.parse {
+  Err(NotFound) => DEFAULTS,
+  Err(ParseError(e)) => fail("bad config: {e}"),
+  Ok(data) => DEFAULTS | data,
+}
+
+### concurrent_fetch
+async fn fetch_all(urls: [str]) -> [int] =
+  urls |> map(u => http.get(u)) |> await_all |> map(r => r.status)
+
+### binary_search
+fn binary_search(items: [int], target: int) -> int {
+  let mut lo = 0
+  let mut hi = len(items) - 1
+  while lo <= hi {
+    let mid = (lo + hi) / 2
+    if items[mid] == target { return mid }
+    if items[mid] < target { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  -1
+}
+
+### cli_greet
+fn main(name: str, times = 1) {
+  for _ in 1..times { print("Hello, {name}!") }
+}

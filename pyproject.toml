@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siplang"
+version = "0.1.0"
+description = "Sip: a token-efficient language that compiles to Python"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[project.scripts]
+sip = "siplang.cli:main"
+
+[tool.setuptools]
+packages = ["siplang"]
