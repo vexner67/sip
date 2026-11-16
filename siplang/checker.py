@@ -2105,6 +2105,18 @@ def b_abs(c, e):
     return t
 
 
+def b_ord(c, e):
+    (t,) = c.args(e, 1)
+    c.expect(STR, t, e, "ord() argument")
+    return INT
+
+
+def b_chr(c, e):
+    (t,) = c.args(e, 1)
+    c.expect(INT, t, e, "chr() argument")
+    return STR
+
+
 def b_minmax(c, e):
     ts = c.args(e, 1, 16, kw=("key",))
     keyf = c.kwarg(e, "key")
@@ -2411,7 +2423,7 @@ BUILTINS = {
     "abs": b_abs, "min": b_minmax, "max": b_minmax, "sum": b_sum, "avg": b_avg, "any": b_anyall,
     "all": b_anyall, "sorted": b_sorted, "list": b_list, "count": b_count, "read": b_read,
     "write": b_write, "input": b_input, "round": b_round, "zip": b_zip, "enumerate": b_enumerate,
-    "exit": b_exit, "set": b_set,
+    "exit": b_exit, "set": b_set, "ord": b_ord, "chr": b_chr,
 }
 
 

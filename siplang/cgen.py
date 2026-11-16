@@ -325,6 +325,8 @@ class CGen:
         from .checker import is_std
         return is_std(self.srcmap.locate(node.line)[0]) if self.srcmap is not None and node.line else False
 
+    C_NAMES = {"i8": "int8_t", "i16": "int16_t", "i32": "int32_t", "u8": "uint8_t", "u16": "uint16_t",
+               "u32": "uint32_t", "u64": "uint64_t", "usize": "size_t"}
     C_RANGE = {"int8_t": ("INT8_MIN", "INT8_MAX"), "int16_t": ("INT16_MIN", "INT16_MAX"),
                "int32_t": ("INT32_MIN", "INT32_MAX"), "uint8_t": ("0", "UINT8_MAX"),
                "uint16_t": ("0", "UINT16_MAX"), "uint32_t": ("0", "UINT32_MAX"), "uint64_t": ("0", None),
@@ -354,7 +356,8 @@ class CGen:
                 lo, hi = self.C_RANGE.get(ct, (None, None))
                 if lo is not None:
                     cond = f"{v} < {lo}" + (f" || {v} > {hi}" if hi else "")
-                    msg = c_bytes(f"argument '{name}' of {dn}() does not fit in C {ct}".encode())
+                    sip_t = {v: k for k, v in self.C_NAMES.items()}.get(ct, ct)
+                    msg = c_bytes(f"argument '{name}' of {dn}() does not fit in C {sip_t}".encode())
                     pre.append(f"if (SIP_UNLIKELY({cond})) sip_raise(SIP_E_OverflowError, SIP_LIT({msg}), {line});")
                 cparams.append(ct)
                 args.append(f"({ct}){v}")
@@ -1623,6 +1626,12 @@ class CGen:
                 self.emit(fmt_call(self.ty(a), sb, self.ex(a)))
         self.emit("sip_print_line();")
         return ""
+
+    def b_ord(self, e):
+        return f"sip_ord({self.ex(e.args[0])}, {e.line})"
+
+    def b_chr(self, e):
+        return f"sip_chr({self.ex(e.args[0])}, {e.line})"
 
     def b_len(self, e):
         (a,) = e.args

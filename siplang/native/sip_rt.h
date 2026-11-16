@@ -898,6 +898,34 @@ static int64_t sip_str_find(sip_str s, sip_str sub) {
 
 static inline bool sip_str_contains(sip_str s, sip_str sub) { return sip_str_find(s, sub) >= 0; }
 
+/* ord: код символа UTF-8; у строки из одного байта — сам байт (s[i] режет по байтам) */
+static int64_t sip_ord(sip_str s, int line) {
+    if (s.n == 1) return (unsigned char)s.p[0];
+    const unsigned char *p = (const unsigned char *)s.p;
+    int64_t n = s.n, cp = -1;
+    if (n == 2 && (p[0] & 0xE0) == 0xC0) cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+    else if (n == 3 && (p[0] & 0xF0) == 0xE0) cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    else if (n == 4 && (p[0] & 0xF8) == 0xF0)
+        cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+    if (cp < 0) sip_raisef(SIP_E_ValueError, line, "ord() expected a character, but string of length %lld found", (long long)n);
+    return cp;
+}
+
+static sip_str sip_chr(int64_t cp, int line) {
+    if (cp < 0 || cp > 0x10FFFF) sip_raisef(SIP_E_ValueError, line, "chr() arg not in range(0x110000)");
+    char *p = sip_alloc_atomic(4);
+    int n;
+    if (cp < 0x80) { p[0] = (char)cp; n = 1; }
+    else if (cp < 0x800) { p[0] = (char)(0xC0 | (cp >> 6)); p[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) {
+        p[0] = (char)(0xE0 | (cp >> 12)); p[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); p[2] = (char)(0x80 | (cp & 0x3F)); n = 3;
+    } else {
+        p[0] = (char)(0xF0 | (cp >> 18)); p[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        p[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); p[3] = (char)(0x80 | (cp & 0x3F)); n = 4;
+    }
+    return (sip_str){p, n};
+}
+
 static int64_t sip_str_rfind(sip_str s, sip_str sub) {
     if (sub.n > s.n) return -1;
     for (int64_t i = s.n - sub.n; i >= 0; i--)

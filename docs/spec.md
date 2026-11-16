@@ -323,7 +323,7 @@ from geo import Point, area as square
 print geo.area(geo.Point(1, 2)), S.shout("hi")
 ```
 
-- Модуль — это файл `.sip`. `import a.b` ищет `a/b.sip` сначала рядом с файлом, который импортирует, потом в зависимостях пакета, потом от корня пакета (папки с `sip.toml`). Имя модуля в коде — последняя часть: `import models.user` даёт `user.User`.
+- Модуль — это файл `.sip`. `import a.b` ищет `a/b.sip` сначала рядом с файлом, который импортирует, потом в зависимостях пакета, потом от корня пакета (папки с `sip.toml`), потом в стандартной библиотеке. Имя модуля в коде — последняя часть: `import models.user` даёт `user.User`.
 - Код верхнего уровня модуля выполняется один раз, до кода программы. `fn main` модуля не вызывается.
 - Одинаковые имена в разных модулях не мешают друг другу. Циклический импорт — ошибка компиляции.
 - Ошибки в модуле показывают его файл и строку: `lib/strs.sip:2: IndexError: ...`.
@@ -386,6 +386,55 @@ $ sip build main.sip
 | `json`, `csv`, `http` | ниже |
 
 `math.floor`, `ceil` и `trunc` дают `int`. `math.sqrt(-1)` бросает `ValueError: math domain error`.
+
+## Стандартная библиотека
+
+Модули `os`, `path` и `re` написаны на самом Sip (`siplang/std/*.sip`) и подключаются через `import`. Если в ваших модулях есть файл с тем же именем, `import` найдёт сначала его.
+
+```
+import os
+import path
+import re
+
+for f in os.walk("src")
+    if path.ext(f) == ".sip" and re.test("fn main", read(f))
+        print path.stem(f)
+```
+
+| модуль | функции |
+|---|---|
+| `os` | `env(name) str?`, `setenv`, `unsetenv`, `cwd`, `chdir`, `exists`, `isfile`, `isdir`, `size`, `mtime`, `listdir(dir) [str]` (по алфавиту), `walk(dir) [str]` (все файлы вглубь), `mkdir(p, parents: true)`, `remove`, `rename`, `run(cmd) int` (код выхода), `output(cmd) str` (вывод; ненулевой код — ошибка), `pid`, `platform` |
+| `path` | `join(*parts)`, `basename`, `dirname`, `ext` (`".gz"`), `stem`, `normalize` (`a/./b/../c` → `a/c`), `abs`, `isabs` |
+| `re` | `test(p, s) bool`, `full(p, s) bool`, `search(p, s) Match?`, `find(p, s) str?`, `find_all(p, s) [str]`, `matches(p, s) [Match]`, `replace(p, s, "$1")`, `replace_fn(p, s, fn(m) = ...)`, `split(p, s)` |
+
+- `re` — это POSIX ERE (как `grep -E`) и сокращения `\d \w \s \D \W \S`. Ленивых `*?` и просмотра вперёд нет. `Match(text, start, end, groups)`: позиции в байтах, `groups` — группы в скобках.
+- Ошибки файловой системы — `NotFound` (нет файла) и `IOError`. Они показываются на строке вашего кода, которая вызвала функцию библиотеки.
+
+## FFI: функции C
+
+`extern fn` объявляет функцию C, после этого её вызывают как обычную:
+
+```
+extern fn strlen(s str) usize                # libc и libm подключены всегда
+extern "sqlite3" fn sqlite3_libversion() str # библиотека: -lsqlite3
+extern "fast.c" fn dot(a ptr, b ptr, n i32) f64   # свой файл C рядом с модулем
+extern "fast.c" fn _new(n i32) ptr = vec_new      # имя в Sip и имя в C разные
+
+print strlen("hello"), sqlite3_libversion()
+```
+
+| в объявлении | в C | в Sip |
+|---|---|---|
+| `int`, `i64` / `i8 i16 i32 u8 u16 u32 u64 usize` | `int64_t` / типы того же размера | `int`; не помещается — `OverflowError` |
+| `float`, `f64` / `f32` | `double` / `float` | `float` |
+| `bool` | `bool` | `bool` |
+| `str` / `str?` | `const char *` (копия с нулём в конце) | `str`; NULL в результате — `NilError` / `nil` |
+| `ptr` / `ptr?` | `void *` | непрозрачный указатель; NULL — `NilError` / `nil` |
+
+- Строка, которую получила функция C, живёт только во время вызова. Строку из результата Sip копирует сразу.
+- `ptr` можно хранить в записях и списках и сравнивать через `==`. Память за ним освобождает код C (например, своей функцией `free`).
+- Файлы `.c` из `extern "file.c"` компилируются отдельно и берутся из кэша, как модули. Флаги для clang задаются в `sip.toml`: `[c] flags = ["-Iinclude", "-L/opt/homebrew/lib"]`. Пути в `-I` и `-L` считаются от папки пакета.
+- Обратных вызовов из C в Sip и структур по значению пока нет: для них пишут небольшую обёртку на C.
 
 ## JSON
 
@@ -498,7 +547,7 @@ sip run greet.sip Ann --times 3 --loud
 
 | тип | методы |
 |---|---|
-| `str` | `lower upper strip lstrip rstrip split splitlines find count replace startswith endswith isdigit isalpha isspace join` |
+| `str` | `lower upper capitalize title strip lstrip rstrip split splitlines find rfind count replace startswith endswith removeprefix removesuffix zfill ljust rjust isdigit isalpha isalnum isspace isupper islower join` |
 | список | `append pop insert extend clear sort reverse copy index count join sum avg top map filter sort_by group_by first` |
 | словарь | `get keys values items copy top pop update clear` |
 | множество | `add remove discard clear copy update union intersection difference issubset` |

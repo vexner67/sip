@@ -1575,6 +1575,147 @@ class LspTest(unittest.TestCase):
         self.assertEqual(bank[-1]["diagnostics"][0]["range"]["start"]["line"], 8)
 
 
+def run_path(path: str, *args) -> str:
+    """Собирает файл с диска (с его .c и модулями) так же, как build(), и запускает."""
+    global _n
+    _n += 1
+    exe = os.path.join(TMP, f"f{_n}")
+    flags = os.environ.get("SIP_TEST_CFLAGS", "-O1").split()
+    src = Path(path).read_text()
+    if WHOLE:
+        cc_build(compile_source(src, path), exe, flags)
+    else:
+        cc_build_units(compile_units(src, path)[0], exe, flags)
+    r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise AssertionError(f"exit {r.returncode}: {r.stderr}")
+    return r.stdout
+
+
+class FfiTest(unittest.TestCase):
+    GLUE = ("#include <stdio.h>\n#include <stdlib.h>\n"
+            "int add32(int a, int b) { return a + b; }\n"
+            "float half(float x) { return x / 2; }\n"
+            "const char *greet(const char *n) { static char b[64]; snprintf(b, sizeof b, \"hi, %s\", n); return b; }\n"
+            "typedef struct { int n; } counter;\n"
+            "void *counter_new(void) { return calloc(1, sizeof(counter)); }\n"
+            "int counter_inc(void *p) { return ++((counter *)p)->n; }\n"
+            "void counter_free(void *p) { free(p); }\n"
+            "const char *maybe(int x) { return x ? \"yes\" : NULL; }\n"
+            "void *null_ptr(void) { return NULL; }\n"
+            "unsigned char low(unsigned char x) { return x; }\n")
+    MAIN = ("extern fn strlen(s str) usize\n"
+            "extern fn cbrt(x float) float\n"
+            "extern fn abs(x i32) i32\n"
+            "extern fn getenv(name str) str?\n"
+            "extern \"glue.c\" fn add32(a i32, b i32) i32\n"
+            "extern \"glue.c\" fn half(x f32) f32\n"
+            "extern \"glue.c\" fn greet(name str) str\n"
+            "extern \"glue.c\" fn counter_new() ptr\n"
+            "extern \"glue.c\" fn counter_inc(c ptr) i32\n"
+            "extern \"glue.c\" fn counter_free(c ptr)\n"
+            "extern \"glue.c\" fn maybe(x i32) str?\n"
+            "extern \"glue.c\" fn null_ptr() ptr\n"
+            "extern \"glue.c\" fn _low(x u8) u8 = low\n"
+            "type Counter(h ptr)\n"
+            "print strlen(\"hello\"), cbrt(27.0), abs(-5), add32(2, 3), half(3.0)\n"
+            "print greet(\"ann\"), maybe(1), maybe(0), getenv(\"SIP_NO_SUCH_VAR\")\n"
+            "c = Counter(counter_new())\ncounter_inc(c.h)\nprint counter_inc(c.h)\ncounter_free(c.h)\n"
+            "for f in [fn() = _low(300), fn() = add32(9999999999, 1)]\n"
+            "    try\n        f()\n    catch OverflowError e\n        print e\n"
+            "try\n    null_ptr()\ncatch NilError e\n    print e\n")
+
+    def test_ffi(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"glue.c": self.GLUE, "main.sip": self.MAIN})
+        self.assertEqual(run_path(os.path.join(d, "main.sip")),
+                         "5 3.0 5 5 1.5\nhi, ann yes None None\n2\n"
+                         "argument 'x' of _low() does not fit in C u8\n"
+                         "argument 'a' of add32() does not fit in C i32\nnull_ptr() returned NULL\n")
+
+    def test_library_and_package_flags(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"sip.toml": "[package]\nname = \"app\"\n[c]\nflags = [\"-Iinc\", \"-DTWICE=2\"]\n",
+                       "inc/twice.h": "#define TW(x) ((x) * TWICE)\n",
+                       "glue.c": "#include \"twice.h\"\nlong twice(long x) { return TW(x); }\n",
+                       "main.sip": "extern \"z\" fn zlibVersion() str\nextern \"glue.c\" fn twice(x i64) i64\n"
+                                   "print len(zlibVersion()) > 0, twice(21)\n"})
+        r = sip_cli("run", cwd=d)
+        self.assertEqual((r.returncode, r.stdout), (0, "True 42\n"), r.stderr)
+
+    def test_errors(self):
+        cases = [("extern fn f(xs [int])\n", "must be int, float, bool, str, ptr"),
+                 ("extern fn f() [int]\n", "result must be int"),
+                 ("extern fn f(x int)\n    pass\n", "an extern fn has no body"),
+                 ("extern \"sip\" fn f()\n", "reserved for the standard library"),
+                 ("extern fn f[T](x T)\n", "cannot have type parameters")]
+        for src, want in cases:
+            with self.subTest(want=want):
+                self.assertIn(want, errors_of(src))
+
+    def test_missing_c_file(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"main.sip": "extern \"nope.c\" fn f()\nf()\n"})
+        r = sip_cli("run", "main.sip", cwd=d)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("C source 'nope.c' not found", r.stderr)
+
+
+class StdTest(unittest.TestCase):
+    def test_os(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        src = (f'import os\nd = "{d}"\n'
+               'os.setenv("SIP_T", "42")\nprint os.env("SIP_T"), os.env("SIP_NO_SUCH"), os.platform() != ""\n'
+               'os.mkdir(d + "/a/b", parents: true)\nos.mkdir(d + "/a/b", parents: true)\n'
+               'write(d + "/a/b/x.txt", "hi")\nwrite(d + "/top.txt", "hello")\n'
+               'print os.listdir(d), len(os.walk(d)), os.isdir(d + "/a"), os.isfile(d + "/top.txt")\n'
+               'print os.size(d + "/top.txt"), os.exists(d + "/zzz")\n'
+               'os.rename(d + "/top.txt", d + "/t2.txt")\nos.remove(d + "/t2.txt")\nprint os.listdir(d)\n'
+               'print os.output("echo hi; echo there").splitlines(), os.run("exit 3")\n'
+               'try\n    os.output("exit 2")\ncatch e\n    print e\n'
+               'try\n    os.listdir(d + "/missing")\ncatch NotFound e\n    print "nf"\n')
+        self.assertEqual(run(src), "42 None True\n['a', 'top.txt'] 2 True True\n5 False\n['a']\n"
+                                   "['hi', 'there'] 3\ncommand failed (exit 2): exit 2\nnf\n")
+
+    def test_error_points_at_the_caller(self):
+        err = failure('import os\nx = 1\nos.listdir("/no/such/dir")\n')
+        self.assertIn("t.sip:3: NotFound: /no/such/dir: No such file or directory", err)
+        self.assertIn('os.listdir("/no/such/dir")', err)
+
+    def test_path(self):
+        self.assertEqual(run('import path\n'
+                             'print path.join("a", "b", "c.txt"), path.join("a/", "/abs", "x")\n'
+                             'print path.basename("a/b.txt"), path.dirname("a/b.txt"), path.dirname("b"), '
+                             'path.dirname("/b")\n'
+                             'print path.ext("x.tar.gz"), path.ext(".bashrc"), path.stem("a/b.txt")\n'
+                             'print path.normalize("a/./b/../c//d"), path.normalize("/../x"), '
+                             'path.normalize("../a/.."), path.abs("q").startswith("/")\n'),
+                         "a/b/c.txt /abs/x\nb.txt a  /\n.gz  b\na/c/d /x .. True\n")
+
+    def test_re(self):
+        self.assertEqual(run('import re\n'
+                             'print re.test("\\d+", "ab12"), re.find("\\d+", "ab12cd345"), re.find("z", "abc")\n'
+                             'print re.find_all("\\d+", "ab12cd345"), re.find_all("[\\w.]+@\\w+", "a.b@x, c@y")\n'
+                             'm = re.search("(\\w+)@(\\w+)\\.com", "mail: ann@example.com!")\nprint m\n'
+                             'print re.replace("(\\w+)@(\\w+)", "ann@x bob@y", "$2:$1 $$"), '
+                             're.split("[,;] *", "a, b;c,d")\n'
+                             'print re.replace_fn("\\d+", "a1b22", fn(m) = str(int(m.text) * 2)), '
+                             're.full("[a-z]+", "abc"), re.full("[a-z]+", "abc1"), re.find_all("x*", "ab")\n'
+                             'try\n    re.test("(", "x")\ncatch ValueError e\n    print "bad"\n'),
+                         "True 12 None\n['12', '345'] ['a.b@x', 'c@y']\n"
+                         "Match(text='ann@example.com', start=6, end=21, groups=['ann', 'example'])\n"
+                         "x:ann $ y:bob $ ['a', 'b', 'c', 'd']\na2b44 True False ['', '', '']\nbad\n")
+
+    def test_str_methods(self):
+        self.assertEqual(run('s = "hello world"\n'
+                             'print s.rfind("o"), s.rfind("z"), s.removeprefix("hello "), s.removesuffix("x")\n'
+                             'print "42".zfill(5), "-42".zfill(5), "ab".ljust(4) + "|", "ab".rjust(4)\n'
+                             'print "a1".isalnum(), "a-1".isalnum(), "AB1".isupper(), "ab".islower(), "1".isupper()\n'
+                             'print s.capitalize(), s.title(), "hELLO".capitalize()\n'),
+                         "7 -1 world hello world\n00042 -0042 ab  |   ab\nTrue False True True False\n"
+                         "Hello world Hello World Hello\n")
+
+
 class ExamplesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

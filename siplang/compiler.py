@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .errors import SipError
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 CFLAGS = ["-O3", "-march=native", "-fwrapv", "-fno-math-errno", "-w"]
 
 

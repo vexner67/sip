@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "siplang"
-version = "0.4.0"
+version = "0.5.0"
 description = "Sip: a token-efficient language compiled to native code via C"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -16,4 +16,4 @@ sip = "siplang.cli:main"
 packages = ["siplang"]
 
 [tool.setuptools.package-data]
-siplang = ["native/*.h"]
+siplang = ["native/*.h", "std/*.sip"]

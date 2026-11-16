@@ -449,7 +449,7 @@ class Parser:
         csym = name
         if self.accept("="):
             csym = self.expect("NAME", "the name of the C function (extern fn has no body)").value
-        elif self.at(":"):
+        elif self.at(":") or (self.at("NEWLINE") and self.peek(1).kind == "INDENT"):
             self.error("an extern fn has no body: it is implemented in C")
         self.end_line()
         fn = FnDef(name, params, ret, [], line=tok.line)
