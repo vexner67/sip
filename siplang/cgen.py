@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import re
+import zlib
 from pathlib import Path
 
 from .checker import ERROR_KINDS, Program
@@ -41,6 +42,11 @@ def c_bytes(data: bytes) -> str:
         else:
             out.append(f"\\{b:03o}")
     return '"' + "".join(out) + '"'
+
+
+def err_id(t) -> int:
+    """Номер вида ошибки для типа-значения: один и тот же в каждой единице компиляции."""
+    return 1000 + zlib.crc32(T_.key(t).encode()) % 1_000_000_000
 
 
 def has_call(node) -> bool:
@@ -789,8 +795,17 @@ class CGen:
         return f"sip_sb_done(&{sb})"
 
     def s_Fail(self, s):
-        msg = self.to_str(self.ex(s.value), self.ty(s.value))
-        self.emit(f"sip_raise(SIP_E_Error, {msg}, {s.line});")
+        if getattr(s, "kind", None):
+            msg = self.to_str(self.ex(s.msg), self.ty(s.msg)) if s.msg is not None else 'SIP_LIT("")'
+            self.emit(f"sip_raise(SIP_E_{s.kind}, {msg}, {s.line});")
+            return
+        t = getattr(s, "typed", None)
+        code = self.ex(s.value)
+        if t is not None:
+            obj = self.spill(code, t)
+            self.emit(f"sip_raise_obj({err_id(self.ty(s.value))}, {obj}, {self.to_str(obj, self.ty(s.value))}, {s.line});")
+            return
+        self.emit(f"sip_raise(SIP_E_Error, {self.to_str(code, self.ty(s.value))}, {s.line});")
 
     def s_Assert(self, s):
         c = self.cond(s.cond)
@@ -814,14 +829,19 @@ class CGen:
         self.emit("} else {")
         self.depth += 1
         for i, h in enumerate(s.handlers):
-            if h.kind is None or h.kind == "Exception":
+            et = getattr(h, "err_type", None)
+            if et is not None:
+                c = f"sip_err_kind == {err_id(et)}"
+                if h.tag is not None:
+                    c += f" && (({self.c(et)})sip_err_obj)->tag == {h.tag}"
+            elif h.kind is None or h.kind == "Exception":
                 c = "1"
             else:
                 c = f"sip_kind_matches(sip_err_kind, SIP_E_{h.kind})"
             self.emit(("if" if i == 0 else "} else if") + f" ({c}) {{")
             self.depth += 1
             if h.name:
-                self.emit(f"{h.var.cname} = sip_err_msg;")
+                self.emit(f"{h.var.cname} = " + (f"({self.c(et)})sip_err_obj;" if et is not None else "sip_err_msg;"))
             self.block(h.body)
             self.depth -= 1
         self.emit("} else {")
@@ -1152,6 +1172,8 @@ class CGen:
     def binop_code(self, op, lt, rt, res, lc, rc, line) -> str:
         lt, rt, res = deep(lt), deep(rt), deep(res)
         both_int = lt is INT and rt is INT
+        if op in ("+", "-", "*") and both_int:
+            return f"sip_{ {'+': 'add', '-': 'sub', '*': 'mul'}[op]}({lc}, {rc}, {line})"
         if op in ("+", "-", "*") and lt in (INT, FLOAT) and rt in (INT, FLOAT):
             return f"({lc} {op} {rc})"
         if op == "/":
@@ -1167,11 +1189,11 @@ class CGen:
         if op == "+" and lt is STR:
             return f"sip_str_concat({lc}, {rc})"
         if op == "*" and lt is STR:
-            return f"sip_str_repeat({lc}, {rc})"
+            return f"sip_str_repeat({lc}, {rc}, {line})"
         if op == "+" and isinstance(lt, ListT):
             return f"{self.k(res)}_concat({lc}, {rc})"
         if op == "*" and isinstance(lt, ListT):
-            return f"{self.k(lt)}_repeat({lc}, {rc})"
+            return f"{self.k(lt)}_repeat({lc}, {rc}, {line})"
         if op == "|" and isinstance(lt, DictT):
             return f"{self.k(res)}_merge({lc}, {rc})"
         if isinstance(lt, SetT):
@@ -1281,6 +1303,8 @@ class CGen:
         code = self.ex(e.operand)
         if e.op == "not":
             return f"(!{self.truthy(code, self.ty(e.operand))})"
+        if e.op == "-" and deep(self.ty(e.operand)) is INT:
+            return f"sip_neg({code}, {e.line})"
         return f"({e.op}{code})"
 
     def e_IfExpr(self, e):
@@ -1391,7 +1415,13 @@ class CGen:
         if kind == "sum":
             acc = self.tmp(self.c(res), "acc")
             self.emit(f"{acc} = 0;")
-            self.each(node, lambda c, t: self.emit(f"{acc} += {c};"))
+            if res is INT:
+                # сумма единиц (подсчёт) не переполнится раньше, чем кончится цикл; без проверки
+                # такой цикл векторизуется
+                self.each(node, lambda c, t: self.emit(f"{acc} += {c};" if c in ("0", "1")
+                                                       else f"{acc} = sip_add({acc}, {c}, {line});"))
+            else:
+                self.each(node, lambda c, t: self.emit(f"{acc} += {c};"))
             return acc
         if kind == "avg":
             acc = self.tmp("double", "acc")
@@ -1463,7 +1493,7 @@ class CGen:
         code = self.ex(a)
         if t is STR:
             return f"sip_parse_int({code}, {e.line})"
-        return code if t is INT else f"((int64_t)({code}))"
+        return code if t is INT else f"sip_f2i({code}, {e.line})"
 
     def b_float(self, e):
         (a,) = e.args
@@ -1479,7 +1509,7 @@ class CGen:
     def b_abs(self, e):
         (a,) = e.args
         code = self.ex(a)
-        return f"llabs({code})" if self.ty(a) is INT else f"fabs({code})"
+        return f"sip_iabs({code}, {e.line})" if deep(self.ty(a)) is INT else f"fabs({code})"
 
     def minmax(self, e):
         if e.minmax_seq and getattr(e, "minmax_key", None) is not None:
@@ -1613,7 +1643,7 @@ class CGen:
         if len(e.args) == 2:
             x, n = self.eval_args(e.args)
             return f"sip_round_to((double)({x}), {n})"
-        return f"sip_round((double)({self.ex(e.args[0])}))"
+        return f"sip_round((double)({self.ex(e.args[0])}), {e.line})"
 
     def b_zip(self, e):
         (ac, at), (bc, bt) = self.as_list(e.args[0]), self.as_list(e.args[1])
@@ -1682,15 +1712,15 @@ class CGen:
     def b_math_floor(self, e):
         a = [f"(double)({c})" if self.ty(x) is INT and "gcd" not in "floor" else c
              for c, x in zip(self.eval_args(e.args), e.args)]
-        return "((int64_t)floor({0}))".format(*a, L=e.line)
+        return "sip_f2i(floor({0}), {L})".format(*a, L=e.line)
     def b_math_ceil(self, e):
         a = [f"(double)({c})" if self.ty(x) is INT and "gcd" not in "ceil" else c
              for c, x in zip(self.eval_args(e.args), e.args)]
-        return "((int64_t)ceil({0}))".format(*a, L=e.line)
+        return "sip_f2i(ceil({0}), {L})".format(*a, L=e.line)
     def b_math_trunc(self, e):
         a = [f"(double)({c})" if self.ty(x) is INT and "gcd" not in "trunc" else c
              for c, x in zip(self.eval_args(e.args), e.args)]
-        return "((int64_t)trunc({0}))".format(*a, L=e.line)
+        return "sip_f2i(trunc({0}), {L})".format(*a, L=e.line)
     def b_math_atan2(self, e):
         a = [f"(double)({c})" if self.ty(x) is INT and "gcd" not in "atan2" else c
              for c, x in zip(self.eval_args(e.args), e.args)]

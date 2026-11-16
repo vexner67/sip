@@ -303,8 +303,9 @@ class Parser:
         while self.at("catch"):
             htok = self.advance()
             kind = name = None
-            if self.at("NAME") and self.peek().value[0].isupper():
-                kind = self.parse_dotted()
+            if self.at("NAME") and (self.peek().value[0].isupper()
+                                    or (self.peek(1).kind == "." and is_word(self.peek(2)))):
+                kind = self.parse_dotted()  # ValueError, NotEnough, bank.NotEnough
             if self.at("NAME"):
                 name = self.advance().value
             elif self.accept("as"):

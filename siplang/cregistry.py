@@ -596,7 +596,7 @@ class Registry:
             "copy": f"static {k} {k}_copy({k} l)",
             "concat": f"static {k} {k}_concat({k} a, {k} b)",
             "extend": f"static void {k}_extend({k} a, {k} b)",
-            "repeat": f"static {k} {k}_repeat({k} l, int64_t times)",
+            "repeat": f"static {k} {k}_repeat({k} l, int64_t times, int line)",
             "contains": f"static bool {k}_contains({k} l, {ce} x)",
             "index": f"static int64_t {k}_index({k} l, {ce} x, int line)",
             "count": f"static int64_t {k}_count({k} l, {ce} x)",
@@ -659,7 +659,10 @@ class Registry:
 }}
 {sigs['extend']} {{ int64_t n = b->n; for (int64_t i = 0; i < n; i++) {k}_push(a, b->d[i]); }}
 {sigs['repeat']} {{
-    {k} r = {k}_new(times > 0 ? l->n * times : 0);
+    int64_t total = 0;
+    if (times > 0 && (__builtin_mul_overflow(l->n, times, &total) || total > ((int64_t)1 << 40)))
+        sip_raise(SIP_E_OverflowError, SIP_LIT("repeated list is too long"), line);
+    {k} r = {k}_new(total);
     for (int64_t t = 0; t < times; t++) for (int64_t i = 0; i < l->n; i++) {k}_push(r, l->d[i]);
     return r;
 }}

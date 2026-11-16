@@ -24,7 +24,7 @@ fn describe(x int) str                    # блочное тело
 
 | Sip | что это | в C |
 |---|---|---|
-| `int` | 64-битное целое, при переполнении заворачивается | `int64_t` |
+| `int` | 64-битное целое; выход за пределы бросает `OverflowError` | `int64_t` |
 | `float` | число двойной точности | `double` |
 | `bool` | `true`, `false` | `bool` |
 | `str` | неизменяемая строка UTF-8; `len` и индексы считают байты | указатель и длина |
@@ -148,6 +148,7 @@ print if i % 3 == 0 then "Fizz" else i     # ветки str и другого т
 
 - `true`, `false`. Питоновские `True`, `False` тоже работают.
 - `/` для двух целых делит нацело с округлением вниз: `7 / 2 == 3`, `-7 / 2 == -4`. `%` следует правилам Python. Деление на ноль бросает `ZeroDivisionError`.
+- Целые не переполняются молча. Если результат `+ - * ** // -x abs sum` не помещается в 64 бита, бросается `OverflowError: integer overflow`. То же бывает, когда `int(x)`, `round`, `math.floor` получают слишком большое число с плавающей точкой или когда `int("...")` получает слишком длинную строку цифр. `int(nan)` бросает `ValueError`. У `float` поведение IEEE: `1e308 * 10 == inf`.
 - `{host: "x", port: "80"}` — ключ без кавычек становится строкой. В генераторе `{k: v for k in xs}` ключ — переменная.
 - `a | b` объединяет словари, `a + b` склеивает списки и строки, `[0] * n` повторяет.
 - Строки интерполируются: `"Hi {name}, {x:.2f}, {n:>5}, {k:03d}"`. Внутри `{}` можно писать любое выражение. `{{` и `}}` дают буквальные скобки.
@@ -274,8 +275,37 @@ catch e                                   # ловит всё, e — текст 
     print "error: {e}"
 ```
 
-- `fail "сообщение"` бросает `Error`. `assert x > 0, "msg"` бросает `AssertionError`.
-- Виды: `NotFound` (файла нет), `IOError`, `ParseError` (плохое число; ловится и как `ValueError`), `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`, `AssertionError`, `NilError` (`nil` там, где нужно значение), `HttpError` (ответ 4xx/5xx). `catch Exception` ловит всё.
+- `fail "сообщение"` бросает `Error`, а `fail ValueError("сообщение")` бросает ошибку встроенного вида. `assert x > 0, "msg"` бросает `AssertionError`.
+- Виды: `NotFound` (файла нет), `IOError`, `ParseError` (плохое число; ловится и как `ValueError`), `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`, `OverflowError` (целое не помещается в 64 бита), `AssertionError`, `NilError` (`nil` там, где нужно значение), `HttpError` (ответ 4xx/5xx). `catch Exception` ловит всё.
+
+### Типизированные ошибки
+
+Ошибкой может быть значение записи или типа-суммы. `catch Тип e` ловит только его, а в `e` оказывается само значение со всеми полями:
+
+```
+type NotEnough(need int, have int)
+type BankError = Frozen(why str) | Closed
+
+fn withdraw(bal int, x int) int
+    if x > bal then fail NotEnough(x, bal)
+    if bal == 0 then fail Closed
+    return bal - x
+
+try
+    withdraw(10, 50)
+catch NotEnough e
+    print "не хватает {e.need - e.have}"
+catch Frozen e                            # один вариант суммы; e имеет тип BankError
+    print e
+catch BankError e                         # любой вариант
+    print "bank: {e}"
+```
+
+- Ошибку из модуля ловят по полному имени: `catch bank.NotEnough e`.
+- `catch e` и `catch Exception e` ловят и типизированные ошибки; в `e` тогда текст значения: `NotEnough(need=50, have=10)`.
+- Если ошибку не поймали, печатается само значение: `prog.sip:5: NotEnough(need=50, have=10)`.
+- Ошибка проходит через `await` и `all(...)` без изменений.
+- Обобщённые типы (`Box[T]`) ловить пока нельзя.
 - Непойманная ошибка печатает одну строку и строку исходника, код выхода 1:
 
 ```

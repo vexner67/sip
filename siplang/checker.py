@@ -22,7 +22,7 @@ NEED_TEXT = {"ord": "comparison with < (or sorting, min, max)", "hash": "use as 
 
 ERROR_KINDS = ["Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
                "ZeroDivisionError", "AssertionError", "IOError", "NilError",
-               "HttpError"]
+               "HttpError", "OverflowError"]
 CATCH_ALL = {"Exception"}
 
 UNSUPPORTED = "is not supported by the native compiler yet"
@@ -848,8 +848,8 @@ class Checker:
                 elif isinstance(s, Try):
                     walk(s.body)
                     for h in s.handlers:
-                        if h.name:
-                            add(h.name)
+                        if h.name and not self.typed_kind(h.kind):
+                            add(h.name)  # переменная ошибки-значения живёт только в своём catch
                         walk(h.body)
                 elif isinstance(s, Match):
                     for a in s.arms:
@@ -1049,9 +1049,47 @@ class Checker:
         pass
 
     def s_Fail(self, s):
-        t = self.expr(s.value)
-        if prune(t) is UNIT:
+        v = s.value
+        if (isinstance(v, Call) and isinstance(v.func, Name) and v.func.id in ERROR_KINDS
+                and v.func.id not in self.p.fns and v.func.id not in self.p.records
+                and v.func.id not in self.p.variants):
+            # fail ValueError("bad input") — встроенный вид с сообщением
+            if v.kwargs or len(v.args) > 1:
+                self.err(f"{v.func.id}() takes one message argument", v)
+            s.kind = v.func.id
+            s.msg = v.args[0] if v.args else None
+            if s.msg is not None and prune(self.expr(s.msg)) is UNIT:
+                self.err("the error message needs a value", s.msg)
+            return
+        t = prune(self.expr(v))
+        if t is UNIT:
             self.err("fail needs a value", s)
+        if isinstance(t, (RecordT, SumT)):
+            s.typed = t  # ошибка-значение: ловится через catch ИмяТипа e
+
+    def typed_kind(self, kind) -> bool:
+        p = getattr(self, "p", None)
+        return p is not None and kind is not None and (kind in p.records or kind in p.sums or kind in p.variants)
+
+    def handler_kind(self, h):
+        """catch Kind: встроенный вид, запись, тип-сумма или один её вариант."""
+        h.err_type = h.tag = None
+        kind = h.kind
+        if kind is None or kind in CATCH_ALL:
+            return STR
+        t = self.p.records.get(kind) or self.p.sums.get(kind)
+        if t is None and kind in self.p.variants:
+            t = self.p.variants[kind]
+            h.tag = list(t.variants).index(kind)
+        if t is None:
+            if kind in ERROR_KINDS:
+                return STR
+            self.err(f"unknown error kind '{kind}'; catch a record or sum type, or one of: "
+                     f"{', '.join(ERROR_KINDS)}", h)
+        if t.params:
+            self.err(f"catch on a generic type {UNSUPPORTED}", h)
+        h.err_type = t
+        return t
 
     def s_Assert(self, s):
         self.cond(s.cond)
@@ -1095,8 +1133,15 @@ class Checker:
             self.block_lambda().has_try = True
         self.block(s.body)
         for h in s.handlers:
-            if h.kind is not None and h.kind not in ERROR_KINDS and h.kind not in CATCH_ALL:
-                self.err(f"unknown error kind '{h.kind}'; known: {', '.join(ERROR_KINDS)}", h)
+            vt = self.handler_kind(h)
+            if h.name and vt is not STR:
+                var = Var(h.name, vt, self.fresh(f"c_{h.name}_"), "comp")
+                (self.lambdas[-1].extra if self.lambdas else self.cur.extra).append(var)
+                h.var = var
+                self.scopes.append({h.name: var})
+                self.block(h.body)
+                self.scopes.pop()
+                continue
             if h.name:
                 var = self.lookup(h.name)
                 self.expect(var.ty, STR, h, f"catch variable '{h.name}' (it holds the message)")

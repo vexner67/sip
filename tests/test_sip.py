@@ -97,8 +97,8 @@ class SemanticsTest(unittest.TestCase):
     def test_division_by_zero(self):
         self.assertIn("ZeroDivisionError", failure("x = 0\nprint 1 / x"))
 
-    def test_int_is_64_bit_and_wraps(self):
-        self.assertEqual(run("x = 9223372036854775807\nprint x, x + 1"),
+    def test_int_is_64_bit(self):
+        self.assertEqual(run("x = 9223372036854775807\nprint x, -x - 1"),
                          "9223372036854775807 -9223372036854775808\n")
 
     def test_float_repr_matches_python(self):
@@ -1061,6 +1061,88 @@ print maybe.name(), d["b"].name(), d
         for src, want in cases:
             with self.subTest(want=want):
                 self.assertIn(want, errors_of(src))
+
+
+class OverflowTest(unittest.TestCase):
+    MAX = "big = 9223372036854775807\nlow = -big - 1\n"
+
+    def test_arithmetic_overflow_raises(self):
+        cases = ["big + 1", "low - 1", "big * 2", "-low", "abs(low)", "low // -1", "3 ** 41",
+                 "sum([big, 1])", "[big, 1].sum()", "int(1e19)", "int(-1e300)", "round(1e19)",
+                 "math.floor(1e19)", 'int("9223372036854775808")', '"ab" * big', "[1] * big"]
+        for expr in cases:
+            with self.subTest(expr=expr):
+                err = failure("import math\n" + self.MAX + f"print {expr}")
+                self.assertIn("OverflowError", err)
+
+    def test_aug_assign_overflow(self):
+        self.assertIn("t.sip:4: OverflowError: integer overflow",
+                      failure(self.MAX + "n = 2\nn *= big\n"))
+
+    def test_edges_that_fit(self):
+        self.assertEqual(run(self.MAX + "print big - 1 + 1, low + 0, low % -1, low // 1, 2 ** 62, 3 ** 39, "
+                             "(-2) ** 63, int(-9.2e18), abs(-big)"),
+                         "9223372036854775807 -9223372036854775808 0 -9223372036854775808 "
+                         "4611686018427387904 4052555153018976267 -9223372036854775808 "
+                         "-9200000000000000000 9223372036854775807\n")
+
+    def test_overflow_is_catchable(self):
+        self.assertEqual(run(self.MAX + "try\n    print big + 1\ncatch OverflowError e\n    print \"caught: {e}\"\n"
+                             "try\n    print int(float(\"nan\"))\ncatch ValueError e\n    print e\n"),
+                         "caught: integer overflow\ncannot convert float NaN to integer\n")
+
+    def test_float_arithmetic_is_unchecked(self):
+        self.assertEqual(run("x = 1e308\nprint x * 10, -(x * 10)"), "inf -inf\n")
+
+
+class TypedErrorTest(unittest.TestCase):
+    BANK = ("type NotEnough(need int, have int)\n"
+            "type BankError = Frozen(why str) | Closed\n"
+            "fn take(bal int, x int) int\n"
+            "    if x > bal then fail NotEnough(x, bal)\n"
+            "    if x == 13 then fail Frozen(\"unlucky\")\n"
+            "    if x == 0 then fail Closed\n"
+            "    if x < 0 then fail ValueError(\"negative: {x}\")\n"
+            "    return bal - x\n")
+
+    def test_catch_by_type(self):
+        src = self.BANK + (
+            "for x in [50, 500, 13, 0, -1]\n"
+            "    try\n        print take(100, x)\n"
+            "    catch NotEnough e\n        print \"need {e.need} have {e.have}\"\n"
+            "    catch Frozen e -> print \"frozen {e}\"\n"
+            "    catch BankError e -> print \"bank {e}\"\n"
+            "    catch ValueError e -> print \"value {e}\"\n")
+        self.assertEqual(run(src), "50\nneed 500 have 100\nfrozen Frozen(why='unlucky')\nbank Closed()\n"
+                                   "value negative: -1\n")
+
+    def test_catch_all_gets_the_repr(self):
+        self.assertEqual(run(self.BANK + "try\n    take(1, 5)\ncatch e\n    print e\n"
+                             "try\n    take(1, 5)\ncatch Error e\n    print \"no\"\ncatch Exception e\n    print e\n"),
+                         "NotEnough(need=5, have=1)\nNotEnough(need=5, have=1)\n")
+
+    def test_uncaught_shows_the_value(self):
+        err = failure(self.BANK + "take(1, 5)\n")
+        self.assertIn("t.sip:4: NotEnough(need=5, have=1)", err)
+
+    def test_other_types_pass_through(self):
+        err = failure(self.BANK + "try\n    take(1, 5)\ncatch BankError e\n    print \"no\"\n")
+        self.assertIn("NotEnough(need=5, have=1)", err)
+
+    def test_typed_error_through_async_and_modules(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"bank.sip": self.BANK + "async fn slow(x int) int = take(10, x)\n",
+                       "main.sip": "import bank\nasync fn main()\n"
+                                   "    try\n        print await all([bank.slow(1), bank.slow(20)])\n"
+                                   "    catch bank.NotEnough e\n        print e.need\n"})
+        r = sip_cli("run", os.path.join(d, "main.sip"))
+        self.assertEqual((r.returncode, r.stdout), (0, "20\n"), r.stderr)
+
+    def test_errors(self):
+        self.assertIn("unknown error kind 'Nope'", errors_of("try\n    pass\ncatch Nope e\n    pass\n"))
+        self.assertIn("catch on a generic type", errors_of("type Box[T](v T)\ntry\n    pass\ncatch Box e\n    pass\n"))
+        self.assertIn("expected str, got E", errors_of("type E(c int)\ntry\n    pass\ncatch E e\n    x: str = e\n"))
+        self.assertIn("takes one message argument", errors_of("fail ValueError(\"a\", \"b\")\n"))
 
 
 class GcTest(unittest.TestCase):

@@ -344,8 +344,11 @@ class Renamer:
         if isinstance(node, (PCapture, PStar)):
             node.name = self.new(node.name, local) or node.name
             return node
-        if isinstance(node, Handler) and node.name:
-            node.name = self.new(node.name, local) or node.name
+        if isinstance(node, Handler):
+            if node.kind:
+                node.kind = self.dotted(node.kind, node, local)
+            if node.name:
+                node.name = self.new(node.name, local) or node.name
         if isinstance(node, Variant) and node.name in self.names:
             node.display = node.name
             node.name = self.names[node.name]

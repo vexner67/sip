@@ -503,18 +503,22 @@ static void sip_gc_now(void) {
 enum {
     SIP_E_Error, SIP_E_NotFound, SIP_E_ParseError, SIP_E_IndexError, SIP_E_KeyError,
     SIP_E_ValueError, SIP_E_ZeroDivisionError, SIP_E_AssertionError, SIP_E_IOError, SIP_E_NilError,
-    SIP_E_HttpError
+    SIP_E_HttpError, SIP_E_OverflowError, SIP_E_NKINDS
 };
 static const char *const sip_err_names[] = {
     "Error", "NotFound", "ParseError", "IndexError", "KeyError",
-    "ValueError", "ZeroDivisionError", "AssertionError", "IOError", "NilError", "HttpError"
+    "ValueError", "ZeroDivisionError", "AssertionError", "IOError", "NilError", "HttpError", "OverflowError"
 };
+/* Ошибки-значения (fail NotEnough(5, 2)): вид — номер типа (>= SIP_E_USER), объект — в sip_err_obj,
+ * в сообщении — его запись: NotEnough(need=5, have=2). */
+#define SIP_E_USER 1000
 
 typedef struct sip_try { jmp_buf jb; struct sip_try *prev; } sip_try;
 SIP_GV(sip_try *sip_try_top);
 SIP_GV(int sip_err_kind);
 SIP_GV(sip_str sip_err_msg);
 SIP_GV(int sip_err_line);
+SIP_GV(void *sip_err_obj);
 
 static inline void sip_try_push(sip_try *t) { t->prev = sip_try_top; sip_try_top = t; }
 static inline void sip_try_pop(void) { sip_try_top = sip_try_top->prev; }
@@ -559,8 +563,12 @@ __attribute__((noreturn, cold)) static void sip_die(void) {
     int f = 0;
     while (f + 1 < SIP_NFILES && SIP_FILES[f + 1].start < sip_err_line) f++;
     int local = sip_err_line - SIP_FILES[f].start;
-    fprintf(stderr, "%s:%d: %s", SIP_FILES[f].name, local, sip_err_names[sip_err_kind]);
-    if (sip_err_msg.n) fprintf(stderr, ": %.*s", (int)sip_err_msg.n, sip_err_msg.p);
+    if (sip_err_kind >= SIP_E_USER) {
+        fprintf(stderr, "%s:%d: %.*s", SIP_FILES[f].name, local, (int)sip_err_msg.n, sip_err_msg.p);
+    } else {
+        fprintf(stderr, "%s:%d: %s", SIP_FILES[f].name, local, sip_err_names[sip_err_kind]);
+        if (sip_err_msg.n) fprintf(stderr, ": %.*s", (int)sip_err_msg.n, sip_err_msg.p);
+    }
     fputc('\n', stderr);
     if (local > 0 && local <= *SIP_FILES[f].n) {
         const char *s = SIP_FILES[f].lines[local - 1];
@@ -577,11 +585,20 @@ __attribute__((noreturn, cold)) static void sip_reraise(void) {
     longjmp(t->jb, 1);
 }
 
-__attribute__((noreturn, cold)) static void sip_raise(int kind, sip_str msg, int line) {
+__attribute__((noreturn, cold)) static void sip_raise_obj(int kind, void *obj, sip_str msg, int line) {
     sip_err_kind = kind;
+    sip_err_obj = obj;
     sip_err_msg = msg;
     sip_err_line = line;
     sip_reraise();
+}
+
+__attribute__((noreturn, cold)) static void sip_raise(int kind, sip_str msg, int line) {
+    sip_raise_obj(kind, NULL, msg, line);
+}
+
+__attribute__((noreturn, cold, noinline)) static void sip_overflow(int line) {
+    sip_raise(SIP_E_OverflowError, SIP_LIT("integer overflow"), line);
 }
 
 __attribute__((noreturn, cold)) static void sip_raisef(int kind, int line, const char *fmt, ...);
@@ -653,8 +670,42 @@ static inline void sip_print_line(void) {
 
 /* ---------- числа ---------- */
 
+/* int — 64 бита со знаком; выход за пределы — OverflowError, а не тихое переполнение */
+static inline int64_t sip_add(int64_t a, int64_t b, int line) {
+    int64_t r;
+    if (SIP_UNLIKELY(__builtin_add_overflow(a, b, &r))) sip_overflow(line);
+    return r;
+}
+
+static inline int64_t sip_sub(int64_t a, int64_t b, int line) {
+    int64_t r;
+    if (SIP_UNLIKELY(__builtin_sub_overflow(a, b, &r))) sip_overflow(line);
+    return r;
+}
+
+static inline int64_t sip_mul(int64_t a, int64_t b, int line) {
+    int64_t r;
+    if (SIP_UNLIKELY(__builtin_mul_overflow(a, b, &r))) sip_overflow(line);
+    return r;
+}
+
+static inline int64_t sip_neg(int64_t a, int line) {
+    if (SIP_UNLIKELY(a == INT64_MIN)) sip_overflow(line);
+    return -a;
+}
+
+static inline int64_t sip_iabs(int64_t a, int line) { return a < 0 ? sip_neg(a, line) : a; }
+
+/* float -> int: NaN — ValueError, бесконечность и слишком большие числа — OverflowError */
+static inline int64_t sip_f2i(double x, int line) {
+    if (SIP_LIKELY(x > -9223372036854775809.0 && x < 9223372036854775808.0)) return (int64_t)x;
+    if (x != x) sip_raise(SIP_E_ValueError, SIP_LIT("cannot convert float NaN to integer"), line);
+    sip_raise(SIP_E_OverflowError, SIP_LIT("float is too large for an int"), line);
+}
+
 static inline int64_t sip_floordiv(int64_t a, int64_t b, int line) {
     if (SIP_UNLIKELY(b == 0)) sip_raise(SIP_E_ZeroDivisionError, SIP_LIT("division by zero"), line);
+    if (SIP_UNLIKELY(b == -1)) return sip_neg(a, line);
     int64_t q = a / b;
     if ((a % b != 0) && ((a < 0) != (b < 0))) q--;
     return q;
@@ -662,6 +713,7 @@ static inline int64_t sip_floordiv(int64_t a, int64_t b, int line) {
 
 static inline int64_t sip_mod(int64_t a, int64_t b, int line) {
     if (SIP_UNLIKELY(b == 0)) sip_raise(SIP_E_ZeroDivisionError, SIP_LIT("modulo by zero"), line);
+    if (SIP_UNLIKELY(b == -1)) return 0;
     int64_t r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
     return r;
@@ -684,14 +736,17 @@ static inline double sip_fmod(double a, double b, int line) {
 static int64_t sip_ipow(int64_t a, int64_t b, int line) {
     if (b < 0) sip_raise(SIP_E_ValueError, SIP_LIT("negative exponent for int; use a float"), line);
     int64_t r = 1;
-    while (b) { if (b & 1) r *= a; a *= a; b >>= 1; }
+    while (b) {
+        if (b & 1) r = sip_mul(r, a, line);
+        b >>= 1;
+        if (b) a = sip_mul(a, a, line);
+    }
     return r;
 }
 
-static inline int64_t sip_round(double x) {
+static inline int64_t sip_round(double x, int line) {
     /* как в Python: банковское округление */
-    double r = nearbyint(x);
-    return (int64_t)r;
+    return sip_f2i(nearbyint(x), line);
 }
 
 static inline double sip_round_to(double x, int64_t nd) {
@@ -754,9 +809,12 @@ static sip_str sip_str_concat(sip_str a, sip_str b) {
     return (sip_str){p, a.n + b.n};
 }
 
-static sip_str sip_str_repeat(sip_str s, int64_t k) {
+static sip_str sip_str_repeat(sip_str s, int64_t k, int line) {
     if (k <= 0 || !s.n) return SIP_LIT("");
-    char *p = sip_alloc_atomic((size_t)(s.n * k));
+    int64_t total;
+    if (__builtin_mul_overflow(s.n, k, &total) || total > ((int64_t)1 << 48))
+        sip_raise(SIP_E_OverflowError, SIP_LIT("repeated string is too long"), line);
+    char *p = sip_alloc_atomic((size_t)total);
     for (int64_t i = 0; i < k; i++) memcpy(p + i * s.n, s.p, (size_t)s.n);
     return (sip_str){p, s.n * k};
 }
@@ -863,7 +921,10 @@ static int64_t sip_parse_int(sip_str s, int line) {
     char *end;
     errno = 0;
     long long v = strtoll(buf, &end, 10);
-    if (*end || errno) goto bad;
+    if (*end) goto bad;
+    if (errno == ERANGE)
+        sip_raisef(SIP_E_OverflowError, line, "int out of range: '%.*s'", (int)(s.n > 40 ? 40 : s.n), s.p);
+    if (errno) goto bad;
     return v;
 bad:
     sip_raisef(SIP_E_ParseError, line, "invalid int: '%.*s'", (int)(s.n > 40 ? 40 : s.n), s.p);
@@ -1839,6 +1900,7 @@ typedef struct sip_task {
     int state;  /* 0 — не запускалась, 1 — выполняется, 2 — готова, 3 — ошибка */
     int ek, el;
     sip_str em;
+    void *eo;
 } sip_task;
 
 /* выполнить задачу в текущем потоке; ошибка запоминается в задаче */
@@ -1853,6 +1915,7 @@ static void sip_task_exec(sip_task *t) {
     } else {
         t->state = 3;
         t->ek = sip_err_kind;
+        t->eo = sip_err_obj;
         t->em = sip_err_msg;
         t->el = sip_err_line;
     }
@@ -1861,7 +1924,7 @@ static void sip_task_exec(sip_task *t) {
 static void sip_task_await(sip_task *t, int line) {
     if (t->state == 0) sip_task_exec(t);
     else if (t->state == 1) sip_raise(SIP_E_Error, SIP_LIT("a task cannot await itself"), line);
-    if (t->state == 3) sip_raise(t->ek, t->em, t->el);
+    if (t->state == 3) sip_raise_obj(t->ek, t->eo, t->em, t->el);
 }
 
 typedef struct { sip_task **ts; int64_t n, next; } sip_pool;
@@ -1909,7 +1972,7 @@ static void sip_gather(sip_task **ts, int64_t n, int line) {
         pthread_attr_destroy(&attr);
     }
     for (int64_t i = 0; i < n; i++) {
-        if (ts[i]->state == 3) sip_raise(ts[i]->ek, ts[i]->em, ts[i]->el);
+        if (ts[i]->state == 3) sip_raise_obj(ts[i]->ek, ts[i]->eo, ts[i]->em, ts[i]->el);
         if (ts[i]->state == 1) sip_raise(SIP_E_Error, SIP_LIT("a task cannot await itself"), line);
     }
 }
