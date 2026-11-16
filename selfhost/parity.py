@@ -18,8 +18,7 @@ from siplang.errors import SipError  # noqa: E402
 from siplang.lexer import tokenize  # noqa: E402
 from siplang.parser import parse  # noqa: E402
 from siplang.checker import check_program  # noqa: E402
-from siplang.modules import NATIVE, load_program  # noqa: E402
-from siplang.nodes import FromImport, Import  # noqa: E402
+from siplang.modules import STD_DIR, load_program  # noqa: E402
 from siplang.types import show  # noqa: E402
 from dataclasses import fields, is_dataclass  # noqa: E402
 
@@ -116,18 +115,72 @@ def py_check(src: str, name: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def single_file(path: str) -> bool:
-    """Программа без импорта других файлов .sip: такие проверяет checker.sip."""
-    with open(path, encoding="utf-8", newline="") as f:
-        src = f.read()
-    try:
-        mod = parse(src, path)
-    except SipError:
-        return True
-    for s in mod.body:
-        if isinstance(s, (Import, FromImport)) and s.module not in NATIVE:
-            return False
-    return True
+# программы из нескольких файлов: {путь: текст}, корень — main.sip
+PROJECTS = [
+    {"main.sip": "import utils\nfrom utils import twice as tw, Point\nimport utils as u\n"
+                 "p = Point(1, 2)\nprint utils.twice(3), tw(4), u.twice(p.x), utils.LIMIT\n"
+                 "fn main()\n    q: utils.Point = utils.origin()\n    print q.y\n",
+     "utils.sip": "LIMIT = 10\ntype Point(x int, y int)\nfn twice(n int) int = n * 2\n"
+                  "fn origin() Point = Point(0, 0)\n"},
+    {"main.sip": "import a.b\nprint b.f()\n", "a/b.sip": "import c\nfn f() int = c.g() + 1\n",
+     "a/c.sip": "fn g() int = 41\n"},
+    {"main.sip": "import x\n", "x.sip": "import y\n", "y.sip": "import x\n"},
+    {"main.sip": "import nope\n"},
+    {"main.sip": "from utils import missing\n", "utils.sip": "fn f() = 1\n"},
+    {"main.sip": "from utils import _hidden\n", "utils.sip": "fn _hidden() int = 1\n"},
+    {"main.sip": "import utils\nprint utils._hidden()\n", "utils.sip": "fn _hidden() int = 1\n"},
+    {"main.sip": "import utils\nprint utils.nothing\n", "utils.sip": "x = 1\n"},
+    {"main.sip": "import utils\nprint utils\n", "utils.sip": "x = 1\n"},
+    {"main.sip": "import acct\na = acct.open(5)\nprint a._bal\n",
+     "acct.sip": "type Acct(name str, _bal int = 0)\nfn open(n int) Acct = Acct(\"x\", n)\n"},
+    {"main.sip": "import acct\na = acct.Acct(\"bob\")\nprint a.name, a.balance()\nb = acct.Acct(\"c\", 5)\n",
+     "acct.sip": "type Acct(name str, _bal int = 0)\n    fn balance() int = ._bal\n    fn _secret() int = 1\n"},
+    {"main.sip": "import acct\na = acct.Acct(\"bob\")\nprint a._secret()\n",
+     "acct.sip": "type Acct(name str, _bal int = 0)\n    fn _secret() int = 1\n"},
+    {"main.sip": "import acct\nmatch acct.Acct(\"b\")\n    acct.Acct(n, b) -> print n, b\n",
+     "acct.sip": "type Acct(name str, _bal int = 0)\n"},
+    {"main.sip": "import shapes\nfn area(s shapes.Shape) float = match s\n"
+                 "    shapes.Circle(r) -> 3.0 * r * r\n    shapes.Sq(a) -> a * a\nprint area(shapes.Sq(2.0))\n"
+                 "print shapes.biggest([shapes.Circle(1.0)])\n",
+     "shapes.sip": "type Shape = Circle(r float) | Sq(a float)\nfn biggest(xs [Shape]) Shape = xs[0]\n"},
+    {"main.sip": "import box\nb = box.Box[int](3)\nprint b.get(), box.first([1, 2])\nprint box.Box(\"s\").get()\n",
+     "box.sip": "type Box[T](v T)\n    fn get() T = .v\nfn first[T](xs [T]) T = xs[0]\n"},
+    {"main.sip": "import util\nprint util.f(\"a\")\n", "util.sip": "fn f(n int) int = n\n"},
+    {"main.sip": "import util\nprint util.f(1, 2)\n", "util.sip": "fn f(n int) int = n\n"},
+    {"main.sip": "import util\n", "util.sip": "type T = A | B\ntype A(x int)\n"},
+    {"main.sip": "import util\n", "util.sip": "fn f(\n"},
+    {"main.sip": "import util\n", "util.sip": "x = 1\ny = \"a\" + 1\n"},
+    {"main.sip": "import re\nimport path\nimport os\nm = re.search(\"(\\\\d+)\", \"ab12\")\n"
+                 "if m != nil then print m.groups\nprint path.join(\"a\", \"b\"), os.cwd() != \"\"\n"},
+    {"main.sip": "import math\nfrom json import parse\nimport random as r\nx: [int] = parse(\"[1]\")\n"
+                 "print math.sqrt(2), r.randint(1, 2), x\n"},
+    {"main.sip": "import math as m\nprint m\n"},
+    {"main.sip": "from math import nope\n"},
+    {"main.sip": "import kit\nfrom kit.fmt import pad\nprint kit.shout(\"a\"), pad(\"b\")\n",
+     "sip.toml": "[package]\nname = \"app\"\n\n[deps]\nkit = { path = \"../kit\" }\n",
+     "../kit/sip.toml": "[package]\nname = \"kit\"\n",
+     "../kit/kit.sip": "import fmt\nfn shout(s str) str = fmt.pad(s.upper())\n",
+     "../kit/fmt.sip": "fn pad(s str) str = \" \" + s\n"},
+    {"main.sip": "import lib.geo\nfrom lib.geo import dist\nprint dist(1.0, 2.0), geo.ORIGIN\n",
+     "lib/geo.sip": "import lib.helpers\nORIGIN = 0.0\nfn dist(a float, b float) float = helpers.sq(a - b)\n",
+     "lib/helpers.sip": "fn sq(x float) float = x * x\n"},
+    {"main.sip": "import a\nimport b\nprint a.Item(1), b.Item(\"x\")\n",
+     "a.sip": "type Item(n int)\n", "b.sip": "type Item(s str)\n"},
+    {"main.sip": "import a\nx: a.Item = a.Item(\"no\")\n", "a.sip": "type Item(n int)\n"},
+]
+
+
+def write_projects(tmp):
+    roots = []
+    for i, files in enumerate(PROJECTS):
+        d = os.path.join(tmp, f"proj{i}", "app")
+        for rel, text in files.items():
+            p = os.path.normpath(os.path.join(d, rel))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+        roots.append(os.path.join(d, "main.sip"))
+    return roots
 
 
 CORPUS = os.path.join(os.path.expanduser("~"), ".cache", "sip", "selfhost-corpus")
@@ -199,13 +252,13 @@ PARSER_CASES = [
 ]
 
 
-def compare(exe, inputs, want_fn, what):
+def compare(exe, inputs, want_fn, what, extra=()):
     bad = 0
     for p in inputs:
         with open(p, encoding="utf-8", newline="") as f:
             src = f.read()
         want = want_fn(src, p)
-        got = subprocess.run([exe, p], capture_output=True, text=True).stdout
+        got = subprocess.run([exe, p, *extra], capture_output=True, text=True).stdout
         if got != want:
             bad += 1
             wl, gl = want.splitlines(), got.splitlines()
@@ -237,14 +290,15 @@ def main(argv):
     lex_in = (write_cases(tmp, "case", CASES) if not argv else []) + files
     par_in = (write_cases(tmp, "pcase", PARSER_CASES + CASES) if not argv else []) + files
     corpus = sorted(glob.glob(os.path.join(CORPUS, "*.sip"))) if not argv else []
-    chk_in = [p for p in par_in + corpus if single_file(p)]
+    chk_in = par_in + corpus + (write_projects(tmp) if not argv else [])
     bad = 0
     if only in (None, "lexer"):
         bad += compare(build_cached(os.path.join(ROOT, "selfhost", "lexer.sip")), lex_in, py_dump, "lexer")
     if only in (None, "parser"):
         bad += compare(build_cached(os.path.join(ROOT, "selfhost", "parser.sip")), par_in, py_ast, "parser")
     if only in (None, "checker"):
-        bad += compare(build_cached(os.path.join(ROOT, "selfhost", "checker.sip")), chk_in, py_check, "checker")
+        bad += compare(build_cached(os.path.join(ROOT, "selfhost", "checker.sip")), chk_in, py_check, "checker",
+                       ["--std", STD_DIR])
     return 1 if bad else 0
 
 

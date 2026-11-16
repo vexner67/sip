@@ -1,11 +1,12 @@
 # Проверка типов Sip на самом Sip: перенос siplang/checker.py и siplang/types.py.
-# Пока для одной программы в одном файле: встроенные модули (math, json, http, ...) есть,
-# импорт других файлов .sip — ещё нет (он в загрузчике модулей).
+# Модули загружает selfhost/modules.sip: вся программа приходит сюда одним деревом.
 # sip run selfhost/checker.sip FILE.sip печатает дерево с типом каждого выражения или первую ошибку.
 
 import lexer
 import parser
+import modules
 from parser import N, mk, S, L, T, NONE
+from modules import NATIVE, SipErr, isn, nm, flag, walk_assigned, assigned
 
 UNSUPPORTED = "is not supported by the native compiler yet"
 ERROR_KINDS = ["Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
@@ -35,7 +36,7 @@ type Var(name str, ty Ty, kind str)
 # У экземпляра Box[int] base — Box; поля, варианты и методы хранит base.
 type Ty(k str, id int, name str = "", a [Ty] = [], ref Ty? = nil, base Ty? = nil, params [Ty] = [],
         fields {str: Ty} = {}, defaults {str: N} = {}, variants {str: [Field]} = {}, methods {str: Fn} = {},
-        imethods {str: Sig} = {}, bound Ty? = nil, needs {str: bool} = {}, display str = "")
+        imethods {str: Sig} = {}, bound Ty? = nil, needs {str: bool} = {}, display str = "", mod str = "")
 
 type Fn(node N, name str, ret Ty, owner Ty? = nil, params [PInfo] = [], locals {str: Var} = {}, body [N] = [],
         state str = "new", cache bool = false, tparams [Ty] = [], allparams [Ty] = [], tscope {str: Ty} = {},
@@ -274,19 +275,8 @@ DICT_METHODS = {"pop", "update", "clear", "get", "keys", "values", "items", "cop
 SET_METHODS = {"add", "remove", "discard", "clear", "copy", "update", "union", "intersection", "difference",
                "issubset"}
 
-NATIVE = {
-    "math": {"sqrt", "floor", "ceil", "trunc", "log", "log2", "log10", "exp", "sin", "cos", "tan", "asin",
-             "acos", "atan", "atan2", "hypot", "pow", "isnan", "isinf", "gcd", "pi", "e", "inf", "nan", "tau"},
-    "random": {"random", "randint", "uniform", "choice", "shuffle", "seed"},
-    "time": {"time", "sleep", "perf_counter"},
-    "json": {"parse", "stringify", "read", "write"},
-    "csv": {"read", "write", "parse"},
-    "http": {"get", "post", "Response"},
-}
 
 # ---------- узлы ----------
-
-fn isn(n N) bool = n.kind == "None"
 
 fn opt_n(n N) N?
     if n.kind == "None" then return nil
@@ -298,13 +288,12 @@ fn is_nil_opt(e N?) bool
     if e == nil then return false
     is_nil(e)
 
-fn nm(n N) str = n.kids[0].s
-
-fn flag(n N) bool = n.s == "True"
-
 fn copy_n(n N) N = N(n.kind, n.line, n.s, [copy_n(k) for k in n.kids])
 
 fn is_extern(fnode N) bool = len(fnode.kids) == 9
+
+# имя определения в исходнике модуля (после переименования utils__f это f)
+fn dname(n N) str = if n.s != "" then n.s else nm(n)
 
 # неявный return: последнее выражение функции — её результат
 fn tail(stmts [N]) [N]
@@ -350,228 +339,6 @@ fn literal_default(e N) bool
         return true
     false
 
-# имена, которым что-то присваивается (локальные переменные); kinds — имена записей и сумм,
-# у catch Kind e такая переменная живёт только в своём catch
-fn add_name(names [str], n str)
-    if n not in names then names.append(n)
-
-fn assign_target(t N, names [str])
-    if t.kind == "Name"
-        add_name(names, nm(t))
-    elif t.kind == "TupleLit"
-        for i in t.kids[0].kids
-            assign_target(i, names)
-    pass
-
-fn pattern_names(pt N, names [str])
-    k = pt.kind
-    if k == "PCapture" or k == "PStar"
-        add_name(names, nm(pt))
-    elif k == "PClass"
-        for a in pt.kids[1].kids
-            pattern_names(a, names)
-        for kv in pt.kids[2].kids
-            pattern_names(kv.kids[1], names)
-    elif k == "PTuple" or k == "PList"
-        for a in pt.kids[0].kids
-            pattern_names(a, names)
-    pass
-
-fn walk_assigned(ss [N], names [str], augs [str], use_augs bool, kinds {str})
-    for s in ss
-        k = s.kind
-        if k == "FnDef"
-            add_name(names, nm(s))
-        elif k == "Assign"
-            for t in s.kids[0].kids
-                assign_target(t, names)
-        elif k == "AugAssign" and use_augs and s.kids[0].kind == "Name"
-            if nm(s.kids[0]) not in augs then augs.append(nm(s.kids[0]))
-        elif k == "AugAssign" or k == "AnnAssign"
-            assign_target(s.kids[0], names)
-        elif k == "For"
-            assign_target(s.kids[0], names)
-            walk_assigned(s.kids[2].kids, names, augs, use_augs, kinds)
-        elif k == "While"
-            walk_assigned(s.kids[1].kids, names, augs, use_augs, kinds)
-        elif k == "If"
-            for b in s.kids[0].kids
-                walk_assigned(b.kids[1].kids, names, augs, use_augs, kinds)
-            if not isn(s.kids[1]) then walk_assigned(s.kids[1].kids, names, augs, use_augs, kinds)
-        elif k == "With"
-            for it in s.kids[0].kids
-                if not isn(it.kids[1]) then add_name(names, it.kids[1].s)
-            walk_assigned(s.kids[1].kids, names, augs, use_augs, kinds)
-        elif k == "Try"
-            walk_assigned(s.kids[0].kids, names, augs, use_augs, kinds)
-            for h in s.kids[1].kids
-                if not isn(h.kids[1]) and (isn(h.kids[0]) or h.kids[0].s not in kinds)
-                    add_name(names, h.kids[1].s)
-                walk_assigned(h.kids[2].kids, names, augs, use_augs, kinds)
-        elif k == "Match"
-            for a in s.kids[1].kids
-                pattern_names(a.kids[0], names)
-                walk_assigned(a.kids[2].kids, names, augs, use_augs, kinds)
-    pass
-
-fn assigned(stmts [N], kinds {str}) [str]
-    names: [str] = []
-    augs: [str] = []
-    walk_assigned(stmts, names, augs, false, kinds)
-    names
-
-fn target_names(t N) {str}
-    out: {str} = set()
-    if t.kind == "Name"
-        out.add(nm(t))
-    elif t.kind == "TupleLit"
-        for i in t.kids[0].kids
-            out = out | target_names(i)
-    out
-
-type CheckError(msg str, line int)
-
-fn is_std(path str) bool = path.find("/siplang/std/") >= 0
-
-# ---------- переименование (siplang/modules.py, Renamer): math.sqrt -> имя math.sqrt ----------
-
-type Renamer(names {str: str}, natives {str: str})
-    fn err(msg str, node N)
-        fail CheckError(msg, node.line)
-
-    fn new(name str, local {str}) str
-        if name in local then return ""
-        got = .names.get(name)
-        if got == nil then return ""
-        got
-
-    fn member(alias str, attr str, node N, local {str}) str
-        if alias in local or alias in .names then return ""
-        mod = ""
-        got = .natives.get(alias)
-        if got != nil
-            mod = got
-        elif alias in NATIVE
-            mod = alias
-        if mod != ""
-            if attr not in NATIVE[mod] then .err("module '{mod}' has no '{attr}'", node)
-            return mod + "." + attr
-        ""
-
-    fn dotted(name str, node N, local {str}) str
-        if name.find(".") >= 0
-            i = name.find(".")
-            got = .member(name[:i], name[i + 1:], node, local)
-            return if got != "" then got else name
-        got = .new(name, local)
-        if got != "" then got else name
-
-    fn process(body [N]) [N]
-        rest: [N] = []
-        for s in body
-            if s.kind == "Import"
-                module = s.kids[0].s
-                parts = module.split(".")
-                alias = if isn(s.kids[1]) then parts[len(parts) - 1] else s.kids[1].s
-                if module not in NATIVE
-                    fail CheckError("importing .sip modules is not supported by the self-hosted checker yet", s.line)
-                .natives[alias] = module
-            elif s.kind == "FromImport"
-                module = s.kids[0].s
-                for pair in s.kids[1].kids
-                    n = pair.kids[0].s
-                    alias = if isn(pair.kids[1]) then n else pair.kids[1].s
-                    if module not in NATIVE
-                        fail CheckError("importing .sip modules is not supported by the self-hosted checker yet",
-                                        s.line)
-                    if n not in NATIVE[module] then fail CheckError("module '{module}' has no '{n}'", s.line)
-                    .names[alias] = "{module}.{n}"
-            else
-                rest.append(s)
-        [.top(s) for s in rest]
-
-    fn top(s N) N
-        k = s.kind
-        if (k == "FnDef" or k == "Record" or k == "SumType" or k == "Interface") and nm(s) in .names
-            s.kids[0] = S(.names[nm(s)])
-        empty: {str} = set()
-        .rn(s, empty)
-
-    fn rn_all(n N, local {str})
-        for i in 0..len(n.kids) - 1
-            n.kids[i] = .rn(n.kids[i], local)
-        pass
-
-    fn rn(n N, local0 {str}) N
-        local = local0
-        k = n.kind
-        if k == "list" or k == "tuple"
-            .rn_all(n, local)
-            return n
-        if k == "str" or k == "None" or k == "bool" or k == "extern" then return n
-        if k == "Name"
-            got = .new(nm(n), local)
-            if got != ""
-                n.kids[0] = S(got)
-            elif nm(n) not in local and nm(n) in .natives
-                .err("module '{nm(n)}' cannot be used as a value", n)
-            return n
-        if k == "Attr" and n.kids[0].kind == "Name"
-            got = .member(nm(n.kids[0]), n.kids[1].s, n, local)
-            if got != "" then return mk("Name", n.line, [S(got)])
-        if k == "TName" or k == "PClass" then n.kids[0] = S(.dotted(nm(n), n, local))
-        if k == "PValue" then return mk("PClass", n.line, [S(.dotted(nm(n), n, local)), L([]), L([])])
-        if k == "PCapture" or k == "PStar"
-            got = .new(nm(n), local)
-            if got != "" then n.kids[0] = S(got)
-            return n
-        if k == "Handler"
-            if not isn(n.kids[0]) then n.kids[0] = S(.dotted(n.kids[0].s, n, local))
-            if not isn(n.kids[1])
-                got = .new(n.kids[1].s, local)
-                if got != "" then n.kids[1] = S(got)
-        if k == "Variant" and nm(n) in .names then n.kids[0] = S(.names[nm(n)])
-        if (k == "Record" or k == "SumType") and n.kids[3].kids
-            local = local | {tp.kids[0].s for tp in n.kids[3].kids}  # T в полях — не имя модуля
-        if k == "FnDef"
-            n.kids[7] = .rn(n.kids[7], local)
-            local = local | {tp.kids[0].s for tp in n.kids[7].kids}
-            inner = local | {p.kids[0].s for p in n.kids[1].kids}
-            for a in assigned(n.kids[3].kids, set())
-                inner.add(a)
-            if flag(n.kids[6]) then inner.add("self")
-            for p in n.kids[1].kids
-                .rn(p, local)  # тип и значение по умолчанию — снаружи
-            n.kids[2] = .rn(n.kids[2], local)
-            n.kids[3] = .rn(n.kids[3], inner)
-            return n
-        if k == "Lambda"
-            n.kids[2] = .rn(n.kids[2], local)
-            inner = local | {p.s for p in n.kids[0].kids}
-            if not isn(n.kids[3])
-                for a in assigned(n.kids[3].kids, set())
-                    inner.add(a)
-                n.kids[3] = .rn(n.kids[3], inner)
-            else
-                n.kids[1] = .rn(n.kids[1], inner)
-            return n
-        if k == "Comp"
-            bound: {str} = set()
-            for c in n.kids[3].kids
-                bound = bound | target_names(c.kids[0])
-            inner = local | bound
-            first = true
-            for c in n.kids[3].kids
-                c.kids[1] = .rn(c.kids[1], if first then local else inner)
-                first = false
-                c.kids[0] = .rn(c.kids[0], inner)
-                c.kids[2] = .rn(c.kids[2], inner)
-            n.kids[1] = .rn(n.kids[1], inner)
-            n.kids[2] = .rn(n.kids[2], inner)
-            return n
-        .rn_all(n, local)
-        n
-
 # ---------- проверка ----------
 
 type Lam(block bool, ret Ty)
@@ -580,7 +347,7 @@ type Typed(node N, ty Ty, name str)
 
 type Inst(params [Ty], args [Ty], node N, what str)
 
-type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {str: Ty} = {},
+type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {str: Ty} = {}, sums {str: Ty} = {},
              variants {str: Ty} = {}, ifaces {str: Ty} = {}, fns {str: Fn} = {}, methods [Fn] = [],
              globals {str: Var} = {}, tops [Fn] = [], cur Fn? = nil, scopes [{str: Var}] = [], lams [Lam] = [],
              typed [Typed] = [], nils [N] = [], tscope {str: Ty} = {}, inst_checks [Inst] = [],
@@ -590,7 +357,25 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
 
     fn err(msg str, node N? = nil)
         line = if node == nil then 0 else node.line
-        fail CheckError(msg, line)
+        f = .file
+        if line != 0
+            f, line = .loader.locate(line)
+        fail SipErr(msg, f, line, 0)
+
+    # файл, в котором написан узел
+    fn mod_of(node N) str
+        if node.line == 0 then return .file
+        f, _ = .loader.locate(node.line)
+        f
+
+    fn is_std(f str) bool = f != "" and modules.abspath(f).startswith(.std + "/")
+
+    # поле или метод на _ доступны только в модуле, где объявлен тип
+    fn private(t Ty, name str, node N, what str)
+        m = base_of(t).mod
+        if name.startswith("_") and m != "" and .mod_of(node) != m
+            .err("{what} '{name}' of {show(t)} is private to its module", node)
+        pass
 
     fn set_ty(n N, t Ty)
         if n.ty == 0
@@ -774,15 +559,15 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
             k = s.kind
             if (k == "Record" or k == "SumType" or k == "Interface") and (nm(s) in .records or nm(s) in .sums or
                                                                           nm(s) in .ifaces)
-                .err("type '{nm(s)}' is already defined", s)
+                .err("type '{dname(s)}' is already defined", s)
             if k == "Interface"
-                .ifaces[nm(s)] = Ty("iface", nid(), nm(s), display=nm(s))
+                .ifaces[nm(s)] = Ty("iface", nid(), nm(s), display=dname(s))
             elif k == "Record"
-                rt = Ty("record", nid(), nm(s), display=nm(s))
+                rt = Ty("record", nid(), nm(s), display=dname(s), mod=.mod_of(s))
                 .records[nm(s)] = rt
                 .type_params(rt, s)
             elif k == "SumType"
-                st = Ty("sum", nid(), nm(s), display=nm(s))
+                st = Ty("sum", nid(), nm(s), display=dname(s), mod=.mod_of(s))
                 .type_params(st, s)
                 .sums[nm(s)] = st
                 for v in s.kids[1].kids
@@ -865,18 +650,31 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
             .signature(fi)
 
         # верхний уровень: присвоенные там имена — глобальные переменные
-        topnode = mk("FnDef", 1, [S("<top>"), L([]), NONE(), L(top_stmts), parser.B(false), L([]), parser.B(false),
-                                  L([])])
-        top = Fn(topnode, "<top>", UNIT, body=top_stmts, is_top=true)
-        for name in assigned(top_stmts, .kinds())
-            .globals[name] = Var(name, tv(), "global")
-        top.locals = .globals
-        .tops.append(top)
-        .cur = top
-        top.state = "busy"
-        .block(top.body)
-        top.state = "done"
-        .cur = nil
+        # у каждого модуля своя функция верхнего уровня, в порядке тел: зависимости раньше
+        order: [str] = []
+        groups: {str: [N]} = {}
+        for ts in top_stmts
+            mf = .mod_of(ts)
+            if mf not in groups
+                groups[mf] = []
+                order.append(mf)
+            groups[mf].append(ts)
+        if not order then order.append(.loader.files[0][1])
+        for mf in order
+            stmts = if mf in groups then groups[mf] else []
+            topnode = mk("FnDef", 1, [S("<top>"), L([]), NONE(), L(stmts), parser.B(false), L([]), parser.B(false),
+                                      L([])])
+            top = Fn(topnode, "<top>", UNIT, body=stmts, is_top=true)
+            for name in assigned(stmts, .kinds())
+                .globals[name] = Var(name, tv(), "global")
+            top.locals = .globals
+            .tops.append(top)
+        for top in .tops
+            .cur = top
+            top.state = "busy"
+            .block(top.body)
+            top.state = "done"
+            .cur = nil
 
         for fi in all
             .check_fn(fi)
@@ -887,16 +685,16 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
             .need_resolved(.globals[name].ty, nil, "global '{name}'")
         .check_instances()
         if "main" in .fns
-            mf = .fns["main"]
-            if mf.tparams then .err("main cannot have type parameters", mf.node)
-            if "**" in mf.stars then .err("main cannot take **kwargs; use flags: fn main(name str, n = 1)", mf.node)
-            star = if "*" in mf.stars then mf.stars["*"] else -1
-            for i, p in enumerate(mf.params)
+            mainf = .fns["main"]
+            if mainf.tparams then .err("main cannot have type parameters", mainf.node)
+            if "**" in mainf.stars then .err("main cannot take **kwargs; use flags: fn main(name str, n = 1)", mainf.node)
+            star = if "*" in mainf.stars then mainf.stars["*"] else -1
+            for i, p in enumerate(mainf.params)
                 pt = prune(p.ty)
                 if i == star then pt = prune(pt.a[0])  # *files str — остальные позиционные аргументы
                 if pt.k == "opt" and p.default != nil then pt = prune(pt.a[0])
                 if not (pt.id == INT.id or pt.id == FLOAT.id or pt.id == STR.id or pt.id == BOOL.id)
-                    .err("main parameter '{p.name}' must be int, float, str or bool (or T? = nil)", mf.node)
+                    .err("main parameter '{p.name}' must be int, float, str or bool (or T? = nil)", mainf.node)
         pass
 
     fn type_params(base Ty, node N)
@@ -1128,7 +926,7 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
         n = fi.node
         ext = n.kids[8]
         fi.state = "done"
-        if ext.kids[0].s == "sip" and not .std
+        if ext.kids[0].s == "sip" and not .is_std(.mod_of(n))
             .err("extern \"sip\" is reserved for the standard library; use extern fn or extern \"lib\"", n)
         if fi.parent != nil then .err("extern fn must be declared at the top level", n)
         for p, c in zip(fi.params, ext.kids[2].kids)
@@ -1465,11 +1263,13 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
             args = p.kids[1].kids
             if len(args) > len(fields) then .err("{pname} has {len(fields)} field(s), pattern gives {len(args)}", p)
             for fd, sub in zip(fields, args)
+                if sub.kind != "PWild" then .private(t, fd.name, p, "field")
                 .pattern(sub, fd.ty, node, in_or)
             names = [f.name for f in fields]
             for kv in p.kids[2].kids
                 kname = kv.kids[0].s
                 if kname not in names then .err("{pname} has no field '{kname}'", p)
+                .private(t, kname, p, "field")
                 ft = UNIT
                 for f in fields
                     if f.name == kname then ft = f.ty
@@ -1624,6 +1424,7 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
         if t.k == "record"
             fs = fields_of(t)
             if name not in fs then .err("{t.name} has no field '{name}'", e)
+            .private(t, name, e, "field")
             return fs[name]
         .err("{show(t)} has no field '{name}'", e)
         UNIT
@@ -1769,13 +1570,14 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
             if .lookup(name) != nil then return .call_value(e)
             if name in .fns
                 fi = .fns[name]
+                dn = dname(fi.node)  # имя, как в исходнике модуля
                 if fi.tparams or has_ex
-                    targs = .explicit_targs(e, fi.tparams, "{name}()", ex, has_ex)
+                    targs = .explicit_targs(e, fi.tparams, "{dn}()", ex, has_ex)
                     m: {int: Ty} = {}
                     for P, a in zip(fi.tparams, targs)
                         m[P.id] = a
-                    return .generic_call(e, fi, "{name}()", m)
-                .bind_args(e, fi.params, "{name}()", fi.stars)
+                    return .generic_call(e, fi, "{dn}()", m)
+                .bind_args(e, fi.params, "{dn}()", fi.stars)
                 .ensure(fi)  # вывести тип результата до использования
                 return .call_ret(fi)
             if name in .records
@@ -1785,7 +1587,30 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
                 fs = fields_of(rt)
                 defs = base_of(rt).defaults
                 params = [PInfo(fname, fs[fname], defs.get(fname)) for fname in fs]
-                .bind_args(e, params, "{show(base_of(rt))}()", {})
+                anypriv = false
+                for p in params
+                    if p.name.startswith("_") then anypriv = true
+                if anypriv and .mod_of(e) != base_of(rt).mod
+                    # снаружи модуля приватные поля получают значения по умолчанию
+                    for p in params
+                        if p.name.startswith("_") and p.default == nil
+                            .err("{show(rt)} has private field '{p.name}' without a default; create it with a " +
+                                 "function from its module", e)
+                    pub = [p for p in params if not p.name.startswith("_")]
+                    privkw = false
+                    for kv in e.kids[2].kids
+                        if kv.kids[0].s.startswith("_") then privkw = true
+                    if len(e.kids[1].kids) > len(pub) or privkw
+                        pubs = ", ".join([p.name for p in pub])
+                        .err("{show(base_of(rt))}() outside its module takes only public fields " +
+                             "({if pubs == '' then 'none' else pubs}); private fields are set by the module", e)
+                    .bind_args(e, pub, "{show(base_of(rt))}()", {})
+                    for p in params
+                        if p.name.startswith("_")
+                            node = copy_n(p.default)
+                            .expect(p.ty, .expr(node, true, p.ty), node, "field '{p.name}'", node)
+                else
+                    .bind_args(e, params, "{show(base_of(rt))}()", {})
                 return rt
             if name in .variants
                 st = .variants[name]
@@ -1804,6 +1629,7 @@ type Checker(file str, std bool, tys [Ty] = [], records {str: Ty} = {}, sums {st
                 e.kids[1] = L([f.kids[0]] + e.kids[1].kids)
                 return .e_Call(e, want)
             if is_gen(rt) and fname in meths(rt)
+                .private(rt, fname, e, "method")
                 fi = meths(rt)[fname]
                 if fi.allparams then return .generic_call(e, fi, "{show(rt)}.{fname}()", targ_map(rt))
                 .bind_args(e, fi.params, "{rt.name}.{fname}()", fi.stars)
@@ -2606,14 +2432,11 @@ fn dump_into(n N, depth int, out [str], tys [Ty])
             dump_into(c, depth + 1, out, tys)
     pass
 
-fn check_source(path str, src str) str
-    p = parser.Parser(lexer.tokenize(src), 0)
-    mod = p.parse_module()
-    body = [s for s in mod.kids[0].kids if s.kind != "TestDef"]
-    r = Renamer({}, {})
-    body = r.process(body)
-    mod.kids[0] = L(body)
-    c = Checker(path, is_std(path), tys=[UNIT])
+fn check_source(file str, src str, std str) str
+    ld = modules.Loader(std)
+    body = ld.load_root(file, src)
+    mod = mk("Module", 1, [L(body)])
+    c = Checker(file, std, ld, tys=[UNIT])
     c.check(body)
     out: [str] = []
     dump_into(mod, 0, out, c.tys)
@@ -2624,15 +2447,9 @@ fn where(path str, line int, col int) str
     if col == 0 then return "{path}:{line}"
     "{path}:{line}:{col}"
 
-fn main(path str)
+fn main(file str, std = "")
     try
-        write("/dev/stdout", check_source(path, read(path)))
-    catch lexer.LexError e
-        print "{where(path, e.line, e.col)}: {e.msg}"
-        exit(1)
-    catch parser.ParseError e
-        print "{where(path, e.line, e.col)}: {e.msg}"
-        exit(1)
-    catch CheckError e
-        print "{where(path, e.line, 0)}: {e.msg}"
+        write("/dev/stdout", check_source(file, read(file), if std != "" then std else modules.abspath("siplang/std")))
+    catch SipErr e
+        print "{where(e.file, e.line, e.col)}: {e.msg}"
         exit(1)
