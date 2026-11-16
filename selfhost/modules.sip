@@ -411,6 +411,7 @@ type Loader(std str, files [(int, str)] = [], srcs [[str]] = [], extra [str] = [
         pkg = .package_of(p)
         .base = if pkg != nil then pkg.root else path.dirname(abspath(p))
         .loading[abspath(p)] = true  # import самого себя — циклический импорт
+        .load_rt()
         out = .process(body, "", p, offset, {})
         .bodies + out
 
@@ -445,10 +446,19 @@ type Loader(std str, files [(int, str)] = [], srcs [[str]] = [], extra [str] = [
             label = [if x == ".." then "up" else x for x in rel[:len(rel) - 4].split("/")]
         "__".join([word_safe(x) for x in label]) + "__"
 
+    # рантайм на Sip (std/rt.sip): его функции вызывает сгенерированный C; подключается к каждой программе
+    fn load_rt()
+        p = join_parts(.std, ["rt.sip"])
+        if p not in .loading and p not in .modules then .load_path(p, .prefix(p))
+        pass
+
     fn load_module(name str, from_path str, node N) {str: str}
         p, pre = .resolve(name, from_path, node)
         if p in .loading then fail SipErr("circular import of '{name}'", from_path, node.line, 0)
         if p in .modules then return .modules[p]
+        .load_path(p, pre)
+
+    fn load_path(p str, pre str) {str: str}
         src = read(p)
         .loading[p] = true
         body = .parse_file(src, p)

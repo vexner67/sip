@@ -857,15 +857,6 @@ static sip_str sip_str_concat(sip_str a, sip_str b) {
     return (sip_str){p, a.n + b.n};
 }
 
-static sip_str sip_str_repeat(sip_str s, int64_t k, int line) {
-    if (k <= 0 || !s.n) return SIP_LIT("");
-    int64_t total;
-    if (__builtin_mul_overflow(s.n, k, &total) || total > ((int64_t)1 << 48))
-        sip_raise(SIP_E_OverflowError, SIP_LIT("repeated string is too long"), line);
-    char *p = sip_alloc_atomic((size_t)total);
-    for (int64_t i = 0; i < k; i++) memcpy(p + i * s.n, s.p, (size_t)s.n);
-    return (sip_str){p, s.n * k};
-}
 
 static inline sip_str sip_str_at(sip_str s, int64_t i, int line) {
     if (i < 0) i += s.n;
@@ -891,8 +882,13 @@ static inline sip_str sip_str_slice(sip_str s, int64_t lo, int64_t hi, bool has_
 static int64_t sip_str_find(sip_str s, sip_str sub) {
     if (sub.n == 0) return 0;
     if (sub.n > s.n) return -1;
-    for (int64_t i = 0; i + sub.n <= s.n; i++)
-        if (s.p[i] == sub.p[0] && memcmp(s.p + i, sub.p, (size_t)sub.n) == 0) return i;
+    const char *p = s.p, *last = s.p + (s.n - sub.n);  /* кандидаты — по первому байту через memchr */
+    while (p <= last) {
+        p = memchr(p, sub.p[0], (size_t)(last - p + 1));
+        if (!p) return -1;
+        if (memcmp(p + 1, sub.p + 1, (size_t)sub.n - 1) == 0) return p - s.p;
+        p++;
+    }
     return -1;
 }
 
@@ -926,70 +922,11 @@ static sip_str sip_chr(int64_t cp, int line) {
     return (sip_str){p, n};
 }
 
-static int64_t sip_str_rfind(sip_str s, sip_str sub) {
-    if (sub.n > s.n) return -1;
-    for (int64_t i = s.n - sub.n; i >= 0; i--)
-        if (memcmp(s.p + i, sub.p, (size_t)sub.n) == 0) return i;
-    return -1;
-}
 
-static sip_str sip_str_remove_affix(sip_str s, sip_str a, int suffix) {
-    if (a.n > s.n) return s;
-    if (!suffix && memcmp(s.p, a.p, (size_t)a.n) == 0) return (sip_str){s.p + a.n, s.n - a.n};
-    if (suffix && memcmp(s.p + s.n - a.n, a.p, (size_t)a.n) == 0) return (sip_str){s.p, s.n - a.n};
-    return s;
-}
 
-/* mode: 0 ljust, 1 rjust, 2 zfill (нули после знака) */
-static sip_str sip_str_pad(sip_str s, int64_t width, int mode) {
-    if (width <= s.n) return s;
-    if (width > ((int64_t)1 << 40)) sip_raise(SIP_E_OverflowError, SIP_LIT("width is too large"), sip_std_line);
-    char *p = sip_alloc_atomic((size_t)width);
-    int64_t fill = width - s.n;
-    if (mode == 0) { memcpy(p, s.p, (size_t)s.n); memset(p + s.n, ' ', (size_t)fill); }
-    else if (mode == 1) { memset(p, ' ', (size_t)fill); memcpy(p + fill, s.p, (size_t)s.n); }
-    else {
-        int64_t sign = s.n && (s.p[0] == '-' || s.p[0] == '+');
-        if (sign) p[0] = s.p[0];
-        memset(p + sign, '0', (size_t)fill);
-        memcpy(p + sign + fill, s.p + sign, (size_t)(s.n - sign));
-    }
-    return (sip_str){p, width};
-}
 
-/* isupper/islower как в Python: есть буквы, и все они в этом регистре */
-static bool sip_str_cased(sip_str s, int upper) {
-    bool any = false;
-    for (int64_t i = 0; i < s.n; i++) {
-        char c = s.p[i];
-        if (c >= 'a' && c <= 'z') { if (upper) return false; any = true; }
-        else if (c >= 'A' && c <= 'Z') { if (!upper) return false; any = true; }
-    }
-    return any;
-}
 
-/* capitalize (words = 0) и title (words = 1) */
-static sip_str sip_str_title(sip_str s, int words) {
-    char *p = sip_alloc_atomic((size_t)s.n + 1);
-    bool start = true;
-    for (int64_t i = 0; i < s.n; i++) {
-        char c = s.p[i];
-        bool alpha = (c | 32) >= 'a' && (c | 32) <= 'z';
-        if (alpha) p[i] = start ? (char)(c & ~32) : (char)(c | 32);
-        else p[i] = c;
-        start = words ? !alpha : false;
-    }
-    return (sip_str){p, s.n};
-}
 
-static int64_t sip_str_count(sip_str s, sip_str sub) {
-    if (sub.n == 0) return s.n + 1;
-    int64_t c = 0;
-    for (int64_t i = 0; i + sub.n <= s.n;) {
-        if (memcmp(s.p + i, sub.p, (size_t)sub.n) == 0) { c++; i += sub.n; } else i++;
-    }
-    return c;
-}
 
 static inline bool sip_str_startswith(sip_str s, sip_str p) {
     return p.n <= s.n && memcmp(s.p, p.p, (size_t)p.n) == 0;
@@ -999,15 +936,6 @@ static inline bool sip_str_endswith(sip_str s, sip_str p) {
     return p.n <= s.n && memcmp(s.p + s.n - p.n, p.p, (size_t)p.n) == 0;
 }
 
-static sip_str sip_str_map(sip_str s, int upper) {
-    char *p = sip_alloc_atomic((size_t)s.n);
-    for (int64_t i = 0; i < s.n; i++) {
-        char c = s.p[i];
-        if (upper) p[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
-        else p[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
-    }
-    return (sip_str){p, s.n};
-}
 
 static inline bool sip_isspace(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
 
@@ -1018,50 +946,8 @@ static sip_str sip_str_strip(sip_str s, int left, int right) {
     return (sip_str){s.p + a, b - a};
 }
 
-static bool sip_str_all(sip_str s, int kind) {
-    if (!s.n) return false;
-    for (int64_t i = 0; i < s.n; i++) {
-        char c = s.p[i];
-        bool ok = kind == 0 ? (c >= '0' && c <= '9')
-                : kind == 1 ? ((c | 32) >= 'a' && (c | 32) <= 'z')
-                : kind == 3 ? ((c >= '0' && c <= '9') || ((c | 32) >= 'a' && (c | 32) <= 'z'))
-                : sip_isspace(c);
-        if (!ok) return false;
-    }
-    return true;
-}
 
-static sip_str sip_str_replace(sip_str s, sip_str old, sip_str rep) {
-    if (old.n == 0) return s;
-    sip_sb b = sip_sb_new();
-    int64_t i = 0;
-    while (i < s.n) {
-        if (i + old.n <= s.n && memcmp(s.p + i, old.p, (size_t)old.n) == 0) {
-            sip_sb_str(&b, rep);
-            i += old.n;
-        } else sip_sb_putc(&b, s.p[i++]);
-    }
-    return sip_sb_done(&b);
-}
 
-static int64_t sip_parse_int(sip_str s, int line) {
-    sip_str t = sip_str_strip(s, 1, 1);
-    char buf[64];
-    if (t.n == 0 || t.n >= (int64_t)sizeof buf) goto bad;
-    int64_t j = 0;
-    for (int64_t i = 0; i < t.n; i++) if (t.p[i] != '_') buf[j++] = t.p[i];
-    buf[j] = 0;
-    char *end;
-    errno = 0;
-    long long v = strtoll(buf, &end, 10);
-    if (*end) goto bad;
-    if (errno == ERANGE)
-        sip_raisef(SIP_E_OverflowError, line, "int out of range: '%.*s'", (int)(s.n > 40 ? 40 : s.n), s.p);
-    if (errno) goto bad;
-    return v;
-bad:
-    sip_raisef(SIP_E_ParseError, line, "invalid int: '%.*s'", (int)(s.n > 40 ? 40 : s.n), s.p);
-}
 
 static double sip_parse_float(sip_str s, int line) {
     sip_str t = sip_str_strip(s, 1, 1);
@@ -1158,6 +1044,30 @@ static inline sip_str sip_int_to_str(int64_t x) { sip_sb b = sip_sb_new(); str_i
 static inline void sip_fmt_float(sip_sb *b, const char *fmt, double x) { sip_sb_printf(b, fmt, x); }
 static inline void sip_fmt_int(sip_sb *b, const char *fmt, int64_t x) { sip_sb_printf(b, fmt, (long long)x); }
 static inline void sip_fmt_str(sip_sb *b, const char *fmt, sip_str s) { sip_sb_printf(b, fmt, (int)s.n, s.p); }
+
+/* ---------- примитивы для рантайма на Sip (std/rt.sip) ----------
+ * Строковые функции (lower, replace, ljust, int(s), ...) написаны на Sip в std/rt.sip; здесь только то,
+ * что Sip пока не выражает сам: байт строки, кусок без копии, сырая память. Границы не проверяются:
+ * эти функции вызывает только rt.sip, который сам следит за индексами. */
+static inline int64_t sip_rt_byte(sip_str s, int64_t i) { return (unsigned char)s.p[i]; }
+static inline sip_str sip_rt_sub(sip_str s, int64_t lo, int64_t hi) { return (sip_str){s.p + lo, hi - lo}; }
+static inline bool sip_rt_eq_at(sip_str s, int64_t i, sip_str t) { return memcmp(s.p + i, t.p, (size_t)t.n) == 0; }
+static inline int64_t sip_rt_find(sip_str s, sip_str sub, int64_t from) {
+    int64_t i = sip_str_find((sip_str){s.p + from, s.n - from}, sub);
+    return i < 0 ? -1 : i + from;
+}
+static inline void *sip_rt_alloc(int64_t n) { return sip_alloc_atomic((size_t)(n ? n : 1)); }
+static inline void sip_rt_set(void *p, int64_t i, int64_t b) { ((char *)p)[i] = (char)b; }
+static inline void sip_rt_fill(void *p, int64_t i, int64_t n, int64_t b) { if (n > 0) memset((char *)p + i, (int)b, (size_t)n); }
+static inline void sip_rt_copy(void *p, int64_t i, sip_str s) { if (s.n) memcpy((char *)p + i, s.p, (size_t)s.n); }
+static inline sip_str sip_rt_str(void *p, int64_t n) { return (sip_str){(const char *)p, n}; }
+static inline void *sip_rt_sb(void) { sip_sb *b = sip_alloc(sizeof *b); *b = sip_sb_new(); return b; }
+static inline void sip_rt_put(void *b, sip_str s) { sip_sb_str((sip_sb *)b, s); }
+static inline void sip_rt_putc(void *b, int64_t c) { sip_sb_putc((sip_sb *)b, (char)c); }
+static inline sip_str sip_rt_done(void *b) { return sip_sb_done((sip_sb *)b); }
+/* ошибки rt.sip — на строке кода пользователя, который вызвал рантайм */
+static void sip_rt_parse_error(sip_str msg) { sip_raise(SIP_E_ParseError, msg, sip_std_line); }
+static void sip_rt_overflow(sip_str msg) { sip_raise(SIP_E_OverflowError, msg, sip_std_line); }
 
 /* ---------- файлы ---------- */
 

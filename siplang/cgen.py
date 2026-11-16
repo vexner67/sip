@@ -322,8 +322,17 @@ class CGen:
         return "\n".join(out) + ("\n" if out else "")
 
     def in_std(self, node) -> bool:
+        return self.in_std_line(node.line)
+
+    def in_std_line(self, line) -> bool:
         from .checker import is_std
-        return is_std(self.srcmap.locate(node.line)[0]) if self.srcmap is not None and node.line else False
+        return is_std(self.srcmap.locate(line)[0]) if self.srcmap is not None and line else False
+
+    def rt(self, name, args, line=0) -> str:
+        """Вызов функции рантайма на Sip (std/rt.sip); line — для ошибок: они указывают на код пользователя."""
+        if line and not self.in_std_line(line):
+            self.emit(f"sip_std_line = {line};")
+        return f"f_std__rt__{name}({', '.join(args)})"
 
     C_NAMES = {"i8": "int8_t", "i16": "int16_t", "i32": "int32_t", "u8": "uint8_t", "u16": "uint16_t",
                "u32": "uint32_t", "u64": "uint64_t", "usize": "size_t"}
@@ -1346,7 +1355,7 @@ class CGen:
         if op == "+" and lt is STR:
             return f"sip_str_concat({lc}, {rc})"
         if op == "*" and lt is STR:
-            return f"sip_str_repeat({lc}, {rc}, {line})"
+            return self.rt("str_repeat", [lc, rc], line)
         if op == "+" and isinstance(lt, ListT):
             return f"{self.k(res)}_concat({lc}, {rc})"
         if op == "*" and isinstance(lt, ListT):
@@ -1655,7 +1664,7 @@ class CGen:
         t = self.ty(a)
         code = self.ex(a)
         if t is STR:
-            return f"sip_parse_int({code}, {e.line})"
+            return self.rt("parse_int", [code], e.line)
         return code if t is INT else f"sip_f2i({code}, {e.line})"
 
     def b_float(self, e):
@@ -2075,10 +2084,10 @@ class CGen:
         return self.eval_args([e.recv] + list(e.args))
 
     def ms_lower(self, e, t):
-        return f"sip_str_map({self.recv_args(e)[0]}, 0)"
+        return self.rt("str_map", [self.recv_args(e)[0], "false"])
 
     def ms_upper(self, e, t):
-        return f"sip_str_map({self.recv_args(e)[0]}, 1)"
+        return self.rt("str_map", [self.recv_args(e)[0], "true"])
 
     def ms_strip(self, e, t):
         return f"sip_str_strip({self.recv_args(e)[0]}, 1, 1)"
@@ -2090,13 +2099,13 @@ class CGen:
         return f"sip_str_strip({self.recv_args(e)[0]}, 0, 1)"
 
     def ms_isdigit(self, e, t):
-        return f"sip_str_all({self.recv_args(e)[0]}, 0)"
+        return self.rt("str_all", [self.recv_args(e)[0], "0"])
 
     def ms_isalpha(self, e, t):
-        return f"sip_str_all({self.recv_args(e)[0]}, 1)"
+        return self.rt("str_all", [self.recv_args(e)[0], "1"])
 
     def ms_isspace(self, e, t):
-        return f"sip_str_all({self.recv_args(e)[0]}, 2)"
+        return self.rt("str_all", [self.recv_args(e)[0], "2"])
 
     def ms_startswith(self, e, t):
         return "sip_str_startswith({}, {})".format(*self.recv_args(e))
@@ -2108,43 +2117,43 @@ class CGen:
         return "sip_str_find({}, {})".format(*self.recv_args(e))
 
     def ms_rfind(self, e, t):
-        return "sip_str_rfind({}, {})".format(*self.recv_args(e))
+        return self.rt("str_rfind", self.recv_args(e))
 
     def ms_removeprefix(self, e, t):
-        return "sip_str_remove_affix({}, {}, 0)".format(*self.recv_args(e))
+        return self.rt("str_remove_affix", self.recv_args(e) + ["false"])
 
     def ms_removesuffix(self, e, t):
-        return "sip_str_remove_affix({}, {}, 1)".format(*self.recv_args(e))
+        return self.rt("str_remove_affix", self.recv_args(e) + ["true"])
 
     def ms_ljust(self, e, t):
-        return "sip_str_pad({}, {}, 0)".format(*self.recv_args(e))
+        return self.rt("str_pad", self.recv_args(e) + ["0"], e.line)
 
     def ms_rjust(self, e, t):
-        return "sip_str_pad({}, {}, 1)".format(*self.recv_args(e))
+        return self.rt("str_pad", self.recv_args(e) + ["1"], e.line)
 
     def ms_zfill(self, e, t):
-        return "sip_str_pad({}, {}, 2)".format(*self.recv_args(e))
+        return self.rt("str_pad", self.recv_args(e) + ["2"], e.line)
 
     def ms_isalnum(self, e, t):
-        return f"sip_str_all({self.recv_args(e)[0]}, 3)"
+        return self.rt("str_all", [self.recv_args(e)[0], "3"])
 
     def ms_isupper(self, e, t):
-        return f"sip_str_cased({self.recv_args(e)[0]}, 1)"
+        return self.rt("str_cased", [self.recv_args(e)[0], "true"])
 
     def ms_islower(self, e, t):
-        return f"sip_str_cased({self.recv_args(e)[0]}, 0)"
+        return self.rt("str_cased", [self.recv_args(e)[0], "false"])
 
     def ms_capitalize(self, e, t):
-        return f"sip_str_title({self.recv_args(e)[0]}, 0)"
+        return self.rt("str_title", [self.recv_args(e)[0], "false"])
 
     def ms_title(self, e, t):
-        return f"sip_str_title({self.recv_args(e)[0]}, 1)"
+        return self.rt("str_title", [self.recv_args(e)[0], "true"])
 
     def ms_count(self, e, t):
-        return "sip_str_count({}, {})".format(*self.recv_args(e))
+        return self.rt("str_count", self.recv_args(e))
 
     def ms_replace(self, e, t):
-        return "sip_str_replace({}, {}, {})".format(*self.recv_args(e))
+        return self.rt("str_replace", self.recv_args(e))
 
     def ms_join(self, e, t):
         sep, lst = self.recv_args(e)

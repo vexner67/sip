@@ -189,6 +189,7 @@ code { font-size: 12.5px; background: var(--wash); padding: 1px 5px; border-radi
       <li>Sip проверяет переполнение <code>int</code> и границы списков, C в этой таблице нет. Сильнее всего это видно в fib.</li>
       <li>Токены: <code>bench/count_tokens.py</code>, задачи и варианты синтаксиса в <code>bench/samples</code>. Sip здесь — выбранный вариант E (гибрид). Код на C не считали.</li>
       <li>Компилятор: <code>selfhost/sipc.sip</code> (собран сам собой) против <code>siplang</code> на Python; время Python включает запуск интерпретатора, потому что его платит каждый вызов. Сверка C на 300 программах: <code>python3 selfhost/parity.py --only cgen</code>.</li>
+      <li>Обе версии компилятора подключают к программе рантайм на Sip (<code>siplang/std/rt.sip</code>). Две трети времени <code>sipc</code> на больших файлах уходит на сборку мусора: с <code>SIP_GC=off</code> сам компилятор переводится в C за 69 мс.</li>
       <li>Все числа есть в таблицах: кнопка «Таблица» на каждом графике.</li>
     </ul>
   </section>
@@ -219,10 +220,10 @@ const TOKENS = [
 ].map(([task, sip, py, go]) => ({ task, sip, py, go }));
 
 const COMPILER = [
-  { name: "sipc.sip — сам компилятор", note: "8.5 тыс. строк с модулями", sip: 131, py: 714 },
-  { name: "checker.sip", note: "2 695 строк", sip: 56, py: 427 },
-  { name: "word_freq.sip", note: "6 строк", sip: 2.0, py: 96 },
-  { name: "shapes.sip", note: "9 строк", sip: 2.1, py: 98 },
+  { name: "sipc.sip — сам компилятор", note: "8.7 тыс. строк с модулями", sip: 227, py: 732 },
+  { name: "checker.sip", note: "2 695 строк", sip: 93, py: 435 },
+  { name: "word_freq.sip", note: "6 строк", sip: 3.2, py: 105 },
+  { name: "shapes.sip", note: "9 строк", sip: 2.9, py: 105 },
 ];
 
 const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();

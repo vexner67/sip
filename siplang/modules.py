@@ -205,6 +205,7 @@ class Loader:
         pkg = self.package_of(path)
         self.base = pkg.root if pkg is not None else os.path.dirname(os.path.abspath(path))
         self.loading.add(os.path.abspath(path))  # import самого себя — циклический импорт
+        self.load_rt()
         body = self.process(mod.body, "", path, offset)
         out = Module(self.bodies + body, line=1)
         out.tests = tests if self.tests else None
@@ -244,12 +245,21 @@ class Loader:
             label = [p if p != ".." else "up" for p in rel.split(os.sep)]
         return "__".join(re.sub(r"\W", "_", p) for p in label) + "__"
 
+    def load_rt(self):
+        """Рантайм на Sip (std/rt.sip): его функции вызывает сгенерированный C. Подключается к каждой программе."""
+        path = os.path.join(STD_DIR, "rt.sip")
+        if path not in self.loading and path not in self.modules:
+            self.load_path(path, self.prefix(path))
+
     def load_module(self, name: str, from_path: str, node) -> dict:
         path, prefix = self.resolve(name, from_path, node)
         if path in self.loading:
             raise SipError(f"circular import of '{name}'", node.line, 0, from_path)
         if path in self.modules:
             return self.modules[path]
+        return self.load_path(path, prefix)
+
+    def load_path(self, path: str, prefix: str) -> dict:
         if path in self.overlay:
             src = self.overlay[path]
         else:

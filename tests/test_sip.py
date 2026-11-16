@@ -1354,14 +1354,17 @@ class SeparateCompilationTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             return r.stderr.strip(), subprocess.run([exe], capture_output=True, text=True).stdout
 
-        self.assertEqual(build(), ("2 unit(s): 2 compiled, 0 cached", "2 5.0 abab\n"))
-        self.assertEqual(build()[0], "2 unit(s): 0 compiled, 2 cached")
+        # третья единица — рантайм на Sip (std/rt.sip): он одинаков у всех программ и обычно уже в кэше
+        first, out = build()
+        self.assertIn(first, ("3 unit(s): 2 compiled, 1 cached", "3 unit(s): 3 compiled, 0 cached"))
+        self.assertEqual(out, "2 5.0 abab\n")
+        self.assertEqual(build()[0], "3 unit(s): 0 compiled, 3 cached")
         with open(main, "a") as f:
             f.write("print 3\n")
-        self.assertEqual(build(), ("2 unit(s): 1 compiled, 1 cached", "2 5.0 abab\n3\n"))
+        self.assertEqual(build(), ("3 unit(s): 1 compiled, 2 cached", "2 5.0 abab\n3\n"))
         with open(os.path.join(d, "lib.sip"), "a") as f:
             f.write("fn extra() int = 0\n")  # строки lib растут, но единица main не меняется
-        self.assertEqual(build()[0], "2 unit(s): 1 compiled, 1 cached")
+        self.assertEqual(build()[0], "3 unit(s): 1 compiled, 2 cached")
         r = sip_cli("build", main, "-o", exe, "--whole")
         self.assertEqual(r.returncode, 0, r.stderr)
 

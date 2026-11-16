@@ -429,10 +429,17 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         out.extend(["    " * l.d + l.t for l in .lines])
         "\n".join(out) + (if out then "\n" else "")
 
-    fn in_std(node N) bool
-        if node.line == 0 then return false
-        f, _ = .ld.locate(node.line)
+    fn in_std(node N) bool = .in_std_line(node.line)
+
+    fn in_std_line(line int) bool
+        if line == 0 then return false
+        f, _ = .ld.locate(line)
         .c.is_std(f)
+
+    # вызов функции рантайма на Sip (std/rt.sip); line — для ошибок: они указывают на код пользователя
+    fn rt(name str, args [str], line int = 0) str
+        if line != 0 and not .in_std_line(line) then .emit("sip_std_line = {line};")
+        "f_std__rt__{name}({', '.join(args)})"
 
     fn c_name(ct str) str
         if ct == "int8_t" then return "i8"
@@ -1647,7 +1654,7 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         if op == "%" then return if both_int then "sip_mod({lc}, {rc}, {line})" else "sip_fmod({lc}, {rc}, {line})"
         if op == "**" then return if both_int then "sip_ipow({lc}, {rc}, {line})" else "pow({lc}, {rc})"
         if op == "+" and lt.id == STR.id then return "sip_str_concat({lc}, {rc})"
-        if op == "*" and lt.id == STR.id then return "sip_str_repeat({lc}, {rc}, {line})"
+        if op == "*" and lt.id == STR.id then return .rt("str_repeat", [lc, rc], line)
         if op == "+" and lt.k == "list" then return "{.k(res)}_concat({lc}, {rc})"
         if op == "*" and lt.k == "list" then return "{.k(lt)}_repeat({lc}, {rc}, {line})"
         if op == "|" and lt.k == "dict" then return "{.k(res)}_merge({lc}, {rc})"
@@ -1969,7 +1976,7 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         if name == "int"
             t = .ty(a[0])
             code = .ex(a[0])
-            if t.id == STR.id then return "sip_parse_int({code}, {l})"
+            if t.id == STR.id then return .rt("parse_int", [code], l)
             return if t.id == INT.id then code else "sip_f2i({code}, {l})"
         if name == "float"
             t = .ty(a[0])
@@ -2272,30 +2279,30 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
 
     fn str_method(e N, m str) str
         c = .recv_args(e)
-        if m == "lower" then return "sip_str_map({c[0]}, 0)"
-        if m == "upper" then return "sip_str_map({c[0]}, 1)"
+        if m == "lower" then return .rt("str_map", [c[0], "false"])
+        if m == "upper" then return .rt("str_map", [c[0], "true"])
         if m == "strip" then return "sip_str_strip({c[0]}, 1, 1)"
         if m == "lstrip" then return "sip_str_strip({c[0]}, 1, 0)"
         if m == "rstrip" then return "sip_str_strip({c[0]}, 0, 1)"
-        if m == "isdigit" then return "sip_str_all({c[0]}, 0)"
-        if m == "isalpha" then return "sip_str_all({c[0]}, 1)"
-        if m == "isspace" then return "sip_str_all({c[0]}, 2)"
-        if m == "isalnum" then return "sip_str_all({c[0]}, 3)"
+        if m == "isdigit" then return .rt("str_all", [c[0], "0"])
+        if m == "isalpha" then return .rt("str_all", [c[0], "1"])
+        if m == "isspace" then return .rt("str_all", [c[0], "2"])
+        if m == "isalnum" then return .rt("str_all", [c[0], "3"])
         if m == "startswith" then return "sip_str_startswith({c[0]}, {c[1]})"
         if m == "endswith" then return "sip_str_endswith({c[0]}, {c[1]})"
         if m == "find" then return "sip_str_find({c[0]}, {c[1]})"
-        if m == "rfind" then return "sip_str_rfind({c[0]}, {c[1]})"
-        if m == "removeprefix" then return "sip_str_remove_affix({c[0]}, {c[1]}, 0)"
-        if m == "removesuffix" then return "sip_str_remove_affix({c[0]}, {c[1]}, 1)"
-        if m == "ljust" then return "sip_str_pad({c[0]}, {c[1]}, 0)"
-        if m == "rjust" then return "sip_str_pad({c[0]}, {c[1]}, 1)"
-        if m == "zfill" then return "sip_str_pad({c[0]}, {c[1]}, 2)"
-        if m == "isupper" then return "sip_str_cased({c[0]}, 1)"
-        if m == "islower" then return "sip_str_cased({c[0]}, 0)"
-        if m == "capitalize" then return "sip_str_title({c[0]}, 0)"
-        if m == "title" then return "sip_str_title({c[0]}, 1)"
-        if m == "count" then return "sip_str_count({c[0]}, {c[1]})"
-        if m == "replace" then return "sip_str_replace({c[0]}, {c[1]}, {c[2]})"
+        if m == "rfind" then return .rt("str_rfind", c)
+        if m == "removeprefix" then return .rt("str_remove_affix", c + ["false"])
+        if m == "removesuffix" then return .rt("str_remove_affix", c + ["true"])
+        if m == "ljust" then return .rt("str_pad", c + ["0"], e.line)
+        if m == "rjust" then return .rt("str_pad", c + ["1"], e.line)
+        if m == "zfill" then return .rt("str_pad", c + ["2"], e.line)
+        if m == "isupper" then return .rt("str_cased", [c[0], "true"])
+        if m == "islower" then return .rt("str_cased", [c[0], "false"])
+        if m == "capitalize" then return .rt("str_title", [c[0], "false"])
+        if m == "title" then return .rt("str_title", [c[0], "true"])
+        if m == "count" then return .rt("str_count", c)
+        if m == "replace" then return .rt("str_replace", c)
         if m == "join" then return "{.k(.ty(.args(e)[0]))}_join({c[1]}, {c[0]})"
         if m == "split"
             s = .spill(c[0], STR)
