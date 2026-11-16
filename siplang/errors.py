@@ -14,6 +14,8 @@ class SipError(Exception):
         self.file = file
 
     def __str__(self) -> str:
+        if not self.line:  # ошибка про файл целиком (sip.toml, C-компилятор)
+            return f"{self.file}: {self.msg}"
         where = f"{self.file}:{self.line}"
         if self.col:
             where += f":{self.col}"

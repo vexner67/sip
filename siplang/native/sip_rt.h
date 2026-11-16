@@ -2,7 +2,7 @@
  *
  * Подключается в каждый сгенерированный .c файл одной единицей трансляции,
  * поэтому clang может встраивать и оптимизировать всё вместе с кодом программы.
- * Перед подключением генератор определяет SIP_FILE, SIP_SRC и SIP_NSRC.
+ * Таблицу исходников SIP_FILES генератор определяет в единице с main.
  */
 #include <errno.h>
 #include <math.h>
@@ -13,12 +13,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Глобальное состояние рантайма. Программа из нескольких единиц компиляции (SIP_SPLIT):
+ * переменные определены в единице с main (SIP_RT_IMPL), остальные видят их через extern.
+ * Одна единица — обычные static. */
+#if defined(SIP_SPLIT) && !defined(SIP_RT_IMPL)
+#define SIP_GV(decl, ...) extern decl
+#elif defined(SIP_SPLIT)
+#define SIP_GV(decl, ...) decl __VA_ARGS__
+#else
+#define SIP_GV(decl, ...) static decl __VA_ARGS__
+#endif
+
 #define SIP_PI 3.14159265358979323846
 #define SIP_LIKELY(x) __builtin_expect(!!(x), 1)
 #define SIP_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define SIP_LIT(s) ((sip_str){(s), (int64_t)(sizeof(s) - 1)})
 
 typedef struct { const char *p; int64_t n; } sip_str;
+
+/* исходники для сообщений об ошибках: строка программы line лежит в файле с наибольшим start < line */
+typedef struct { int start; const char *name; const int *n; const char *const *lines; } sip_srcfile;
+extern const sip_srcfile SIP_FILES[];
+extern const int SIP_NFILES;
 typedef struct { int64_t lo, hi; } sip_range;
 
 /* ---------- память: сборщик мусора ----------
@@ -54,7 +70,9 @@ typedef struct { int64_t lo, hi; } sip_range;
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 /* ASan кладёт локальные переменные в «ложные кадры» в куче, их сборщик не увидит */
+#if !defined(SIP_SPLIT) || defined(SIP_RT_IMPL)
 const char *__asan_default_options(void) { return "detect_stack_use_after_return=0"; }
+#endif
 #endif
 #endif
 
@@ -84,32 +102,32 @@ typedef struct sip_blk {
 typedef struct { char *p; size_t n; bool mark, atomic; } sip_large;
 
 /* размер -> класс: индекс (n + 16) >> 4, лишний байт — для указателя «сразу за концом» */
-static uint8_t sip_class_of[SIP_SMALL_MAX / 16 + 2];
+SIP_GV(uint8_t sip_class_of[SIP_SMALL_MAX / 16 + 2]);
 
-static void *sip_fl[2][SIP_NCLASS];                    /* списки свободных объектов */
-static char *sip_bump[2][SIP_NCLASS], *sip_bend[2][SIP_NCLASS];  /* ещё не тронутая часть блока */
+SIP_GV(void *sip_fl[2][SIP_NCLASS]);                    /* списки свободных объектов */
+SIP_GV(char *sip_bump[2][SIP_NCLASS]); SIP_GV(char *sip_bend[2][SIP_NCLASS]);  /* ещё не тронутая часть блока */
 
-static char **sip_chunks;          /* куски по 4 МБ, по возрастанию адреса */
-static size_t sip_nchunks, sip_chunks_cap;
-static sip_blk **sip_empty;        /* свободные блоки */
-static size_t sip_nempty, sip_empty_cap;
-static sip_large *sip_larges;      /* большие объекты, по возрастанию адреса */
-static size_t sip_nlarge, sip_large_cap;
-static uintptr_t sip_lo = UINTPTR_MAX, sip_hi = 0;
+SIP_GV(char **sip_chunks);          /* куски по 4 МБ, по возрастанию адреса */
+SIP_GV(size_t sip_nchunks); SIP_GV(size_t sip_chunks_cap);
+SIP_GV(sip_blk **sip_empty);        /* свободные блоки */
+SIP_GV(size_t sip_nempty); SIP_GV(size_t sip_empty_cap);
+SIP_GV(sip_large *sip_larges);      /* большие объекты, по возрастанию адреса */
+SIP_GV(size_t sip_nlarge); SIP_GV(size_t sip_large_cap);
+SIP_GV(uintptr_t sip_lo, = UINTPTR_MAX); SIP_GV(uintptr_t sip_hi, = 0);
 
-static size_t sip_heap_used;       /* блоки в работе + большие объекты */
-static size_t sip_gc_min = (size_t)64 << 20;  /* порог не ниже этого (SIP_GC_MIN, в МБ) */
-static size_t sip_gc_next = (size_t)64 << 20;
-static bool sip_gc_on = true, sip_gc_stats;
-static int64_t sip_gc_count;
-static double sip_gc_time;
-static size_t sip_gc_peak;
+SIP_GV(size_t sip_heap_used);       /* блоки в работе + большие объекты */
+SIP_GV(size_t sip_gc_min, = (size_t)64 << 20);  /* порог не ниже этого (SIP_GC_MIN, в МБ) */
+SIP_GV(size_t sip_gc_next, = (size_t)64 << 20);
+SIP_GV(bool sip_gc_on, = true); SIP_GV(bool sip_gc_stats);
+SIP_GV(int64_t sip_gc_count);
+SIP_GV(double sip_gc_time);
+SIP_GV(size_t sip_gc_peak);
 
 /* стеки потоков: сборщик сканирует стек каждого потока от sp до top */
 typedef struct sip_thr { char *top, *sp; jmp_buf regs; struct sip_thr *next; } sip_thr;
-static sip_thr sip_main_thr;
-static sip_thr *sip_threads = &sip_main_thr;
-static _Thread_local sip_thr *sip_cur_thr = &sip_main_thr;
+SIP_GV(sip_thr sip_main_thr);
+SIP_GV(sip_thr *sip_threads, = &sip_main_thr);
+SIP_GV(_Thread_local sip_thr *sip_cur_thr, = &sip_main_thr);
 
 __attribute__((noreturn, cold)) static void sip_oom(void) {
     fputs("sip: out of memory\n", stderr);
@@ -296,8 +314,8 @@ static void *sip_realloc_atomic(void *p, size_t n) { return sip_realloc_k(p, n, 
 /* ---- пометка ---- */
 
 typedef struct { char *p; size_t n; } sip_range_t;
-static sip_range_t *sip_mstack;
-static size_t sip_msn, sip_mscap;
+SIP_GV(sip_range_t *sip_mstack);
+SIP_GV(size_t sip_msn); SIP_GV(size_t sip_mscap);
 
 static inline void sip_mpush(char *p, size_t n) {
     if (sip_msn == sip_mscap) {
@@ -493,10 +511,10 @@ static const char *const sip_err_names[] = {
 };
 
 typedef struct sip_try { jmp_buf jb; struct sip_try *prev; } sip_try;
-static sip_try *sip_try_top;
-static int sip_err_kind;
-static sip_str sip_err_msg;
-static int sip_err_line;
+SIP_GV(sip_try *sip_try_top);
+SIP_GV(int sip_err_kind);
+SIP_GV(sip_str sip_err_msg);
+SIP_GV(int sip_err_line);
 
 static inline void sip_try_push(sip_try *t) { t->prev = sip_try_top; sip_try_top = t; }
 static inline void sip_try_pop(void) { sip_try_top = sip_try_top->prev; }
@@ -506,8 +524,8 @@ static inline void sip_try_pop(void) { sip_try_top = sip_try_top->prev; }
  * поэтому ожидание идёт параллельно. При смене потока сохраняется его стек try. */
 #ifdef SIP_USE_ASYNC
 #include <pthread.h>
-static pthread_mutex_t sip_gil = PTHREAD_MUTEX_INITIALIZER;
-static bool sip_threaded;
+SIP_GV(pthread_mutex_t sip_gil, = PTHREAD_MUTEX_INITIALIZER);
+SIP_GV(bool sip_threaded);
 typedef struct { sip_try *try_top; } sip_tstate;
 static inline sip_tstate sip_gil_release(void) {
     sip_tstate st = {sip_try_top};
@@ -540,11 +558,12 @@ __attribute__((noreturn, cold)) static void sip_die(void) {
     fflush(stdout);
     int f = 0;
     while (f + 1 < SIP_NFILES && SIP_FILES[f + 1].start < sip_err_line) f++;
-    fprintf(stderr, "%s:%d: %s", SIP_FILES[f].name, sip_err_line - SIP_FILES[f].start, sip_err_names[sip_err_kind]);
+    int local = sip_err_line - SIP_FILES[f].start;
+    fprintf(stderr, "%s:%d: %s", SIP_FILES[f].name, local, sip_err_names[sip_err_kind]);
     if (sip_err_msg.n) fprintf(stderr, ": %.*s", (int)sip_err_msg.n, sip_err_msg.p);
     fputc('\n', stderr);
-    if (sip_err_line > 0 && sip_err_line <= SIP_NSRC) {
-        const char *s = SIP_SRC[sip_err_line - 1];
+    if (local > 0 && local <= *SIP_FILES[f].n) {
+        const char *s = SIP_FILES[f].lines[local - 1];
         while (*s == ' ') s++;
         fprintf(stderr, "    %s\n", s);
     }
@@ -624,7 +643,7 @@ static void sip_raisef(int kind, int line, const char *fmt, ...) {
 
 /* ---------- вывод ---------- */
 
-static sip_sb sip_out_line;
+SIP_GV(sip_sb sip_out_line);
 
 static inline void sip_print_line(void) {
     sip_sb_putc(&sip_out_line, '\n');
@@ -980,10 +999,10 @@ static sip_str sip_input(sip_str prompt) {
 
 /* ---------- аргументы командной строки для fn main ---------- */
 
-static int sip_argc;
-static char **sip_argv;
-static char *sip_used;          /* какие argv уже разобраны */
-static int sip_npos;
+SIP_GV(int sip_argc);
+SIP_GV(char **sip_argv);
+SIP_GV(char *sip_used);          /* какие argv уже разобраны */
+SIP_GV(int sip_npos);
 
 static void sip_args_init(int argc, char **argv) {
     sip_argc = argc;
@@ -1102,7 +1121,7 @@ static inline int64_t sip_gcd(int64_t a, int64_t b) {
     return a;
 }
 
-static uint64_t sip_rng = 0;
+SIP_GV(uint64_t sip_rng, = 0);
 
 static inline uint64_t sip_rand_next(void) {  /* splitmix64 */
     if (SIP_UNLIKELY(!sip_rng)) {
@@ -1683,7 +1702,7 @@ static void sip_csv_put(sip_sb *b, sip_str s, char d) {
 
 typedef struct { int64_t status; sip_str body, url; sip_str *hk, *hv; int64_t nh, hcap; } sip_http_resp;
 
-static pthread_once_t sip_http_once = PTHREAD_ONCE_INIT;
+SIP_GV(pthread_once_t sip_http_once, = PTHREAD_ONCE_INIT);
 static void sip_http_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
 
 /* во время запроса другие потоки могут выполнять код Sip, поэтому здесь только malloc */

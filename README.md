@@ -49,8 +49,9 @@ pip install -e .
 
 | команда | что делает |
 |---|---|
-| `sip run FILE.sip [args]` | собирает (с кэшем в `~/.cache/sip`) и запускает; короче: `sip FILE.sip` |
-| `sip build FILE.sip [-o OUT]` | собирает исполняемый файл |
+| `sip run FILE.sip [args]` | собирает (с кэшем в `~/.cache/sip`) и запускает; короче: `sip FILE.sip`. В папке пакета файл можно не указывать |
+| `sip build FILE.sip [-o OUT] [--whole]` | собирает исполняемый файл: каждый модуль — своя единица C из кэша; `--whole` — одной единицей |
+| `sip init NAME` | создаёт пакет: `NAME/sip.toml` и `NAME/main.sip` |
 | `sip check FILE.sip...` | проверяет синтаксис и типы |
 | `sip c FILE.sip [-o OUT.c]` | показывает сгенерированный C |
 
@@ -58,7 +59,7 @@ pip install -e .
 
 ## Библиотека
 
-Модули `.sip` подключаются через `import`, а встроенные модули `math`, `random`, `time`, `json`, `csv`, `http` есть всегда. JSON и CSV читаются сразу в нужный тип, без промежуточных словарей:
+Модули `.sip` подключаются через `import`; имена на `_` видны только в своём модуле. Пакет — папка с `sip.toml`, зависимости в нём указываются папкой или git-репозиторием с ревизией. Каждый модуль компилируется отдельно и берётся из кэша, если не менялся. Встроенные модули `math`, `random`, `time`, `json`, `csv`, `http` есть всегда. JSON и CSV читаются сразу в нужный тип, без промежуточных словарей:
 
 ```
 type User(name str, age int, email str? = nil)
@@ -84,16 +85,16 @@ async fn main()
 | [siplang/types.py](siplang/types.py) | типы и их представление в C |
 | [siplang/checker.py](siplang/checker.py) | вывод и проверка типов (унификация) |
 | [siplang/cregistry.py](siplang/cregistry.py) | C-код для конкретных списков, словарей, кортежей, записей |
-| [siplang/modules.py](siplang/modules.py) | `import`: сборка программы из нескольких файлов |
+| [siplang/modules.py](siplang/modules.py) | `import`, пакеты (`sip.toml`, зависимости), приватные имена |
 | [siplang/cgen.py](siplang/cgen.py) | AST с типами → C |
 | [siplang/native/sip_rt.h](siplang/native/sip_rt.h) | рантайм: строки, аллокатор, ошибки (setjmp), форматирование чисел как в Python, JSON, CSV, HTTP (libcurl), задачи |
-| [siplang/compiler.py](siplang/compiler.py) | вызов clang, кэш сборок |
+| [siplang/compiler.py](siplang/compiler.py) | вызов clang, раздельная компиляция, кэш объектных файлов и бинарников |
 | [siplang/cli.py](siplang/cli.py) | команда `sip` |
 
 ## Документация
 
 - [docs/spec.md](docs/spec.md) — справочник языка.
-- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 1400 токенов.
+- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 1500 токенов.
 - [bench/](bench/) — замер токенов, по которому выбирали синтаксис ([DECISION.md](bench/DECISION.md)), и замер скорости ([speed](bench/speed/)).
 
 ## Тесты

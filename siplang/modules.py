@@ -8,7 +8,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import subprocess
+import tomllib
 from dataclasses import fields
 
 from .errors import SipError
@@ -32,10 +36,17 @@ class SourceMap:
     def __init__(self):
         self.files: list = []  # [(offset, path, строки)]
 
+    BAND = 1 << 20  # строк на файл: номер строки = номер файла * BAND + строка в файле
+
     def add(self, path: str, src: str) -> int:
-        offset = sum(len(lines) for _, _, lines in self.files)
+        # у каждого файла своя полоса номеров: строки модуля не сдвигаются, когда меняются другие
+        offset = len(self.files) * self.BAND
         self.files.append((offset, path, src.splitlines() or [""]))
         return offset
+
+    def sources(self) -> list:
+        """Файлы, от которых зависит программа: модули и sip.toml пакетов."""
+        return [os.path.abspath(p) for _, p, _ in self.files] + list(getattr(self, "extra", []))
 
     def locate(self, line: int):
         """Строка программы -> (файл, строка в файле)."""
@@ -67,39 +78,160 @@ def _fn_locals(fn: FnDef) -> set:
     return names
 
 
+NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+
+
+class Package:
+    """Папка с sip.toml: имя пакета и его зависимости {имя: папка}."""
+
+    def __init__(self, root: str, name: str, deps: dict, toml: str):
+        self.root = root
+        self.name = name
+        self.deps = deps
+        self.toml = toml
+
+
+def fetch_git(name: str, url: str, rev: str, where: str, line: int) -> str:
+    """git-зависимость: клон нужной ревизии в кэше (один раз)."""
+    from .compiler import cache_dir
+    dest = cache_dir() / "pkgs" / f"{name}-{hashlib.sha256(f'{url}@{rev}'.encode()).hexdigest()[:12]}"
+    if dest.exists():
+        return str(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f"{dest}.tmp{os.getpid()}"
+    try:
+        for cmd in (["git", "clone", "--quiet", url, tmp], ["git", "-C", tmp, "checkout", "--quiet", rev]):
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise SipError(f"dependency '{name}': {' '.join(cmd[:2])} failed: {r.stderr.strip()[:500]}",
+                               line, 0, where)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            subprocess.run(["rm", "-rf", tmp])
+    return str(dest)
+
+
+def read_package(root: str) -> Package:
+    toml = os.path.join(root, "sip.toml")
+    try:
+        with open(toml, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise SipError(f"bad sip.toml: {e}", 0, 0, toml) from None
+    pkg = data.get("package", {})
+    name = pkg.get("name") or os.path.basename(os.path.abspath(root))
+    if not NAME_RE.match(name):
+        raise SipError(f"package name '{name}' must be a valid identifier", 0, 0, toml)
+    deps = {}
+    for dname, spec in (data.get("deps") or {}).items():
+        if not NAME_RE.match(dname):
+            raise SipError(f"dependency name '{dname}' must be a valid identifier", 0, 0, toml)
+        if isinstance(spec, str):
+            spec = {"path": spec}
+        if not isinstance(spec, dict):
+            raise SipError(f"dependency '{dname}': write {{ path = \"...\" }} or {{ git = \"...\", rev = \"...\" }}",
+                           0, 0, toml)
+        if "path" in spec:
+            d = os.path.normpath(os.path.join(root, spec["path"]))
+            if not os.path.isdir(d):
+                raise SipError(f"dependency '{dname}': folder {d} not found", 0, 0, toml)
+        elif "git" in spec:
+            if not spec.get("rev"):
+                raise SipError(f"dependency '{dname}': pin a version with rev = \"<tag or commit>\"", 0, 0, toml)
+            d = fetch_git(dname, spec["git"], spec["rev"], toml, 0)
+        else:
+            raise SipError(f"dependency '{dname}' needs path or git", 0, 0, toml)
+        deps[dname] = d
+    return Package(os.path.abspath(root), name, deps, toml)
+
+
+def find_package(start: str) -> Package | None:
+    """Ближайший sip.toml в папке файла или выше."""
+    d = os.path.abspath(start)
+    while True:
+        if os.path.isfile(os.path.join(d, "sip.toml")):
+            return read_package(d)
+        up = os.path.dirname(d)
+        if up == d:
+            return None
+        d = up
+
+
 class Loader:
     def __init__(self):
         self.srcmap = SourceMap()
-        self.modules: dict = {}   # имя модуля -> exports {имя: новое имя}
+        self.srcmap.extra = []
+        self.modules: dict = {}   # путь файла -> exports {имя: новое имя}
         self.loading: set = set()
         self.bodies: list = []    # тела модулей-зависимостей в порядке загрузки
+        self.packages: dict = {}  # папка -> Package | None
+        self.base = "."
+
+    def package_of(self, path: str) -> Package | None:
+        d = os.path.dirname(os.path.abspath(path))
+        if d not in self.packages:
+            pkg = find_package(d)
+            self.packages[d] = pkg
+            if pkg is not None and pkg.toml not in self.srcmap.extra:
+                self.srcmap.extra.append(pkg.toml)
+        return self.packages[d]
 
     def load_root(self, path: str, src: str) -> Module:
         mod = Parser(tokenize(src, path), path).parse_module()
         offset = self.srcmap.add(path, src)
+        pkg = self.package_of(path)
+        self.base = pkg.root if pkg is not None else os.path.dirname(os.path.abspath(path))
+        self.loading.add(os.path.abspath(path))  # import самого себя — циклический импорт
         body = self.process(mod.body, "", path, offset)
         return Module(self.bodies + body, line=1)
 
+    def resolve(self, name: str, from_path: str, node) -> tuple[str, str]:
+        """import a.b -> (путь файла, префикс имён).
+
+        Ищется: рядом с импортирующим файлом; в зависимости пакета (import dep, import dep.x);
+        от корня пакета (папки с sip.toml).
+        """
+        parts = name.split(".")
+        here = os.path.dirname(os.path.abspath(from_path))
+        tried = [os.path.join(here, *parts) + ".sip"]
+        pkg = self.package_of(from_path)
+        if pkg is not None and parts[0] in pkg.deps:
+            droot = pkg.deps[parts[0]]
+            tried.append(os.path.join(droot, *(parts[1:] or parts[:1])) + ".sip")
+        if pkg is not None:
+            tried.append(os.path.join(pkg.root, *parts) + ".sip")
+        for path in tried:
+            if os.path.isfile(path):
+                return os.path.abspath(path), self.prefix(path)
+        raise SipError(f"module '{name}' not found (looked for {', '.join(tried)})", node.line, 0, from_path)
+
+    def prefix(self, path: str) -> str:
+        """Префикс имён модуля: из пакета и пути внутри него, чтобы модули разных пакетов не путались."""
+        pkg = self.package_of(path)
+        if pkg is not None and pkg.root != self.base:
+            label = [pkg.name] + os.path.relpath(path, pkg.root)[:-4].split(os.sep)
+        else:
+            rel = os.path.relpath(path, self.base)[:-4]
+            label = [p if p != ".." else "up" for p in rel.split(os.sep)]
+        return "__".join(re.sub(r"\W", "_", p) for p in label) + "__"
+
     def load_module(self, name: str, from_path: str, node) -> dict:
-        if name in self.modules:
-            return self.modules[name]
-        if name in self.loading:
+        path, prefix = self.resolve(name, from_path, node)
+        if path in self.loading:
             raise SipError(f"circular import of '{name}'", node.line, 0, from_path)
-        path = os.path.join(os.path.dirname(os.path.abspath(from_path)), *name.split(".")) + ".sip"
-        try:
-            with open(path, encoding="utf-8") as f:
-                src = f.read()
-        except OSError:
-            raise SipError(f"module '{name}' not found (looked for {path})", node.line, 0, from_path) from None
-        self.loading.add(name)
+        if path in self.modules:
+            return self.modules[path]
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        self.loading.add(path)
         mod = Parser(tokenize(src, path), path).parse_module()
         offset = self.srcmap.add(path, src)
-        prefix = name.replace(".", "__") + "__"
         exports = {n: prefix + n for n in _top_names(mod.body)}
         body = self.process(mod.body, prefix, path, offset, exports)
         self.bodies += body
-        self.loading.discard(name)
-        self.modules[name] = exports
+        self.loading.discard(path)
+        self.modules[path] = exports
         return exports
 
     def process(self, body, prefix, path, offset, exports=None):
@@ -125,6 +257,9 @@ class Loader:
                         ex = self.load_module(s.module, path, s)
                         if n not in ex:
                             raise SipError(f"module '{s.module}' has no '{n}'", s.line, 0, path)
+                        if n.startswith("_"):
+                            raise SipError(f"'{n}' is private to module '{s.module}' (names starting with _ "
+                                           f"are not exported)", s.line, 0, path)
                         names[alias] = ex[n]
             else:
                 rest.append(s)
@@ -156,6 +291,8 @@ class Renamer:
             ex = self.mods[alias]
             if attr not in ex:
                 self.err(f"module '{alias}' has no '{attr}'", node)
+            if attr.startswith("_"):
+                self.err(f"'{attr}' is private to module '{alias}' (names starting with _ are not exported)", node)
             return ex[attr]
         mod = self.natives.get(alias, alias if alias in NATIVE else None)
         if mod is not None:
@@ -172,6 +309,7 @@ class Renamer:
         return self.new(name, local) or name
 
     def top(self, s):
+        s.mod = self.path  # файл, которому принадлежит инструкция верхнего уровня
         if isinstance(s, (FnDef, Record, SumType, Interface)):
             if s.name in self.names:
                 s.display = s.name

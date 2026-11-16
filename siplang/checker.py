@@ -71,7 +71,8 @@ class Program:
         self.fns: dict = {}        # имя -> FnInfo (функции верхнего уровня)
         self.methods: list = []    # все методы
         self.globals: dict = {}
-        self.top: FnInfo | None = None
+        self.tops: list = []       # код верхнего уровня, по функции на модуль (зависимости первыми)
+        self.mod_index: dict = {}  # файл -> номер модуля
         self.main: FnInfo | None = None
 
 
@@ -140,8 +141,21 @@ class Checker:
         raise SipError(msg, line, 0, file)
 
     def fresh(self, prefix: str) -> str:
-        self.uid += 1
-        return f"{prefix}{self.uid}"
+        """Новое имя C. Номер считается внутри текущей функции, поэтому имена в модуле
+        не меняются, когда меняются другие модули (и его объектный файл берётся из кэша)."""
+        fi = self.cur
+        if fi is None:
+            self.uid += 1
+            return f"{prefix}{self.uid}"
+        fi.nfresh = getattr(fi, "nfresh", 0) + 1
+        return f"{prefix}{fi.cname}_{fi.nfresh}"
+
+    def mod_of(self, node) -> str:
+        """Файл, в котором написан узел."""
+        line = getattr(node, "line", 0) or 0
+        if self.srcmap is not None and line:
+            return self.srcmap.locate(line)[0]
+        return self.file
 
     def unify(self, a, b) -> bool:
         a, b = prune(a), prune(b)
@@ -339,9 +353,11 @@ class Checker:
             elif isinstance(s, Record):
                 p.records[s.name] = RecordT(s.name)
                 p.records[s.name].display = getattr(s, "display", s.name)
+                p.records[s.name].mod = self.mod_of(s)
                 self.type_params(p.records[s.name], s)
             elif isinstance(s, SumType):
                 st = SumT(s.name)
+                st.mod = self.mod_of(s)
                 self.type_params(st, s)
                 st.display = getattr(s, "display", s.name)
                 st.vdisplay = {v.name: getattr(v, "display", v.name) for v in s.variants}
@@ -428,21 +444,36 @@ class Checker:
                 self.err(f"'{fn.name}' is already a type", fn)
             p.fns[fn.name] = FnInfo(fn, f"f_{fn.name}")
         for fi in list(p.fns.values()) + p.methods:
+            fi.mod = self.mod_of(fi.node)
             self.signature(fi)
 
-        # верхний уровень: присвоенные там имена — глобальные переменные
-        top = FnInfo(FnDef("<top>", [], None, top_stmts, line=1), "sip_toplevel")
-        top.ret = UNIT
-        top.body = top_stmts
-        p.top = top
-        for name in self.assigned(top_stmts):
-            p.globals[name] = Var(name, TVar(), f"g_{name}", "global")
-        top.locals = p.globals
-        self.cur = top
-        top.state = "busy"
-        self.block(top_stmts)
-        top.state = "done"
-        self.cur = None
+        # верхний уровень: присвоенные там имена — глобальные переменные; у каждого модуля своя функция
+        files = [f for _, f, _ in self.srcmap.files] if self.srcmap is not None else [self.file]
+        p.mod_index = {f: i for i, f in enumerate(files)}
+        groups: dict = {}
+        for st in top_stmts:
+            groups.setdefault(self.mod_of(st), []).append(st)
+        order = list(groups) or [files[0]]  # в порядке тел: зависимости раньше тех, кто их импортирует
+        for f in order:
+            stmts = groups.get(f, [])
+            idx = p.mod_index.get(f, 0)
+            top = FnInfo(FnDef("<top>", [], None, stmts, line=1), f"sip_top_{idx}")
+            top.ret = UNIT
+            top.body = stmts
+            top.is_top = True
+            top.mod = f
+            for name in self.assigned(stmts):
+                v = Var(name, TVar(), f"g_{name}", "global")
+                v.mod = f
+                p.globals[name] = v
+            top.locals = p.globals
+            p.tops.append(top)
+        for top in p.tops:
+            self.cur = top
+            top.state = "busy"
+            self.block(top.body)
+            top.state = "done"
+            self.cur = None
 
         for fi in list(p.fns.values()) + p.methods:
             self.check_fn(fi)
@@ -998,7 +1029,7 @@ class Checker:
                 self.err("the lambda returns nil here, but its result type is unknown", s)
             self.expect(lam.ret, t, s, "lambda result", src=s.value)
             return
-        if self.cur is self.p.top:
+        if getattr(self.cur, "is_top", False):
             self.err("return outside a function", s)
         if s.value is None:
             t = UNIT
@@ -1126,6 +1157,8 @@ class Checker:
                 self.err(f"{p.name} has {len(fields)} field(s), pattern gives {len(p.args)}", p)
             p.fields = []
             for (fname, ftype), sub in zip(fields, p.args):
+                if not isinstance(sub, PWild):
+                    self.private(t, fname, p, "field")
                 p.fields.append(fname)
                 self.pattern(sub, ftype, node, in_or)
             names = [f for f, _ in fields]
@@ -1133,6 +1166,7 @@ class Checker:
             for kname, sub in p.kwargs:
                 if kname not in names:
                     self.err(f"{p.name} has no field '{kname}'", p)
+                self.private(t, kname, p, "field")
                 p.kwfields.append(kname)
                 self.pattern(sub, dict(fields)[kname], node, in_or)
             return
@@ -1285,11 +1319,17 @@ class Checker:
         self.lookup("self")  # внутри лямбды self попадает в окружение
         return fi.owner.fields[e.name]
 
+    def private(self, t, name: str, node, what: str):
+        """Поле или метод на _ доступны только в модуле, где объявлен тип."""
+        if name.startswith("_") and getattr(t, "mod", None) is not None and self.mod_of(node) != t.mod:
+            self.err(f"{what} '{name}' of {show(t)} is private to its module", node)
+
     def e_Attr(self, e):
         t = prune(self.expr(e.obj))
         if isinstance(t, RecordT):
             if e.name not in t.fields:
                 self.err(f"{t.name} has no field '{e.name}'", e)
+            self.private(t, e.name, e, "field")
             return t.fields[e.name]
         self.err(f"{show(t)} has no field '{e.name}'", e)
 
@@ -1445,7 +1485,24 @@ class Checker:
                 if rt.params:
                     rt = instantiate(rt, targs)
                 params = [(fn, ft, rt.defaults.get(fn)) for fn, ft in rt.fields.items()]
-                self.bind_args(e, params, f"{name}()")
+                if any(fn.startswith("_") for fn, _, _ in params) and self.mod_of(e) != getattr(rt, "mod", None):
+                    # снаружи модуля приватные поля получают значения по умолчанию
+                    for fn, _, d in params:
+                        if fn.startswith("_") and d is None:
+                            self.err(f"{show(rt)} has private field '{fn}' without a default; create it with a "
+                                     f"function from its module", e)
+                    pub = [x for x in params if not x[0].startswith("_")]
+                    if len(e.args) > len(pub) or any(k.startswith("_") for k, _ in e.kwargs):
+                        self.err(f"{show(rt.base)}() outside its module takes only public fields "
+                                 f"({', '.join(x[0] for x in pub) or 'none'}); private fields are set by the module", e)
+                    self.bind_args(e, pub, f"{show(rt.base)}()")
+                    given = iter(e.bound)
+                    e.bound = [copy.deepcopy(d) if fn.startswith("_") else next(given) for fn, _, d in params]
+                    for (fn, ft, _), node in zip(params, e.bound):
+                        if fn.startswith("_"):
+                            self.expect(ft, self.expr(node, opt=True, want=ft), node, f"field '{fn}'", src=node)
+                else:
+                    self.bind_args(e, params, f"{show(rt.base)}()")
                 e.ckind, e.record = "ctor", rt
                 return rt
             if name in self.p.variants:
@@ -1468,6 +1525,7 @@ class Checker:
                 e.args = [f.obj, *e.args]
                 return self.e_Call(e)
             if isinstance(rt, (RecordT, SumT)) and f.name in rt.methods:
+                self.private(rt, f.name, e, "method")
                 fi = rt.methods[f.name]
                 e.ckind, e.fn = "method", fi
                 if fi.allparams:
@@ -1841,7 +1899,7 @@ class Checker:
             if n in names or n in scope:
                 continue
             outer = any(n in sc for sc in self.scopes) or (
-                self.cur is not None and self.cur is not self.p.top and n in self.cur.locals)
+                self.cur is not None and not getattr(self.cur, "is_top", False) and n in self.cur.locals)
             if outer:
                 self.err(f"a lambda cannot change the outer variable '{n}'; return the new value instead", e)
         e.locals = []

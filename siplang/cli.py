@@ -3,13 +3,18 @@
 import os
 import sys
 
-from .compiler import build_cached, cc_build, compile_file
+from .compiler import build_cached, cc_build, cc_build_units, compile_file, compile_units
 from .errors import SipError
 
 USAGE = """\
 usage:
-  sip run FILE.sip [args...]   compile (cached) and run (also: sip FILE.sip)
-  sip build FILE.sip [-o OUT]  build a native executable
+  sip init NAME                create a package: NAME/sip.toml and NAME/main.sip
+  sip run [FILE.sip] [args...] compile (cached) and run (also: sip FILE.sip);
+                               without FILE: main.sip of the package (sip.toml) here
+  sip build FILE.sip [-o OUT] [--whole]
+                               build a native executable; each module is a separate
+                               C unit cached by content (--whole: one unit, cross-module
+                               inlining, full rebuild)
   sip check FILE.sip...        check syntax and types only
   sip c FILE.sip [-o OUT.c]    print the generated C
 
@@ -21,10 +26,12 @@ def _err(msg: str) -> int:
     return 1
 
 
-def _out_arg(args: list[str]):
+def _out_arg(args: list[str], flags=()):
     out, files = None, []
     it = iter(args)
     for a in it:
+        if a in flags:
+            continue
         if a in ("-o", "--out"):
             out = next(it, None)
             if out is None:
@@ -36,6 +43,41 @@ def _out_arg(args: list[str]):
     return files[0], out
 
 
+def package_main() -> str:
+    """main.sip пакета, в папке которого (или ниже) запущен sip."""
+    from .modules import find_package
+    pkg = find_package(os.getcwd())
+    if pkg is None:
+        raise SipError("no .sip file given and no sip.toml here or above (create one: sip init NAME)", 0, 0, "sip")
+    main = os.path.join(pkg.root, "main.sip")
+    if not os.path.isfile(main):
+        raise SipError(f"package '{pkg.name}' has no main.sip", 0, 0, pkg.toml)
+    return main
+
+
+def cmd_init(args: list[str]) -> int:
+    if len(args) != 1:
+        return _err("usage: sip init NAME")
+    name = args[0]
+    from .modules import NAME_RE
+    pkg = os.path.basename(os.path.abspath(name))
+    if not NAME_RE.match(pkg):
+        return _err(f"package name '{pkg}' must be a valid identifier (letters, digits, _)")
+    if os.path.exists(os.path.join(name, "sip.toml")):
+        return _err(f"{name}/sip.toml already exists")
+    os.makedirs(name, exist_ok=True)
+    with open(os.path.join(name, "sip.toml"), "w", encoding="utf-8") as f:
+        f.write(f'[package]\nname = "{pkg}"\n\n[deps]\n'
+                '# util = { path = "../util" }\n'
+                '# colors = { git = "https://github.com/user/colors.git", rev = "v1.0.0" }\n')
+    main = os.path.join(name, "main.sip")
+    if not os.path.exists(main):
+        with open(main, "w", encoding="utf-8") as f:
+            f.write('fn main(name = "world")\n    print "Hello, {name}!"\n')
+    print(f"created {name}/sip.toml and {name}/main.sip; run: cd {name} && sip run")
+    return 0
+
+
 def cmd_run(path: str, args: list[str]) -> int:
     exe = build_cached(path)
     sys.stdout.flush()
@@ -43,9 +85,15 @@ def cmd_run(path: str, args: list[str]) -> int:
 
 
 def cmd_build(args: list[str]) -> int:
-    path, out = _out_arg(args)
+    path, out = _out_arg(args, ("--whole",))
     out = out or os.path.splitext(path)[0]
-    cc_build(compile_file(path), out)
+    if "--whole" in args:
+        cc_build(compile_file(path), out)
+    else:
+        with open(path, encoding="utf-8") as f:
+            units, _ = compile_units(f.read(), path)
+        st = cc_build_units(units, out)
+        print(f"{len(units)} unit(s): {st['compiled']} compiled, {st['cached']} cached", file=sys.stderr)
     print(out)
     return 0
 
@@ -92,11 +140,15 @@ def main(argv: list[str] | None = None) -> int:
     cmd, rest = argv[0], argv[1:]
     try:
         if cmd == "run":
-            if not rest:
-                return _err("run needs a file")
+            if not rest or not rest[0].endswith(".sip"):
+                return cmd_run(package_main(), rest)
             return cmd_run(rest[0], rest[1:])
         if cmd == "build":
+            if not any(a.endswith(".sip") for a in rest):
+                rest = [package_main(), *rest]
             return cmd_build(rest)
+        if cmd == "init":
+            return cmd_init(rest)
         if cmd == "c":
             return cmd_c(rest)
         if cmd == "check":

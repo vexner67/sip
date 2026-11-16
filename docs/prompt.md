@@ -21,7 +21,8 @@ Sip is Python with less noise, statically typed, compiled to native code (via C)
 - `with x as y` calls `x.enter()` (if defined) and always `x.exit()` at the end of the block, even on errors.
 - Builtins: `print len str int float bool abs min max sum avg any all sorted list count zip enumerate round read write input exit`, `@cache`, `pi`.
 - Methods: str `lower upper strip split splitlines find count replace startswith endswith isdigit isalpha join`; list `append pop insert extend sort reverse copy index count join sum avg top map filter sort_by group_by first`; dict `get keys values items copy top pop update clear`; set `add remove discard union intersection difference`. `xs.count()` is a `{T: int}` counter; `.top(n)` gives the n most common `(key, count)`.
-- `import geo` / `from lib.geo import area` loads `geo.sip` next to the file. Built-in modules need no import: `math random time json csv http`.
+- `import geo` / `from lib.geo import area` loads `geo.sip` next to the file (or from the package root / a dependency). Names starting with `_` (functions, types, fields, methods) are private to their module. Built-in modules need no import: `math random time json csv http`.
+- Package: `sip.toml` with `[package] name = "app"` and `[deps] util = { path = "../util" }` or `{ git = "...", rev = "v1" }`; `import util.x` loads `x.sip` from the dependency.
 - JSON and CSV read straight into the expected type: `users: [User] = json.read(p)`, `fn load(p str) [Row] = csv.read(p)`; `json.stringify(x, indent: 2)`, `json.write(p, x)`, `csv.write(p, rows)`. Plain `csv.read(p)` gives `[{str: str}]`.
 - `r = http.get(url, timeout: 5, headers: {...})`: `r.status r.ok r.text r.headers`, `u: User = r.json()`; `http.post(url, json: x)`. 4xx/5xx raise `HttpError`.
 - `async fn f(u str) int`; calling it makes a task; `await f(u)`; `await all(f(u) for u in urls)` runs them concurrently, in order. `await` only inside `async fn` (`async fn main` is fine).

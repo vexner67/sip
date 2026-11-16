@@ -11,12 +11,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from siplang.compiler import cc_build, compile_source  # noqa: E402
+from siplang.compiler import cc_build, cc_build_units, compile_source, compile_units  # noqa: E402
 from siplang.errors import SipError  # noqa: E402
 from siplang.lexer import tokenize  # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="siptest")
-ENV = {**os.environ, "PYTHONPATH": str(ROOT), "SIP_CACHE": os.path.join(TMP, "cache")}
+os.environ["SIP_CACHE"] = os.path.join(TMP, "cache")  # объектные файлы тестов — во временной папке
+ENV = {**os.environ, "PYTHONPATH": str(ROOT)}
+WHOLE = bool(os.environ.get("SIP_TEST_WHOLE"))  # собирать одной единицей C, как sip build --whole
 _n = 0
 
 
@@ -25,7 +27,10 @@ def build(src: str, name="t") -> str:
     _n += 1
     exe = os.path.join(TMP, f"{name}{_n}")
     flags = os.environ.get("SIP_TEST_CFLAGS", "-O1").split()
-    cc_build(compile_source(src, f"{name}.sip"), exe, flags)
+    if WHOLE:
+        cc_build(compile_source(src, f"{name}.sip"), exe, flags)
+    else:
+        cc_build_units(compile_units(src, f"{name}.sip")[0], exe, flags)
     return exe
 
 
@@ -1161,6 +1166,133 @@ print len(msgs), msgs[7], msgs[8], ys[0][0], ys[-1][0]
 """)
         self.assertEqual(out, "3001 bad 7 ok 8 0 999\n")
         self.assertGreater(n, 0)
+
+
+def write_tree(root: str, files: dict) -> None:
+    for rel, text in files.items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def sip_cli(*args, cwd=None) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-m", "siplang", *args], capture_output=True, text=True,
+                          env=ENV, cwd=cwd, timeout=120)
+
+
+class PrivacyTest(unittest.TestCase):
+    ACCT = ("type Account(owner str, _balance int = 0)\n"
+            "    fn deposit(n int)\n        ._check(n)\n        ._balance += n\n"
+            "    fn balance() int = ._balance\n"
+            "    fn _check(n int)\n        if n <= 0 then fail \"bad amount\"\n"
+            "fn _helper() int = 42\n"
+            "fn open(owner str, start int) Account = Account(owner, start)\n")
+
+    def program(self, main: str) -> str:
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"acct.sip": self.ACCT, "main.sip": main})
+        return os.path.join(d, "main.sip")
+
+    def test_public_api_works(self):
+        r = sip_cli("run", self.program('import acct\na = acct.Account("ann")\na.deposit(5)\n'
+                                        'print a.balance(), acct.open("bob", 10).balance()\n'))
+        self.assertEqual((r.returncode, r.stdout), (0, "5 10\n"), r.stderr)
+
+    def test_private_names_are_rejected(self):
+        cases = [
+            ('print acct.Account("a")._balance', "field '_balance' of Account is private to its module"),
+            ('acct.Account("a")._check(1)', "method '_check' of Account is private to its module"),
+            ("print acct._helper()", "'_helper' is private to module 'acct'"),
+            ('x = acct.Account("a", 5)', "outside its module takes only public fields (owner)"),
+            ('match acct.Account("a")\n    acct.Account(o, b) -> print b', "field '_balance' of Account is private"),
+        ]
+        for src, want in cases:
+            with self.subTest(want=want):
+                r = sip_cli("check", self.program("import acct\n" + src + "\n"))
+                self.assertIn(want, r.stderr)
+        r = sip_cli("check", self.program("from acct import _helper\n"))
+        self.assertIn("'_helper' is private to module 'acct'", r.stderr)
+
+
+class PackagesTest(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(dir=TMP)
+        colors = os.path.join(self.d, "colors")
+        write_tree(colors, {"colors.sip": 'fn red(s str) str = "<red>{s}</red>"\n'})
+        git = ["git", "-C", colors, "-c", "user.name=t", "-c", "user.email=t@t"]
+        for cmd in (["git", "init", "-q", colors], [*git[:3], "add", "."], [*git, "commit", "-qm", "init"],
+                    [*git[:3], "tag", "v1"]):
+            subprocess.run(cmd, check=True, capture_output=True)
+        write_tree(self.d, {
+            "app/sip.toml": '[package]\nname = "app"\n\n[deps]\ntextkit = { path = "../textkit" }\n'
+                            f'colors = {{ git = "file://{colors}", rev = "v1" }}\n',
+            "app/models/user.sip": "type User(name str)\n",
+            "app/main.sip": 'import textkit\nfrom textkit.fmt.pad import center\nimport colors\n'
+                            'from models.user import User\n'
+                            'fn main(n = 1)\n'
+                            '    print "[{textkit.shout("hi")}]", "[{center("x", 5)}]", colors.red(User("ann").name), n\n',
+            "textkit/sip.toml": '[package]\nname = "textkit"\n',
+            "textkit/textkit.sip": 'import fmt.pad\nfn shout(s str) str = pad.center(s.upper() + "!", 11)\n',
+            "textkit/fmt/pad.sip": "fn center(s str, w int) str\n    left = (w - len(s)) / 2\n"
+                                   '    " " * left + s + " " * (w - len(s) - left)\n',
+        })
+        self.app = os.path.join(self.d, "app")
+
+    def test_path_and_git_deps(self):
+        r = sip_cli("run", "--n", "7", cwd=self.app)  # без файла — main.sip пакета
+        self.assertEqual((r.returncode, r.stdout), (0, "[    HI!    ] [  x  ] <red>ann</red> 7\n"), r.stderr)
+
+    def test_bad_deps(self):
+        toml = os.path.join(self.app, "sip.toml")
+        text = Path(toml).read_text()
+        write_tree(self.app, {"sip.toml": text.replace('rev = "v1"', 'rev = "nope"')})
+        self.assertIn("dependency 'colors': git -C failed", sip_cli("run", cwd=self.app).stderr)
+        write_tree(self.app, {"sip.toml": text.replace(', rev = "v1"', "")})
+        self.assertIn("pin a version with rev", sip_cli("run", cwd=self.app).stderr)
+        write_tree(self.app, {"sip.toml": text.replace("../textkit", "../nowhere")})
+        self.assertIn("dependency 'textkit': folder", sip_cli("run", cwd=self.app).stderr)
+
+    def test_init(self):
+        r = sip_cli("init", "hello", cwd=self.d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = sip_cli("run", "--name", "Sip", cwd=os.path.join(self.d, "hello"))
+        self.assertEqual(r.stdout, "Hello, Sip!\n", r.stderr)
+
+
+class SeparateCompilationTest(unittest.TestCase):
+    def test_only_changed_units_rebuild(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"lib.sip": "fn twice[T](x T) T = x + x\nfn inc(n int) int = n + 1\n",
+                       "main.sip": "import lib\nprint lib.inc(1), lib.twice(2.5), lib.twice(\"ab\")\n"})
+        main, exe = os.path.join(d, "main.sip"), os.path.join(d, "app")
+
+        def build():
+            r = sip_cli("build", main, "-o", exe)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stderr.strip(), subprocess.run([exe], capture_output=True, text=True).stdout
+
+        self.assertEqual(build(), ("2 unit(s): 2 compiled, 0 cached", "2 5.0 abab\n"))
+        self.assertEqual(build()[0], "2 unit(s): 0 compiled, 2 cached")
+        with open(main, "a") as f:
+            f.write("print 3\n")
+        self.assertEqual(build(), ("2 unit(s): 1 compiled, 1 cached", "2 5.0 abab\n3\n"))
+        with open(os.path.join(d, "lib.sip"), "a") as f:
+            f.write("fn extra() int = 0\n")  # строки lib растут, но единица main не меняется
+        self.assertEqual(build()[0], "2 unit(s): 1 compiled, 1 cached")
+        r = sip_cli("build", main, "-o", exe, "--whole")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_run_sees_changed_module_and_reports_its_lines(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"lib.sip": "fn f() int = 1\n", "main.sip": "import lib\nprint lib.f()\n"})
+        main = os.path.join(d, "main.sip")
+        self.assertEqual(sip_cli("run", main).stdout, "1\n")
+        write_tree(d, {"lib.sip": "\n\nfn f() int = 2 / (1 - 1)\n"})
+        r = sip_cli("run", main)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("lib.sip:3: ZeroDivisionError", r.stderr)
+        self.assertIn("fn f() int = 2 / (1 - 1)", r.stderr)
 
 
 class ExamplesTest(unittest.TestCase):
