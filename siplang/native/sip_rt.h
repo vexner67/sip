@@ -1075,81 +1075,18 @@ static sip_str sip_input(sip_str prompt) {
 
 SIP_GV(int sip_argc);
 SIP_GV(char **sip_argv);
-SIP_GV(char *sip_used);          /* какие argv уже разобраны */
-SIP_GV(int sip_npos);
 
 static void sip_args_init(int argc, char **argv) {
     sip_argc = argc;
     sip_argv = argv;
-    sip_used = calloc((size_t)argc + 1, 1);
 }
 
-__attribute__((noreturn)) static void sip_usage_error(const char *usage, const char *msg, const char *arg) {
+/* разбор аргументов fn main — в std/rt.sip; ему нужны только argv и вывод в stderr */
+static inline int64_t sip_rt_argc(void) { return sip_argc; }
+static inline sip_str sip_rt_argv(int64_t i) { return (sip_str){sip_argv[i], (int64_t)strlen(sip_argv[i])}; }
+static void sip_rt_eput(sip_str s) {
     fflush(stdout);
-    fprintf(stderr, "%s%s\nusage: %s\n", msg, arg ? arg : "", usage);
-    exit(2);
-}
-
-static void sip_args_help(const char *usage) {
-    for (int i = 1; i < sip_argc; i++)
-        if (!strcmp(sip_argv[i], "-h") || !strcmp(sip_argv[i], "--help")) {
-            printf("usage: %s\n", usage);
-            exit(0);
-        }
-}
-
-/* Ищет --name value или --name=value. Возвращает NULL, если флага нет. */
-static const char *sip_flag(const char *name, const char *usage) {
-    size_t n = strlen(name);
-    for (int i = 1; i < sip_argc; i++) {
-        const char *a = sip_argv[i];
-        if (sip_used[i] || a[0] != '-' || a[1] != '-' || strncmp(a + 2, name, n)) continue;
-        if (a[2 + n] == '=') { sip_used[i] = 1; return a + 3 + n; }
-        if (a[2 + n] == 0) {
-            if (i + 1 >= sip_argc) sip_usage_error(usage, "missing value for --", name);
-            sip_used[i] = sip_used[i + 1] = 1;
-            return sip_argv[i + 1];
-        }
-    }
-    return NULL;
-}
-
-static bool sip_flag_bool(const char *name, bool dflt) {
-    size_t n = strlen(name);
-    for (int i = 1; i < sip_argc; i++) {
-        const char *a = sip_argv[i];
-        if (sip_used[i] || a[0] != '-' || a[1] != '-') continue;
-        if (!strcmp(a + 2, name)) { sip_used[i] = 1; return true; }
-        if (!strncmp(a + 2, "no-", 3) && !strcmp(a + 5, name)) { sip_used[i] = 1; return false; }
-        (void)n;
-    }
-    return dflt;
-}
-
-static const char *sip_positional(int index, const char *name, const char *usage) {
-    int k = 0;
-    for (int i = 1; i < sip_argc; i++) {
-        const char *a = sip_argv[i];
-        if (sip_used[i] || (a[0] == '-' && a[1] == '-' && a[2])) continue;
-        if (k++ == index) { sip_used[i] = 1; return a; }
-    }
-    sip_usage_error(usage, "missing argument: ", name);
-}
-
-/* следующий ещё не разобранный позиционный аргумент (для *args у main) */
-static const char *sip_rest_next(void) {
-    for (int i = 1; i < sip_argc; i++) {
-        const char *a = sip_argv[i];
-        if (sip_used[i] || (a[0] == '-' && a[1] == '-' && a[2])) continue;
-        sip_used[i] = 1;
-        return a;
-    }
-    return NULL;
-}
-
-static void sip_args_done(const char *usage) {
-    for (int i = 1; i < sip_argc; i++)
-        if (!sip_used[i]) sip_usage_error(usage, "unexpected argument: ", sip_argv[i]);
+    fwrite(s.p, 1, (size_t)s.n, stderr);
 }
 
 static inline sip_str sip_cstr(const char *s) { return (sip_str){s, (int64_t)strlen(s)}; }
@@ -1173,27 +1110,6 @@ static sip_str sip_from_c(const char *s) {
 #define SIP_STR_(x) #x
 #define SIP_XSTR_(x) SIP_STR_(x)
 #define SIP_SYM(name) SIP_XSTR_(__USER_LABEL_PREFIX__) name
-
-static int64_t sip_arg_int(const char *s, const char *name, const char *usage) {
-    char *end;
-    errno = 0;
-    long long v = strtoll(s, &end, 10);
-    if (!*s || *end || errno) sip_usage_error(usage, "expected an integer for ", name);
-    return v;
-}
-
-static double sip_arg_float(const char *s, const char *name, const char *usage) {
-    char *end;
-    double v = strtod(s, &end);
-    if (!*s || *end) sip_usage_error(usage, "expected a number for ", name);
-    return v;
-}
-
-static bool sip_arg_bool(const char *s, const char *name, const char *usage) {
-    if (!strcmp(s, "true") || !strcmp(s, "1") || !strcmp(s, "yes")) return true;
-    if (!strcmp(s, "false") || !strcmp(s, "0") || !strcmp(s, "no")) return false;
-    sip_usage_error(usage, "expected true or false for ", name);
-}
 
 /* ---------- math, random, time ---------- */
 #include <time.h>

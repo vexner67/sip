@@ -369,6 +369,15 @@ class SemanticsTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("--times", r.stderr)
 
+    def test_main_several_positionals_and_flag_values(self):
+        # позиционные идут по порядку, а значение флага (--rate 2) не принимается за позиционный аргумент
+        src = "fn main(src str, n int, *more int, rate = 1.5, quiet = false)\n    print src, n, more, rate, quiet"
+        self.assertEqual(run(src, "a", "3"), "a 3 [] 1.5 False\n")
+        self.assertEqual(run(src, "--rate", "2", "a", "3", "4", "--quiet", "5"), "a 3 [4, 5] 2.0 True\n")
+        r = proc(src, ["a"])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("missing argument: n", r.stderr)
+
     def test_print_command_forms(self):
         src = "type T(v int)\n    fn show()\n        print .v\nprint [1, 2]\nprint\nprint 'a', 'b'\nT(3).show()"
         self.assertEqual(run(src), "[1, 2]\n\na b\n3\n")

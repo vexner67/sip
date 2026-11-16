@@ -354,17 +354,17 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
                     usage = usage + " [--{fl}]"
                 else
                     usage = usage + " [--{fl} {name.upper()}]"
-            u = c_bytes(usage)
+            u = "SIP_LIT({c_bytes(usage)})"
             .emit("sip_args_init(argc, argv);")
-            .emit("sip_args_help({u});")
+            .emit("f_std__rt__args_help({u});")
             args: [str] = []
-            pos = 0
+            positional: [str] = []  # разбираются после флагов: значение флага не должно попасть в позиционные
             rest_var = ""
             rest_t = UNIT
             rest_flag = ""
             for idx, p in enumerate(m.params)
                 name = p.name
-                flg = c_bytes(name.replace("_", "-"))
+                flg = "SIP_LIT({c_bytes(name.replace('_', '-'))})"
                 full = deep(p.ty)
                 pt = if full.k == "opt" then prune(full.a[0]) else full
                 conv = .arg_conv(pt)
@@ -374,28 +374,29 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
                     rest_t = full
                     rest_flag = flg
                 elif p.default == nil
-                    s = "sip_positional({pos}, {c_bytes(name)}, {u})"
-                    pos += 1
-                    .emit("{var} = " + (if conv != "" then "{conv}({s}, {flg}, {u});" else "sip_cstr({s});"))
+                    s = "f_std__rt__arg_pos(SIP_LIT({c_bytes(name)}), {u})"
+                    positional.append("{var} = " + (if conv != "" then "{conv}({s}, {flg}, {u});" else "{s};"))
                 elif is_p(pt, BOOL) and full.id == pt.id
                     d: N = p.default
-                    .emit("{var} = sip_flag_bool({flg}, {.ex(d)});")
+                    .emit("{var} = f_std__rt__arg_flag_bool({flg}, {.ex(d)});")
                 else
                     d: N = p.default
-                    s = .tmp("const char *", "s")
-                    .emit("{s} = sip_flag({flg}, {u});")
-                    val = if conv != "" then "{conv}({s}, {flg}, {u})" else "sip_cstr({s})"
-                    .emit("{var} = {s} ? {.convert(val, pt, full, 0)} : {.ex(d)};")
+                    s = .tmp("sip_str", "s")
+                    .emit("{s} = f_std__rt__arg_flag({flg}, {u});")
+                    val = if conv != "" then "{conv}({s}, {flg}, {u})" else s
+                    .emit("{var} = f_std__rt__arg_found() ? {.convert(val, pt, full, 0)} : {.ex(d)};")
                 args.append(var)
+            for line in positional
+                .emit(line)
             if rest_var != ""
                 k = .k(rest_t)
                 et = deep(rest_t.a[0])
                 conv = .arg_conv(et)
-                s = .tmp("const char *", "s")
-                val = if conv != "" then "{conv}({s}, {rest_flag}, {u})" else "sip_cstr({s})"
+                s = .tmp("sip_str", "s")
+                val = if conv != "" then "{conv}({s}, {rest_flag}, {u})" else s
                 .emit("{rest_var} = {k}_new(0);")
-                .emit("while (({s} = sip_rest_next()) != NULL) {k}_push({rest_var}, {val});")
-            .emit("sip_args_done(" + u + ");")
+                .emit("while (({s} = f_std__rt__arg_rest(), f_std__rt__arg_found())) {k}_push({rest_var}, {val});")
+            .emit("f_std__rt__args_done(" + u + ");")
             call = "{m.cname}({', '.join(args)})"
             if m.is_async  # async fn main: сразу выполнить задачу
                 call = "{.k(task_t(deep(m.ret)))}_await({call}, {m.node.line})"
@@ -413,9 +414,9 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
             "}}\n")
 
     fn arg_conv(t Ty) str
-        if is_p(t, INT) then return "sip_arg_int"
-        if is_p(t, FLOAT) then return "sip_arg_float"
-        if is_p(t, BOOL) then return "sip_arg_bool"
+        if is_p(t, INT) then return "f_std__rt__arg_int"
+        if is_p(t, FLOAT) then return "f_std__rt__arg_float"
+        if is_p(t, BOOL) then return "f_std__rt__arg_bool"
         ""
 
     fn begin(fi Fn)

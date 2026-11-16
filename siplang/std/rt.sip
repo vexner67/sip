@@ -22,6 +22,9 @@ extern "sip" fn _done(b ptr) str = sip_rt_done
 extern "sip" fn _atof(s str) float = sip_rt_atof
 extern "sip" fn _tofloat(s str) float = sip_rt_tofloat  # потом _fbad(): не число ли
 extern "sip" fn _fbad() bool = sip_rt_fbad_get
+extern "sip" fn _argc() int = sip_rt_argc
+extern "sip" fn _argv(i int) str = sip_rt_argv
+extern "sip" fn _eput(s str) = sip_rt_eput
 
 fn _space(c int) bool = c == 32 or (c >= 9 and c <= 13)
 
@@ -913,3 +916,126 @@ fn csv_put(b ptr, s str, d int)
         j = _find(s, "\"", start)
     _put(b, _sub(s, start, len(s)))
     _putc(b, 34)
+
+# ---------- аргументы fn main ----------
+# Сгенерированный main разбирает командную строку функциями ниже: позиционные аргументы, --name value,
+# --name=value, --flag / --no-flag и *rest. Разобранные отмечаются в _used; arg_found — нашёлся ли
+# последний запрошенный флаг (или ещё один аргумент для *rest).
+
+type _ArgState(found bool)
+
+_argl: [str] = []
+_used: [bool] = []
+_ast = _ArgState(false)
+
+fn _usage_error(usage str, msg str)
+    _eput("{msg}\nusage: {usage}\n")
+    exit(2)
+
+fn args_help(usage str)
+    for i in 0.._argc() - 1
+        _argl.append(_argv(i))
+        _used.append(false)
+    for i in 1..len(_argl) - 1
+        if _argl[i] == "-h" or _argl[i] == "--help"
+            print "usage: {usage}"
+            exit(0)
+
+fn _dashes(a str) bool = len(a) >= 2 and _byte(a, 0) == 45 and _byte(a, 1) == 45
+
+fn _is_flag(a str) bool = len(a) > 2 and _dashes(a)
+
+fn arg_found() bool = _ast.found
+
+# --name value или --name=value
+fn arg_flag(name str, usage str) str
+    _ast.found = false
+    n = len(name)
+    for i in 1..len(_argl) - 1
+        a = _argl[i]
+        if _used[i] or not _dashes(a) or len(a) < 2 + n or not _eq_at(a, 2, name) then continue
+        if len(a) > 2 + n and _byte(a, 2 + n) == 61
+            _used[i] = true
+            _ast.found = true
+            return _sub(a, 3 + n, len(a))
+        if len(a) == 2 + n
+            if i + 1 >= len(_argl) then _usage_error(usage, "missing value for --" + name)
+            _used[i] = true
+            _used[i + 1] = true
+            _ast.found = true
+            return _argl[i + 1]
+    ""
+
+fn arg_flag_bool(name str, dflt bool) bool
+    for i in 1..len(_argl) - 1
+        a = _argl[i]
+        if _used[i] or not _dashes(a) then continue
+        r = _sub(a, 2, len(a))
+        if r == name
+            _used[i] = true
+            return true
+        if len(r) >= 3 and _eq_at(r, 0, "no-") and _sub(r, 3, len(r)) == name
+            _used[i] = true
+            return false
+    dflt
+
+# следующий позиционный аргумент; флаги к этому времени уже разобраны
+fn arg_pos(name str, usage str) str
+    for i in 1..len(_argl) - 1
+        a = _argl[i]
+        if _used[i] or _is_flag(a) then continue
+        _used[i] = true
+        return a
+    _usage_error(usage, "missing argument: " + name)
+    ""
+
+# следующий ещё не разобранный позиционный аргумент (для *args у main)
+fn arg_rest() str
+    _ast.found = false
+    for i in 1..len(_argl) - 1
+        a = _argl[i]
+        if _used[i] or _is_flag(a) then continue
+        _used[i] = true
+        _ast.found = true
+        return a
+    ""
+
+fn args_done(usage str)
+    for i in 1..len(_argl) - 1
+        if not _used[i] then _usage_error(usage, "unexpected argument: " + _argl[i])
+
+# как strtoll: пробелы, знак, цифры, без переполнения
+fn arg_int(s str, name str, usage str) int
+    n = len(s)
+    i = 0
+    while i < n and _space(_byte(s, i))
+        i += 1
+    neg = false
+    if i < n and (_byte(s, i) == 45 or _byte(s, i) == 43)
+        neg = _byte(s, i) == 45
+        i += 1
+    v = 0
+    digits = 0
+    ok = true
+    while ok and i < n
+        c = _byte(s, i)
+        i += 1
+        d = c - 48
+        if not _digit(c) or v < -922337203685477580 or (v == -922337203685477580 and d > 8)
+            ok = false
+        else
+            v = v * 10 - d
+            digits += 1
+    if not ok or digits == 0 or (not neg and v == -9223372036854775807 - 1) then _usage_error(usage, "expected an integer for " + name)
+    if neg then v else -v
+
+fn arg_float(s str, name str, usage str) float
+    v = _tofloat(s)
+    if _fbad() then _usage_error(usage, "expected a number for " + name)
+    v
+
+fn arg_bool(s str, name str, usage str) bool
+    if s == "true" or s == "1" or s == "yes" then return true
+    if s == "false" or s == "0" or s == "no" then return false
+    _usage_error(usage, "expected true or false for " + name)
+    false

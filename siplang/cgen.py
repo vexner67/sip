@@ -68,6 +68,10 @@ def has_call(node) -> bool:
     return False
 
 
+# аргументы fn main: преобразование строки (std/rt.sip)
+ARG_CONV = {INT: "f_std__rt__arg_int", FLOAT: "f_std__rt__arg_float", BOOL: "f_std__rt__arg_bool"}
+
+
 class CGen:
     def __init__(self, prog: Program, file: str, srcmap):
         self.p = prog
@@ -258,42 +262,43 @@ class CGen:
                     usage += f" [--{flag}]"
                 else:
                     usage += f" [--{flag} {name.upper()}]"
-            u = c_bytes(usage.encode())
+            u = f"SIP_LIT({c_bytes(usage.encode())})"
             self.emit("sip_args_init(argc, argv);")
-            self.emit(f"sip_args_help({u});")
+            self.emit(f"f_std__rt__args_help({u});")
             args = []
-            pos = 0
+            positional = []  # разбираются после флагов: значение флага не должно попасть в позиционные
             rest = None
             for idx, (name, t, d) in enumerate(m.params):
-                flag = c_bytes(name.replace("_", "-").encode())
+                flag = f"SIP_LIT({c_bytes(name.replace('_', '-').encode())})"
                 full = deep(t)
                 pt = prune(full.inner) if isinstance(full, OptT) else full
-                conv = {INT: "sip_arg_int", FLOAT: "sip_arg_float", BOOL: "sip_arg_bool"}.get(pt)
+                conv = ARG_CONV.get(pt)
                 var = self.tmp(self.c(full), "a")
                 if idx == star:
                     rest = (var, full, flag)  # заполняется после флагов: им нужны свои значения
                 elif d is None:
-                    s = f"sip_positional({pos}, {c_bytes(name.encode())}, {u})"
-                    pos += 1
-                    self.emit(f"{var} = " + (f"{conv}({s}, {flag}, {u});" if conv else f"sip_cstr({s});"))
+                    s = f"f_std__rt__arg_pos(SIP_LIT({c_bytes(name.encode())}), {u})"
+                    positional.append(f"{var} = " + (f"{conv}({s}, {flag}, {u});" if conv else f"{s};"))
                 elif pt is BOOL and full is pt:
-                    self.emit(f"{var} = sip_flag_bool({flag}, {self.ex(d)});")
+                    self.emit(f"{var} = f_std__rt__arg_flag_bool({flag}, {self.ex(d)});")
                 else:
-                    s = self.tmp("const char *", "s")
-                    self.emit(f"{s} = sip_flag({flag}, {u});")
-                    val = f"{conv}({s}, {flag}, {u})" if conv else f"sip_cstr({s})"
-                    self.emit(f"{var} = {s} ? {self.convert(val, pt, full, 0)} : {self.ex(d)};")
+                    s = self.tmp("sip_str", "s")
+                    self.emit(f"{s} = f_std__rt__arg_flag({flag}, {u});")
+                    val = f"{conv}({s}, {flag}, {u})" if conv else s
+                    self.emit(f"{var} = f_std__rt__arg_found() ? {self.convert(val, pt, full, 0)} : {self.ex(d)};")
                 args.append(var)
+            for line in positional:
+                self.emit(line)
             if rest is not None:
                 var, full, flag = rest
                 k = self.k(full)
                 et = deep(full.elem)
-                conv = {INT: "sip_arg_int", FLOAT: "sip_arg_float", BOOL: "sip_arg_bool"}.get(et)
-                s = self.tmp("const char *", "s")
-                val = f"{conv}({s}, {flag}, {u})" if conv else f"sip_cstr({s})"
+                conv = ARG_CONV.get(et)
+                s = self.tmp("sip_str", "s")
+                val = f"{conv}({s}, {flag}, {u})" if conv else s
                 self.emit(f"{var} = {k}_new(0);")
-                self.emit(f"while (({s} = sip_rest_next()) != NULL) {k}_push({var}, {val});")
-            self.emit("sip_args_done(" + u + ");")
+                self.emit(f"while (({s} = f_std__rt__arg_rest(), f_std__rt__arg_found())) {k}_push({var}, {val});")
+            self.emit("f_std__rt__args_done(" + u + ");")
             call = f"{m.cname}({', '.join(args)})"
             if getattr(m, "is_async", False):  # async fn main: сразу выполнить задачу
                 call = f"{self.k(TaskT(deep(m.ret)))}_await({call}, {m.node.line})"
