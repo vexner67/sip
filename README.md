@@ -97,6 +97,7 @@ async fn main()
 | [siplang/std/](siplang/std/) | стандартная библиотека на Sip: `os`, `path`, `re` |
 | [siplang/compiler.py](siplang/compiler.py) | вызов clang, раздельная компиляция, кэш объектных файлов и бинарников |
 | [siplang/cli.py](siplang/cli.py) | команда `sip` |
+| [selfhost/](selfhost/) | компилятор на самом Sip: лексер и парсер уже переписаны и совпадают с Python, проверка типов и генерация C пока на Python |
 
 ## Документация
 

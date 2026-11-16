@@ -1800,5 +1800,19 @@ class ExamplesTest(unittest.TestCase):
         self.assertEqual(r.stderr, f"{p}:2: IndexError: list index out of range\n    print xs[2]\n")
 
 
+class SelfhostTest(unittest.TestCase):
+    """Лексер и парсер на Sip выдают то же, что эталон на Python."""
+
+    def test_parity(self):
+        sys.path.insert(0, str(ROOT / "selfhost"))
+        import parity
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            bad = parity.main([])
+        self.assertEqual(bad, 0, buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
