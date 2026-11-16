@@ -1,7 +1,7 @@
 # Регулярные выражения: POSIX ERE (как grep -E) и сокращения \d \w \s \D \W \S.
 # Нет ленивых *? и просмотра вперёд/назад. Позиции — в байтах.
 
-extern "sip" fn _compile(pattern str) ptr = sip_re_compile
+extern "sip" fn _compile(posix str, pattern str) ptr = sip_re_compile
 extern "sip" fn _subject(s str) ptr = sip_re_subject
 extern "sip" fn _exec(r ptr, subj ptr, start int) ptr? = sip_re_exec
 extern "sip" fn _ngroups(m ptr) int = sip_re_ngroups
@@ -13,10 +13,63 @@ type Match(text str, start int, end int, groups [str])
 
 _cache: {str: ptr} = {}
 
+# шаблон -> POSIX ERE: \d \w \s и \D \W \S (в том числе внутри [...]), \n \t \r; [\]] внутри класса — символ
+fn _posix(p str) str
+    out: [str] = []
+    in_class = false
+    n = len(p)
+    i = 0
+    while i < n
+        c = p[i]
+        if c == "\\" and i + 1 < n
+            i += 1
+            d = p[i]
+            cls = if d == "d" then "0-9" elif d == "w" then "[:alnum:]_" elif d == "s" then "[:space:]" else ""
+            neg = if d == "D" then "0-9" elif d == "W" then "[:alnum:]_" elif d == "S" then "[:space:]" else ""
+            if cls != ""
+                out.append(if in_class then cls else "[" + cls + "]")
+            elif neg != "" and not in_class
+                out.append("[^" + neg + "]")
+            elif d == "n"
+                out.append("\n")
+            elif d == "t"
+                out.append("\t")
+            elif d == "r"
+                out.append("\r")
+            elif in_class
+                out.append(d)
+            else
+                out.append("\\" + d)
+            i += 1
+            continue
+        if not in_class and c == "["
+            in_class = true
+            out.append(c)
+            if i + 1 < n and p[i + 1] == "^"
+                i += 1
+                out.append("^")
+            if i + 1 < n and p[i + 1] == "]"
+                i += 1
+                out.append("]")
+            i += 1
+            continue
+        if in_class and c == "[" and i + 1 < n and p[i + 1] == ":"  # [:alpha:]
+            k = i + 2
+            while k < n and p[k] != "]"
+                k += 1
+            if k < n
+                out.append(p[i:k + 1])
+                i = k + 1
+                continue
+        if in_class and c == "]" then in_class = false
+        out.append(c)
+        i += 1
+    "".join(out)
+
 fn _re(pattern str) ptr
     r = _cache.get(pattern)
     if r != nil then return r
-    c = _compile(pattern)
+    c = _compile(_posix(pattern), pattern)
     _cache[pattern] = c
     c
 

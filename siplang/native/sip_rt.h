@@ -1534,53 +1534,13 @@ static sip_str sip_os_platform(void) {
 #endif
 }
 
-/* Регулярные выражения: POSIX ERE (regex.h) и сокращения \d \w \s \D \W \S, в том числе внутри [...] */
+/* Регулярные выражения: POSIX ERE (regex.h); сокращения \d \w \s ... переводит std/re.sip */
 typedef struct { regex_t re; int64_t ngroups; } sip_re;
 typedef struct { int64_t n; regmatch_t m[]; } sip_re_match;
 
-static void *sip_re_compile(sip_str pat) {
-    sip_sb sb = sip_sb_new();
-    int in_class = 0;
-    for (int64_t i = 0; i < pat.n; i++) {
-        char c = pat.p[i];
-        if (c == '\\' && i + 1 < pat.n) {
-            char d = pat.p[++i];
-            const char *cls = d == 'd' ? "0-9" : d == 'w' ? "[:alnum:]_" : d == 's' ? "[:space:]" : NULL;
-            const char *neg = d == 'D' ? "0-9" : d == 'W' ? "[:alnum:]_" : d == 'S' ? "[:space:]" : NULL;
-            if (cls) {
-                if (in_class) sip_sb_put(&sb, cls, (int64_t)strlen(cls));
-                else { sip_sb_putc(&sb, '['); sip_sb_put(&sb, cls, (int64_t)strlen(cls)); sip_sb_putc(&sb, ']'); }
-            } else if (neg && !in_class) {
-                sip_sb_put(&sb, "[^", 2); sip_sb_put(&sb, neg, (int64_t)strlen(neg)); sip_sb_putc(&sb, ']');
-            } else if (d == 'n' || d == 't' || d == 'r') {
-                sip_sb_putc(&sb, d == 'n' ? '\n' : d == 't' ? '\t' : '\r');
-            } else if (in_class) {
-                sip_sb_putc(&sb, d);  /* [\]] и т. п.: символ как есть */
-            } else {
-                sip_sb_putc(&sb, '\\'); sip_sb_putc(&sb, d);
-            }
-            continue;
-        }
-        if (!in_class && c == '[') {
-            in_class = 1;
-            sip_sb_putc(&sb, c);
-            if (i + 1 < pat.n && pat.p[i + 1] == '^') sip_sb_putc(&sb, pat.p[++i]);
-            if (i + 1 < pat.n && pat.p[i + 1] == ']') sip_sb_putc(&sb, pat.p[++i]);
-            continue;
-        }
-        if (in_class && c == '[' && i + 1 < pat.n && pat.p[i + 1] == ':') {  /* [:alpha:] */
-            const char *end = memchr(pat.p + i + 2, ']', (size_t)(pat.n - i - 2));
-            if (end) {
-                int64_t k = end - pat.p;
-                sip_sb_put(&sb, pat.p + i, k - i + 1);
-                i = k;
-                continue;
-            }
-        }
-        if (in_class && c == ']') in_class = 0;
-        sip_sb_putc(&sb, c);
-    }
-    sip_str t = sip_sb_done(&sb);
+/* posix — шаблон, уже переведённый std/re.sip в POSIX ERE; pat — исходный, для сообщения об ошибке */
+static void *sip_re_compile(sip_str posix, sip_str pat) {
+    sip_str t = posix;
     sip_re *r = malloc(sizeof *r);  /* шаблоны кэширует std/re.sip, поэтому не освобождаются */
     int err = regcomp(&r->re, sip_ffi_cstr(t), REG_EXTENDED);
     if (err) {
