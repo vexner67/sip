@@ -1,9 +1,18 @@
-DEFAULTS = {host: "localhost", port: 8080, debug: false}
+DEFAULTS = {host: "localhost", port: "8080", debug: "false"}
 
-fn load_config(path str) dict
-    try DEFAULTS | json.parse(read(path))
+fn parse(text str) {str: str}
+    conf = DEFAULTS.copy()
+    for line in text.splitlines()
+        line = line.strip()
+        if not line or line.startswith("#") then continue
+        i = line.find("=")
+        if i < 0 then fail "bad config line: {line}"
+        conf[line[:i].strip()] = line[i + 1:].strip()
+    conf
+
+fn load_config(path str) {str: str}
+    try parse(read(path))
     catch NotFound -> DEFAULTS
-    catch ParseError e -> fail "bad config: {e}"
 
 fn main(path str)
     for key, value in load_config(path)

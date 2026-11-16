@@ -186,6 +186,13 @@ class Parser:
                     args.append(self.parse_expr())
             return self.node(ExprStmt, Call(Name("print", line=tok.line), args, [], line=tok.line), tok=tok)
 
+        if k == "NAME" and self.peek(1).kind == ":":
+            self.advance()
+            self.advance()
+            typ = self.parse_type()
+            self.expect("=", "'=' after the type")
+            return self.node(AnnAssign, Name(tok.value, line=tok.line), typ, self.parse_expr(), tok=tok)
+
         first = self.parse_exprlist()
         if self.at("="):
             targets = [first]

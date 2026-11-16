@@ -1,7 +1,3 @@
-"""Sip: язык программирования, который бережёт токены ИИ. Транслируется в Python."""
+"""Sip: компактный язык программирования, компилируемый в машинный код через C."""
 
-from .compiler import Compiled, compile_file, compile_source, execute
-from .errors import SipError
-
-__version__ = "0.1.0"
-__all__ = ["Compiled", "SipError", "compile_file", "compile_source", "execute"]
+__version__ = "0.2.0"

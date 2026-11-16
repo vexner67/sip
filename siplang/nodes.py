@@ -246,6 +246,14 @@ class Assign(Node):
 
 
 @dataclass
+class AnnAssign(Node):
+    """`x: [int] = []` — присваивание с явным типом."""
+    target: Node
+    type: Node
+    value: Node
+
+
+@dataclass
 class AugAssign(Node):
     target: Node
     op: str
