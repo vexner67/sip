@@ -214,6 +214,7 @@ class CGen:
             self.emit(call + ";")
         body = self.finish()
         return ("int main(int argc, char **argv) {\n"
+                "    sip_gc_init(__builtin_frame_address(0));\n"
                 "    static char sip_outbuf[1 << 16];\n"
                 "    setvbuf(stdout, sip_outbuf, _IOFBF, sizeof sip_outbuf);\n"
                 "    (void)argc; (void)argv;\n"

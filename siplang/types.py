@@ -97,6 +97,18 @@ def is_ref(t: Type) -> bool:
     return isinstance(prune(t), (ListT, DictT, RecordT, SumT, SetT))
 
 
+def no_ptrs(t: Type) -> bool:
+    """В значении типа нет указателей: его память сборщик мусора не сканирует."""
+    t = prune(t)
+    if isinstance(t, Prim):
+        return t is not STR
+    if isinstance(t, TupleT):
+        return all(no_ptrs(x) for x in t.items)
+    if isinstance(t, OptT):
+        return not is_ref(t.inner) and no_ptrs(t.inner)
+    return False
+
+
 _tv_counter = [0]
 
 

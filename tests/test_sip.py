@@ -1,6 +1,7 @@
 """Тесты Sip: лексер, проверка типов, нативный код (через clang) и CLI."""
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -857,6 +858,111 @@ class WithTest(unittest.TestCase):
         self.assertIn("with needs a record with exit()", errors_of("with 5 as x\n    pass"))
         self.assertIn("must take no arguments",
                       errors_of("type T(n int)\n    fn exit(x int)\n        pass\nwith T(1)\n    pass"))
+
+
+class GcTest(unittest.TestCase):
+    """Сборщик мусора: SIP_GC_MIN=0 собирает мусор на каждом новом блоке памяти."""
+
+    def gc_run(self, src: str, gc: str = "0"):
+        env = {**os.environ, "SIP_GC_MIN": gc, "SIP_GC_STATS": "1"}
+        r = subprocess.run([build(src, "gc")], capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        m = re.search(r"sip gc: (\d+) collections, [\d.]+ s, peak heap ([\d.]+) MB", r.stderr)
+        self.assertIsNotNone(m, r.stderr)
+        return r.stdout, int(m.group(1)), float(m.group(2))
+
+    STRESS = """\
+type Node = Leaf(v int) | Pair(l Node, r Node)
+
+type Person
+    name str
+    tags [str]
+
+fn build(d int, v int) Node = if d == 0 then Leaf(v) else Pair(build(d - 1, v * 2), build(d - 1, v * 2 + 1))
+
+fn total(n Node) int = match n
+    Leaf(v) -> v
+    Pair(l, r) -> total(l) + total(r)
+
+keep = build(12, 1)
+people = {}
+for i in 0..2000 - 1
+    people["p{i}"] = Person("name {i}", ["t{i}", "u{i}"])
+words = []
+check = 0
+for round in 0..300 - 1
+    junk = build(8, round)
+    check += total(junk)
+    s = ""
+    for j in 0..50 - 1
+        s = s + "{j},"
+    parts = s.split(",")
+    words.append(parts[round % 50])
+    m = {}
+    for j in 0..200 - 1
+        m["k{j}"] = [j, j * 2]
+    check += m["k7"][1]
+    add = fn(x int) = x + round
+    check += add(1)
+print total(keep), check, len(words), words[299]
+ok = 0
+for i in 0..2000 - 1
+    p = people["p{i}"]
+    if p.name == "name {i}" and p.tags[1] == "u{i}" then ok += 1
+print ok
+"""
+
+    def test_live_data_survives_collections(self):
+        out, n, peak = self.gc_run(self.STRESS)
+        self.assertEqual(out, "25163776 2949130950 300 49\n2000\n")
+        self.assertGreater(n, 10)
+        self.assertLess(peak, 12)
+
+    def test_off_keeps_everything(self):
+        out, n, peak = self.gc_run(self.STRESS, gc="100000")
+        self.assertEqual(out, "25163776 2949130950 300 49\n2000\n")
+        self.assertEqual(n, 0)
+        self.assertGreater(peak, 15)
+
+    def test_threads(self):
+        out, n, _ = self.gc_run("""\
+import time
+async fn work(i int) int
+    total = 0
+    for r in 0..200
+        parts = []
+        for j in 0..20
+            parts.append("w{i}-{j}")
+        s = ",".join(parts)
+        time.sleep(0.0001)
+        total += len(s.split(","))
+    total
+
+async fn main()
+    rs = await all(work(i) for i in 0..15)
+    print sum(rs), len(rs)
+""")
+        self.assertEqual(out, "67536 16\n")
+        self.assertGreater(n, 10)
+
+    def test_errors_and_sort_under_gc(self):
+        out, n, _ = self.gc_run("""\
+fn risky(i int) str
+    if i % 7 == 0 then fail "bad {i}"
+    "ok {i}"
+
+msgs = []
+for i in 0..3000
+    try
+        msgs.append(risky(i))
+    catch e
+        msgs.append(e)
+xs = [["{i * 37 % 1001}"] for i in 0..20000]
+ys = sorted(xs, key: fn(x [str]) = x[0] + "!")
+print len(msgs), msgs[7], msgs[8], ys[0][0], ys[-1][0]
+""")
+        self.assertEqual(out, "3001 bad 7 ok 8 0 999\n")
+        self.assertGreater(n, 0)
 
 
 class ExamplesTest(unittest.TestCase):

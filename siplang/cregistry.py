@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SetT, SumT, TaskT,
                     TupleT,
-                    comparable, ctype, deep, hashable, is_ref, key)
+                    comparable, ctype, deep, hashable, is_ref, key, no_ptrs)
 
 
 def show_t(t) -> str:
@@ -595,16 +595,17 @@ class Registry:
             "join": f"static sip_str {k}_join({k} l, sip_str sep)",
         }
         eq = eq_expr(t.elem, "l->d[i]", "x")
+        ra = "sip_realloc_atomic" if no_ptrs(t.elem) else "sip_realloc"  # числа сборщик не сканирует
         im = f"""{sigs['new']} {{
     {k} l = sip_alloc(sizeof *l);
     l->n = 0; l->cap = cap;
-    l->d = cap ? sip_realloc(NULL, (size_t)cap * sizeof({ce})) : NULL;
+    l->d = cap ? {ra}(NULL, (size_t)cap * sizeof({ce})) : NULL;
     return l;
 }}
 {sigs['push']} {{
     if (SIP_UNLIKELY(l->n == l->cap)) {{
         l->cap = l->cap ? l->cap * 2 : 4;
-        l->d = sip_realloc(l->d, (size_t)l->cap * sizeof({ce}));
+        l->d = {ra}(l->d, (size_t)l->cap * sizeof({ce}));
     }}
     l->d[l->n++] = x;
 }}
@@ -726,6 +727,7 @@ static int cmp_{k}({k} a, {k} b) {{
             "discard": f"static bool {k}_discard({k} d, {ck} key)",
             "pop": f"static {cv} {k}_pop({k} d, {ck} key, int line)",
         }
+        ra = "sip_realloc_atomic" if no_ptrs(t.key) and no_ptrs(t.val) else "sip_realloc"
         im = f"""{sigs['new']} {{ {k} d = sip_alloc(sizeof *d); memset(d, 0, sizeof *d); return d; }}
 {sigs['find']} {{
     if (SIP_UNLIKELY(!d->icap)) return -1;
@@ -738,8 +740,8 @@ static int cmp_{k}({k} a, {k} b) {{
     }}
 }}
 {sigs['rehash']} {{
-    free(d->ix);
-    d->ix = calloc((size_t)icap, sizeof(int32_t));
+    d->ix = sip_alloc_atomic((size_t)icap * sizeof(int32_t));
+    memset(d->ix, 0, (size_t)icap * sizeof(int32_t));
     d->icap = icap;
     uint64_t m = (uint64_t)icap - 1;
     for (int64_t j = 0; j < d->n; j++) {{
@@ -755,7 +757,7 @@ static int cmp_{k}({k} a, {k} b) {{
     if ((d->n + 1) * 4 > d->icap * 3) {k}_rehash(d, d->icap ? d->icap * 2 : 8);
     if (d->n == d->cap) {{
         d->cap = d->cap ? d->cap * 2 : 8;
-        d->e = sip_realloc(d->e, (size_t)d->cap * sizeof({e}));
+        d->e = {ra}(d->e, (size_t)d->cap * sizeof({e}));
     }}
     d->e[d->n] = ({e}){{key, dflt, h}};
     uint64_t m = (uint64_t)d->icap - 1, i = h & m;

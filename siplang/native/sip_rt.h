@@ -21,33 +21,463 @@
 typedef struct { const char *p; int64_t n; } sip_str;
 typedef struct { int64_t lo, hi; } sip_range;
 
-/* ---------- память: bump-аллокатор ----------
- * Самый быстрый способ выделять память: сдвиг указателя. Память не освобождается
- * до конца программы. Буферы списков и словарей растут через realloc. */
+/* ---------- память: сборщик мусора ----------
+ *
+ * Консервативный mark-sweep, как Boehm GC. Указателем считается любое слово
+ * в стеке, в глобальных переменных и в объектах, которое попадает внутрь
+ * выделенного объекта (в том числе в середину: срезы строк указывают внутрь
+ * буфера). Поэтому сгенерированному коду не нужно регистрировать корни,
+ * а выделение памяти остаётся почти таким же быстрым, как сдвиг указателя.
+ *
+ * Куча:
+ * - маленькие объекты (< 16 КБ) лежат в блоках по 64 КБ, в каждом блоке
+ *   объекты одного размера; блоки нарезаются из кусков по 4 МБ;
+ * - большие объекты выделяются через calloc и хранятся в отсортированном массиве;
+ * - «атомарные» объекты (строки, массивы чисел) не содержат указателей,
+ *   их не сканируют: случайное число не удержит мусор.
+ *
+ * Сборка запускается, когда занятая память превышает порог: вдвое больше того,
+ * что пережило прошлую сборку, но не меньше 64 МБ. Короткие программы обычно
+ * не собирают мусор ни разу.
+ *
+ * SIP_GC=off выключает сборку, SIP_GC_STATS=1 печатает статистику в конце,
+ * SIP_GC_MIN=0 собирает мусор как можно чаще (для проверки самого сборщика).
+ */
 
-static char *sip_heap_ptr, *sip_heap_end;
+#include <sys/mman.h>
+#include <time.h>
+#ifdef __APPLE__
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
+#endif
 
-static void *sip_alloc_slow(size_t n) {
-    size_t chunk = n > (1u << 20) ? n : (1u << 20);
-    char *p = malloc(chunk);
-    if (!p) { fputs("sip: out of memory\n", stderr); exit(1); }
-    sip_heap_ptr = p + n;
-    sip_heap_end = p + chunk;
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+/* ASan кладёт локальные переменные в «ложные кадры» в куче, их сборщик не увидит */
+const char *__asan_default_options(void) { return "detect_stack_use_after_return=0"; }
+#endif
+#endif
+
+#define SIP_NOSAN __attribute__((no_sanitize("address", "thread"), noinline))
+
+#define SIP_BLK_SHIFT 16
+#define SIP_BLK ((size_t)1 << SIP_BLK_SHIFT)
+#define SIP_CHUNK_BLKS 64
+#define SIP_CHUNK (SIP_BLK * SIP_CHUNK_BLKS)
+#define SIP_SMALL_MAX 16384
+#define SIP_NCLASS 34
+#define SIP_FREE_CLS 0xFF
+
+static const uint32_t sip_class_size[SIP_NCLASS] = {
+    16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640,
+    768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 8192,
+    10240, 12288, 16384};
+
+typedef struct sip_blk {
+    uint32_t size, nobj;      /* размер объекта и их число */
+    uint8_t cls, atomic;      /* cls == SIP_FREE_CLS — блок свободен */
+    uint8_t pad[6];
+    uint64_t mark[(SIP_BLK / 16 + 63) / 64];
+} sip_blk;
+#define SIP_BLK_HDR ((sizeof(sip_blk) + 15) & ~(size_t)15)
+
+typedef struct { char *p; size_t n; bool mark, atomic; } sip_large;
+
+/* размер -> класс: индекс (n + 16) >> 4, лишний байт — для указателя «сразу за концом» */
+static uint8_t sip_class_of[SIP_SMALL_MAX / 16 + 2];
+
+static void *sip_fl[2][SIP_NCLASS];                    /* списки свободных объектов */
+static char *sip_bump[2][SIP_NCLASS], *sip_bend[2][SIP_NCLASS];  /* ещё не тронутая часть блока */
+
+static char **sip_chunks;          /* куски по 4 МБ, по возрастанию адреса */
+static size_t sip_nchunks, sip_chunks_cap;
+static sip_blk **sip_empty;        /* свободные блоки */
+static size_t sip_nempty, sip_empty_cap;
+static sip_large *sip_larges;      /* большие объекты, по возрастанию адреса */
+static size_t sip_nlarge, sip_large_cap;
+static uintptr_t sip_lo = UINTPTR_MAX, sip_hi = 0;
+
+static size_t sip_heap_used;       /* блоки в работе + большие объекты */
+static size_t sip_gc_min = (size_t)64 << 20;  /* порог не ниже этого (SIP_GC_MIN, в МБ) */
+static size_t sip_gc_next = (size_t)64 << 20;
+static bool sip_gc_on = true, sip_gc_stats;
+static int64_t sip_gc_count;
+static double sip_gc_time;
+static size_t sip_gc_peak;
+
+/* стеки потоков: сборщик сканирует стек каждого потока от sp до top */
+typedef struct sip_thr { char *top, *sp; jmp_buf regs; struct sip_thr *next; } sip_thr;
+static sip_thr sip_main_thr;
+static sip_thr *sip_threads = &sip_main_thr;
+static _Thread_local sip_thr *sip_cur_thr = &sip_main_thr;
+
+__attribute__((noreturn, cold)) static void sip_oom(void) {
+    fputs("sip: out of memory\n", stderr);
+    exit(1);
+}
+
+static void sip_gc_report(void) {
+    fprintf(stderr, "sip gc: %lld collections, %.3f s, peak heap %.1f MB\n", (long long)sip_gc_count, sip_gc_time,
+            (double)sip_gc_peak / (1 << 20));
+}
+
+static void sip_gc_init(void *stack_top) {
+    sip_main_thr.top = stack_top;
+    for (size_t i = 0, c = 0; i < sizeof sip_class_of; i++) {
+        size_t n = i * 16;
+        while (c < SIP_NCLASS - 1 && sip_class_size[c] < n) c++;
+        sip_class_of[i] = (uint8_t)c;
+    }
+    const char *e = getenv("SIP_GC");
+    if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) sip_gc_on = false;
+    e = getenv("SIP_GC_MIN");
+    if (e && *e) sip_gc_min = sip_gc_next = (size_t)strtoull(e, NULL, 10) << 20;
+    e = getenv("SIP_GC_STATS");
+    if (e && *e && strcmp(e, "0")) { sip_gc_stats = true; atexit(sip_gc_report); }
+}
+
+/* ---- куски и блоки ---- */
+
+static void sip_new_chunk(void) {
+    size_t len = SIP_CHUNK + SIP_BLK;
+    char *raw = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (raw == MAP_FAILED) sip_oom();
+    char *p = (char *)(((uintptr_t)raw + SIP_BLK - 1) & ~(uintptr_t)(SIP_BLK - 1));
+    if (p > raw) munmap(raw, (size_t)(p - raw));
+    char *end = p + SIP_CHUNK;
+    if (raw + len > end) munmap(end, (size_t)(raw + len - end));
+    if (sip_nchunks == sip_chunks_cap) {
+        sip_chunks_cap = sip_chunks_cap ? sip_chunks_cap * 2 : 16;
+        sip_chunks = realloc(sip_chunks, sip_chunks_cap * sizeof *sip_chunks);
+        if (!sip_chunks) sip_oom();
+    }
+    size_t i = sip_nchunks++;
+    while (i > 0 && sip_chunks[i - 1] > p) { sip_chunks[i] = sip_chunks[i - 1]; i--; }
+    sip_chunks[i] = p;
+    if ((uintptr_t)p < sip_lo) sip_lo = (uintptr_t)p;
+    if ((uintptr_t)end > sip_hi) sip_hi = (uintptr_t)end;
+    if (sip_nchunks * SIP_CHUNK_BLKS > sip_empty_cap) {  /* в запас могут вернуться все блоки */
+        sip_empty_cap = sip_nchunks * SIP_CHUNK_BLKS * 2;
+        sip_empty = realloc(sip_empty, sip_empty_cap * sizeof *sip_empty);
+        if (!sip_empty) sip_oom();
+    }
+    for (int k = SIP_CHUNK_BLKS - 1; k >= 0; k--) {  /* память из mmap уже нулевая */
+        sip_blk *b = (sip_blk *)(p + (size_t)k * SIP_BLK);
+        b->cls = SIP_FREE_CLS;
+        sip_empty[sip_nempty++] = b;
+    }
+}
+
+static void sip_gc_collect(void);
+
+static bool sip_gc_due(size_t more) {
+    return sip_gc_on && sip_heap_used + more > sip_gc_next;
+}
+
+__attribute__((noinline)) static void *sip_alloc_refill(int c, int atomic) {
+    if (sip_gc_due(SIP_BLK)) {
+        sip_gc_collect();
+        void *p = sip_fl[atomic][c];
+        if (p) {
+            sip_fl[atomic][c] = *(void **)p;
+            *(void **)p = NULL;
+            return p;
+        }
+    }
+    if (!sip_nempty) sip_new_chunk();
+    sip_blk *b = sip_empty[--sip_nempty];
+    uint32_t size = sip_class_size[c];
+    b->size = size;
+    b->nobj = (uint32_t)((SIP_BLK - SIP_BLK_HDR) / size);
+    b->cls = (uint8_t)c;
+    b->atomic = (uint8_t)atomic;
+    sip_heap_used += SIP_BLK;
+    if (sip_heap_used > sip_gc_peak) sip_gc_peak = sip_heap_used;
+    char *start = (char *)b + SIP_BLK_HDR;
+    sip_bump[atomic][c] = start + size;
+    sip_bend[atomic][c] = start + (size_t)b->nobj * size;
+    return start;
+}
+
+__attribute__((noinline)) static void *sip_alloc_large(size_t n, int atomic) {
+    size_t sz = (n + 16) & ~(size_t)15;  /* +1 байт: указатель «сразу за концом» тоже внутри */
+    if (sip_gc_due(sz)) sip_gc_collect();
+    char *p = atomic ? malloc(sz) : calloc(1, sz);
+    if (!p) sip_oom();
+    if (sip_nlarge == sip_large_cap) {
+        sip_large_cap = sip_large_cap ? sip_large_cap * 2 : 64;
+        sip_larges = realloc(sip_larges, sip_large_cap * sizeof *sip_larges);
+        if (!sip_larges) sip_oom();
+    }
+    size_t lo = 0, hi = sip_nlarge;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (sip_larges[mid].p < p) lo = mid + 1; else hi = mid;
+    }
+    memmove(sip_larges + lo + 1, sip_larges + lo, (sip_nlarge - lo) * sizeof *sip_larges);
+    sip_larges[lo] = (sip_large){p, sz, false, (bool)atomic};
+    sip_nlarge++;
+    if ((uintptr_t)p < sip_lo) sip_lo = (uintptr_t)p;
+    if ((uintptr_t)p + sz > sip_hi) sip_hi = (uintptr_t)p + sz;
+    sip_heap_used += sz;
+    if (sip_heap_used > sip_gc_peak) sip_gc_peak = sip_heap_used;
     return p;
 }
 
-static inline void *sip_alloc(size_t n) {
-    n = (n + 15) & ~(size_t)15;
-    if (SIP_UNLIKELY((size_t)(sip_heap_end - sip_heap_ptr) < n)) return sip_alloc_slow(n);
-    void *p = sip_heap_ptr;
-    sip_heap_ptr += n;
-    return p;
-}
-
-static void *sip_realloc(void *p, size_t n) {
-    void *q = realloc(p, n ? n : 1);
-    if (!q) { fputs("sip: out of memory\n", stderr); exit(1); }
+/* Свободная память всегда нулевая, кроме первого слова (ссылки в списке свободных).
+ * У атомарных объектов содержимое не обнуляется. */
+static inline void *sip_alloc_k(size_t n, int atomic) {
+    if (SIP_UNLIKELY(n >= SIP_SMALL_MAX)) return sip_alloc_large(n, atomic);
+    int c = sip_class_of[(n + 16) >> 4];
+    void *p = sip_fl[atomic][c];
+    if (SIP_LIKELY(p != NULL)) {
+        sip_fl[atomic][c] = *(void **)p;
+        *(void **)p = NULL;
+        return p;
+    }
+    char *q = sip_bump[atomic][c];
+    if (SIP_UNLIKELY(q == NULL || q >= sip_bend[atomic][c])) return sip_alloc_refill(c, atomic);
+    sip_bump[atomic][c] = q + sip_class_size[c];
     return q;
+}
+
+/* обнулённая память, в которой могут быть указатели */
+static inline void *sip_alloc(size_t n) { return sip_alloc_k(n, 0); }
+
+/* память без указателей (байты строк, массивы чисел); содержимое не обнулено */
+static inline void *sip_alloc_atomic(size_t n) { return sip_alloc_k(n, 1); }
+
+/* блок или большой объект, внутри которого лежит адрес (или NULL) */
+static inline sip_blk *sip_find_blk(uintptr_t w) {
+    size_t lo = 0, hi = sip_nchunks;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if ((uintptr_t)sip_chunks[mid] <= w) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return NULL;
+    uintptr_t c = (uintptr_t)sip_chunks[lo - 1];
+    if (w >= c + SIP_CHUNK) return NULL;
+    sip_blk *b = (sip_blk *)(w & ~(uintptr_t)(SIP_BLK - 1));
+    return b->cls == SIP_FREE_CLS ? NULL : b;
+}
+
+static inline sip_large *sip_find_large(uintptr_t w) {
+    size_t lo = 0, hi = sip_nlarge;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if ((uintptr_t)sip_larges[mid].p <= w) lo = mid + 1; else hi = mid;
+    }
+    if (lo == 0) return NULL;
+    sip_large *l = &sip_larges[lo - 1];
+    return w < (uintptr_t)l->p + l->n ? l : NULL;
+}
+
+/* сколько байт можно использовать в объекте p */
+static size_t sip_obj_size(void *p) {
+    sip_blk *b = sip_find_blk((uintptr_t)p);
+    if (b) return b->size - 1;
+    sip_large *l = sip_find_large((uintptr_t)p);
+    return l ? l->n - 1 : 0;
+}
+
+static void *sip_realloc_k(void *p, size_t n, int atomic) {
+    if (!p) return sip_alloc_k(n ? n : 1, atomic);
+    size_t old = sip_obj_size(p);
+    if (n <= old) return p;
+    void *q = sip_alloc_k(n, atomic);
+    memcpy(q, p, old);
+    return q;
+}
+
+/* старый объект не освобождается сразу: на него может ещё кто-то ссылаться */
+static void *sip_realloc(void *p, size_t n) { return sip_realloc_k(p, n, 0); }
+static void *sip_realloc_atomic(void *p, size_t n) { return sip_realloc_k(p, n, 1); }
+
+/* ---- пометка ---- */
+
+typedef struct { char *p; size_t n; } sip_range_t;
+static sip_range_t *sip_mstack;
+static size_t sip_msn, sip_mscap;
+
+static inline void sip_mpush(char *p, size_t n) {
+    if (sip_msn == sip_mscap) {
+        sip_mscap = sip_mscap ? sip_mscap * 2 : 4096;
+        sip_mstack = realloc(sip_mstack, sip_mscap * sizeof *sip_mstack);
+        if (!sip_mstack) sip_oom();
+    }
+    sip_mstack[sip_msn++] = (sip_range_t){p, n};
+}
+
+static inline void sip_mark_word(uintptr_t w) {
+    if (w < sip_lo || w >= sip_hi) return;
+    sip_blk *b = sip_find_blk(w);
+    if (b) {
+        uintptr_t base = (uintptr_t)b + SIP_BLK_HDR;
+        if (w < base) return;
+        size_t i = (w - base) / b->size;
+        if (i >= b->nobj) return;
+        uint64_t bit = (uint64_t)1 << (i & 63);
+        if (b->mark[i >> 6] & bit) return;
+        b->mark[i >> 6] |= bit;
+        if (!b->atomic) sip_mpush((char *)(base + i * b->size), b->size);
+        return;
+    }
+    sip_large *l = sip_find_large(w);
+    if (l && !l->mark) {
+        l->mark = true;
+        if (!l->atomic) sip_mpush(l->p, l->n);
+    }
+}
+
+SIP_NOSAN static void sip_mark_range(const char *lo, const char *hi) {
+    uintptr_t a = ((uintptr_t)lo + sizeof(void *) - 1) & ~(uintptr_t)(sizeof(void *) - 1);
+    for (; a + sizeof(void *) <= (uintptr_t)hi; a += sizeof(void *)) sip_mark_word(*(const uintptr_t *)a);
+}
+
+static void sip_mark_drain(void) {
+    while (sip_msn) {
+        sip_range_t r = sip_mstack[--sip_msn];
+        sip_mark_range(r.p, r.p + r.n);
+    }
+}
+
+static void sip_mark_globals(void) {
+#ifdef __APPLE__
+    unsigned long size = 0;
+    static const char *const segs[] = {"__DATA", "__DATA_DIRTY"};
+    for (int i = 0; i < 2; i++) {
+        uint8_t *p = getsegmentdata(&_mh_execute_header, segs[i], &size);
+        if (p) sip_mark_range((char *)p, (char *)p + size);
+    }
+#else
+    extern char __data_start[], _end[];
+    sip_mark_range(__data_start, _end);
+#endif
+}
+
+/* стек текущего потока: от кадра этой функции (ниже всех вызывающих) до вершины */
+SIP_NOSAN static void sip_mark_own_stack(void) {
+    char *sp = (char *)__builtin_frame_address(0);
+    sip_mark_range(sp, sip_cur_thr->top);
+}
+
+static void sip_mark_threads(void) {
+    for (sip_thr *t = sip_threads; t; t = t->next) {
+        if (t == sip_cur_thr) continue;
+        sip_mark_range((char *)&t->regs, (char *)&t->regs + sizeof t->regs);
+        if (t->sp) sip_mark_range(t->sp, t->top);
+    }
+}
+
+/* Поток отпускает GIL: запомнить его регистры и вершину стека, чтобы сборщик,
+ * запущенный в другом потоке, нашёл указатели этого потока. */
+SIP_NOSAN static void sip_gc_park(void) {
+    sip_thr *t = sip_cur_thr;
+    setjmp(t->regs);
+    char *sp;
+#if defined(__aarch64__)
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+#elif defined(__x86_64__)
+    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+#else
+    sp = (char *)__builtin_frame_address(0) - 4096;
+#endif
+    t->sp = sp;
+}
+
+/* новый поток (держит GIL): его стек сканируется до top */
+static void sip_gc_thread_add(sip_thr *t, void *top) {
+    t->top = top;
+    t->sp = NULL;
+    t->next = sip_threads;
+    sip_threads = t;
+    sip_cur_thr = t;
+}
+
+static void sip_gc_thread_remove(sip_thr *t) {
+    for (sip_thr **pp = &sip_threads; *pp; pp = &(*pp)->next)
+        if (*pp == t) { *pp = t->next; break; }
+}
+
+/* ---- уборка ---- */
+
+static size_t sip_sweep(void) {
+    size_t live = 0;
+    for (int a = 0; a < 2; a++)
+        for (int c = 0; c < SIP_NCLASS; c++) {
+            sip_fl[a][c] = NULL;
+            sip_bump[a][c] = sip_bend[a][c] = NULL;
+        }
+    void **tail[2][SIP_NCLASS];
+    for (int a = 0; a < 2; a++)
+        for (int c = 0; c < SIP_NCLASS; c++) tail[a][c] = &sip_fl[a][c];
+    for (size_t ci = 0; ci < sip_nchunks; ci++) {
+        for (size_t k = 0; k < SIP_CHUNK_BLKS; k++) {
+            sip_blk *b = (sip_blk *)(sip_chunks[ci] + k * SIP_BLK);
+            if (b->cls == SIP_FREE_CLS) continue;
+            char *base = (char *)b + SIP_BLK_HDR;
+            size_t nlive = 0, words = (b->nobj + 63) / 64;
+            for (size_t w = 0; w < words; w++) nlive += (size_t)__builtin_popcountll(b->mark[w]);
+            if (nlive == 0) {  /* весь блок — мусор: обнулить и вернуть в общий запас */
+                memset(base, 0, (size_t)b->nobj * b->size);
+                b->cls = SIP_FREE_CLS;
+                sip_empty[sip_nempty++] = b;
+                sip_heap_used -= SIP_BLK;
+                continue;
+            }
+            live += nlive * b->size;
+            int a = b->atomic, c = b->cls;
+            for (size_t i = 0; i < b->nobj; i++) {
+                if (b->mark[i >> 6] & ((uint64_t)1 << (i & 63))) continue;
+                char *o = base + i * b->size;
+                if (!a) memset(o, 0, b->size);
+                *tail[a][c] = o;
+                tail[a][c] = (void **)o;
+            }
+            memset(b->mark, 0, words * sizeof(uint64_t));
+        }
+    }
+    for (int a = 0; a < 2; a++)
+        for (int c = 0; c < SIP_NCLASS; c++) *tail[a][c] = NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < sip_nlarge; i++) {
+        sip_large l = sip_larges[i];
+        if (!l.mark) {
+            free(l.p);
+            sip_heap_used -= l.n;
+            continue;
+        }
+        live += l.n;
+        l.mark = false;
+        sip_larges[j++] = l;
+    }
+    sip_nlarge = j;
+    return live;
+}
+
+SIP_NOSAN __attribute__((noinline)) static void sip_gc_collect(void) {
+    struct timespec t0, t1;
+    if (sip_gc_stats) clock_gettime(CLOCK_MONOTONIC, &t0);
+    jmp_buf regs;  /* регистры текущего потока попадают в стек */
+    setjmp(regs);
+    sip_mark_own_stack();
+    sip_mark_range((char *)&regs, (char *)&regs + sizeof regs);
+    sip_mark_threads();
+    sip_mark_globals();
+    sip_mark_drain();
+    size_t live = sip_sweep();
+    size_t next = live * 2;
+    sip_gc_next = next > sip_gc_min ? next : sip_gc_min;
+    sip_gc_count++;
+    if (sip_gc_stats) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        sip_gc_time += (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    }
+}
+
+/* для тестов: собрать мусор сейчас */
+static void sip_gc_now(void) {
+    if (sip_gc_on) sip_gc_collect();
 }
 
 /* ---------- ошибки ---------- */
@@ -81,11 +511,17 @@ static bool sip_threaded;
 typedef struct { sip_try *try_top; } sip_tstate;
 static inline sip_tstate sip_gil_release(void) {
     sip_tstate st = {sip_try_top};
-    if (sip_threaded) pthread_mutex_unlock(&sip_gil);
+    if (sip_threaded) {
+        sip_gc_park();
+        pthread_mutex_unlock(&sip_gil);
+    }
     return st;
 }
 static inline void sip_gil_acquire(sip_tstate st) {
-    if (sip_threaded) pthread_mutex_lock(&sip_gil);
+    if (sip_threaded) {
+        pthread_mutex_lock(&sip_gil);
+        sip_cur_thr->sp = NULL;
+    }
     sip_try_top = st.try_top;
 }
 #define SIP_BLOCKING_BEGIN sip_tstate sip_st_ = sip_gil_release();
@@ -140,7 +576,7 @@ static inline sip_sb sip_sb_new(void) { return (sip_sb){NULL, 0, 0}; }
 static void sip_sb_grow(sip_sb *b, int64_t need) {
     int64_t cap = b->cap ? b->cap : 32;
     while (cap < b->n + need) cap *= 2;
-    b->p = sip_realloc(b->p, (size_t)cap);
+    b->p = sip_realloc_atomic(b->p, (size_t)cap);
     b->cap = cap;
 }
 
@@ -293,7 +729,7 @@ static inline bool eq_range(sip_range a, sip_range b) { return a.lo == b.lo && a
 static sip_str sip_str_concat(sip_str a, sip_str b) {
     if (!a.n) return b;
     if (!b.n) return a;
-    char *p = sip_alloc((size_t)(a.n + b.n));
+    char *p = sip_alloc_atomic((size_t)(a.n + b.n));
     memcpy(p, a.p, (size_t)a.n);
     memcpy(p + a.n, b.p, (size_t)b.n);
     return (sip_str){p, a.n + b.n};
@@ -301,7 +737,7 @@ static sip_str sip_str_concat(sip_str a, sip_str b) {
 
 static sip_str sip_str_repeat(sip_str s, int64_t k) {
     if (k <= 0 || !s.n) return SIP_LIT("");
-    char *p = sip_alloc((size_t)(s.n * k));
+    char *p = sip_alloc_atomic((size_t)(s.n * k));
     for (int64_t i = 0; i < k; i++) memcpy(p + i * s.n, s.p, (size_t)s.n);
     return (sip_str){p, s.n * k};
 }
@@ -355,7 +791,7 @@ static inline bool sip_str_endswith(sip_str s, sip_str p) {
 }
 
 static sip_str sip_str_map(sip_str s, int upper) {
-    char *p = sip_alloc((size_t)s.n);
+    char *p = sip_alloc_atomic((size_t)s.n);
     for (int64_t i = 0; i < s.n; i++) {
         char c = s.p[i];
         if (upper) p[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
@@ -506,7 +942,7 @@ static inline void sip_fmt_str(sip_sb *b, const char *fmt, sip_str s) { sip_sb_p
 /* ---------- файлы ---------- */
 
 static sip_str sip_read(sip_str path, int line) {
-    char *cpath = sip_alloc((size_t)path.n + 1);
+    char *cpath = sip_alloc_atomic((size_t)path.n + 1);
     memcpy(cpath, path.p, (size_t)path.n);
     cpath[path.n] = 0;
     FILE *f = fopen(cpath, "rb");
@@ -517,14 +953,14 @@ static sip_str sip_read(sip_str path, int line) {
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *buf = sip_alloc((size_t)n + 1);
+    char *buf = sip_alloc_atomic((size_t)n + 1);
     size_t got = fread(buf, 1, (size_t)n, f);
     fclose(f);
     return (sip_str){buf, (int64_t)got};
 }
 
 static void sip_write(sip_str path, sip_str text, int line) {
-    char *cpath = sip_alloc((size_t)path.n + 1);
+    char *cpath = sip_alloc_atomic((size_t)path.n + 1);
     memcpy(cpath, path.p, (size_t)path.n);
     cpath[path.n] = 0;
     FILE *f = fopen(cpath, "wb");
@@ -1285,9 +1721,9 @@ static void sip_http_headers(sip_http_resp *r, const char *p, size_t total) {
         int64_t vn = (int64_t)len - kn - 1;
         while (vn > 0 && (*v == ' ' || *v == '\t')) { v++; vn--; }
         while (vn > 0 && (v[vn - 1] == '\r' || v[vn - 1] == '\n' || v[vn - 1] == ' ')) vn--;
-        char *k = sip_alloc((size_t)kn + 1);
+        char *k = sip_alloc_atomic((size_t)kn + 1);
         for (int64_t j = 0; j < kn; j++) k[j] = (char)tolower((unsigned char)line[j]);
-        char *vv = sip_alloc((size_t)vn + 1);
+        char *vv = sip_alloc_atomic((size_t)vn + 1);
         memcpy(vv, v, (size_t)vn);
         if (r->nh == r->hcap) {
             r->hcap = r->hcap ? r->hcap * 2 : 16;
@@ -1301,7 +1737,7 @@ static void sip_http_headers(sip_http_resp *r, const char *p, size_t total) {
 }
 
 static char *sip_to_c(sip_str s) {
-    char *c = sip_alloc((size_t)s.n + 1);
+    char *c = sip_alloc_atomic((size_t)s.n + 1);
     memcpy(c, s.p, (size_t)s.n);
     c[s.n] = 0;
     return c;
@@ -1356,11 +1792,11 @@ static sip_http_resp sip_http_do(const char *method, sip_str url, const sip_str 
         r.status = status;
         if (eff) {
             int64_t n = (int64_t)strlen(eff);
-            char *u = sip_alloc((size_t)n + 1);
+            char *u = sip_alloc_atomic((size_t)n + 1);
             memcpy(u, eff, (size_t)n + 1);
             r.url = (sip_str){u, n};
         } else r.url = url;
-        char *bp = sip_alloc(out.n ? out.n : 1);
+        char *bp = sip_alloc_atomic(out.n ? out.n : 1);
         memcpy(bp, out.p ? out.p : "", out.n);
         r.body = (sip_str){bp, (int64_t)out.n};
         sip_http_headers(&r, hbuf.p ? hbuf.p : "", hbuf.n);
@@ -1413,13 +1849,16 @@ typedef struct { sip_task **ts; int64_t n, next; } sip_pool;
 
 static void *sip_worker(void *arg) {
     sip_pool *p = arg;
+    sip_thr self;
     pthread_mutex_lock(&sip_gil);
+    sip_gc_thread_add(&self, __builtin_frame_address(0));
     while (p->next < p->n) {
         sip_task *t = p->ts[p->next++];
         if (t->state != 0) continue;
         sip_try_top = NULL;
         sip_task_exec(t);
     }
+    sip_gc_thread_remove(&self);
     pthread_mutex_unlock(&sip_gil);
     return NULL;
 }
