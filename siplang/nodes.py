@@ -425,5 +425,12 @@ class Interface(Node):
 
 
 @dataclass
+class TestDef(Node):
+    """test "имя": блок, который запускает sip test."""
+    name: str
+    body: list
+
+
+@dataclass
 class Module(Node):
     body: list

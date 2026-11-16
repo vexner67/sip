@@ -14,7 +14,8 @@ import zlib
 from pathlib import Path
 
 from .checker import ERROR_KINDS, Program
-from .cregistry import JsonTypeError, Registry, cmp_fn, eq_expr, fmt_call, hash_fn, nil_code, opt_has, opt_val
+from .cregistry import (JsonTypeError, Registry, cmp_fn, eq_expr, fmt_call, hash_fn, nil_code, opt_has, opt_val,
+                        repr_call)
 from .errors import SipError
 from .nodes import *  # noqa: F403
 from . import types as T_
@@ -226,6 +227,20 @@ class CGen:
     def gen_main(self) -> str:
         self.begin(self.p.tops[-1])
         m = self.p.main
+        tests = getattr(self.p, "tests", None)
+        if tests is not None:
+            self.emit("sip_test_begin(argc, argv);")
+            for name, fi in tests:
+                n = c_bytes(name.encode())
+                t = self.tmp("sip_try", "try")
+                self.emit(f"if (sip_test_want({n})) {{")
+                self.emit(f"    sip_try_push(&{t});")
+                self.emit(f"    if (setjmp({t}.jb) == 0) {{ {fi.cname}(); sip_try_pop(); sip_test_ok({n}); }}")
+                self.emit(f"    else sip_test_fail({n});")
+                self.emit("}")
+            self.emit("fflush(stdout);")
+            self.emit("return sip_test_end();")
+            m = None
         if m is not None:
             usage = Path(self.file).stem
             star = getattr(m, "stars", {}).get("*")
@@ -808,11 +823,38 @@ class CGen:
         self.emit(f"sip_raise(SIP_E_Error, {self.to_str(code, self.ty(s.value))}, {s.line});")
 
     def s_Assert(self, s):
+        e = s.cond
+        if (s.msg is None and isinstance(e, Compare) and len(e.ops) == 1
+                and e.ops[0][0] in ("==", "!=", "<", "<=", ">", ">=")
+                and not any(getattr(e, "nilcmp", [False]))):
+            return self.assert_compare(s, e)
         c = self.cond(s.cond)
         self.emit(f"if (SIP_UNLIKELY(!{c})) {{")
         self.depth += 1
         msg = self.to_str(self.ex(s.msg), self.ty(s.msg)) if s.msg is not None else 'SIP_LIT("assertion failed")'
         self.emit(f"sip_raise(SIP_E_AssertionError, {msg}, {s.line});")
+        self.depth -= 1
+        self.emit("}")
+
+    def assert_compare(self, s, e):
+        """assert a == b печатает оба значения: AssertionError: [1, 2] != [1, 3]."""
+        op, right = e.ops[0]
+        lt, rt = self.ty(e.left), self.ty(right)
+        lc, rc = self.eval_args([e.left, right])
+        a, b = self.spill(lc, lt), self.spill(rc, rt)
+        self.emit(f"if (SIP_UNLIKELY(!{self.cmp_code(op, lt, rt, a, b)})) {{")
+        self.depth += 1
+        sb = self.tmp("sip_sb", "sb")
+        self.emit(f"{sb} = sip_sb_new();")
+        if op in ("==", "!="):
+            mid = " != " if op == "==" else " == "
+        else:
+            self.emit(f'sip_sb_put(&{sb}, "not ", 4);')
+            mid = f" {op} "
+        self.emit(repr_call(lt, f"&{sb}", a))
+        self.emit(f'sip_sb_put(&{sb}, "{mid}", {len(mid)});')
+        self.emit(repr_call(rt, f"&{sb}", b))
+        self.emit(f"sip_raise(SIP_E_AssertionError, sip_sb_done(&{sb}), {s.line});")
         self.depth -= 1
         self.emit("}")
 

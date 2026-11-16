@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .errors import SipError
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 CFLAGS = ["-O3", "-march=native", "-fwrapv", "-fno-math-errno", "-w"]
 
 
@@ -28,24 +28,27 @@ def find_cc() -> str:
     return cc
 
 
-def _check(src: str, file: str):
+def _check(src: str, file: str, tests: bool = False):
     from .checker import check_program
     from .modules import load_program
-    module, srcmap = load_program(file, src)
+    module, srcmap = load_program(file, src, tests)
     return check_program(module, file, srcmap), srcmap
 
 
-def compile_source(src: str, file: str = "<input>") -> str:
+def compile_source(src: str, file: str = "<input>", tests: bool = False) -> str:
     """Sip -> текст на C одной единицей. Бросает SipError с позицией в исходнике."""
     from .cgen import generate_c
-    prog, srcmap = _check(src, file)
+    prog, srcmap = _check(src, file, tests)
     return generate_c(prog, file, srcmap)
 
 
-def compile_units(src: str, file: str = "<input>"):
-    """Sip -> [(имя, текст C)] по единице на модуль и список файлов программы."""
+def compile_units(src: str, file: str = "<input>", tests: bool = False):
+    """Sip -> [(имя, текст C)] по единице на модуль и список файлов программы.
+
+    tests=True: вместо main — запуск блоков test корневого файла.
+    """
     from .cgen import generate_units
-    prog, srcmap = _check(src, file)
+    prog, srcmap = _check(src, file, tests)
     return generate_units(prog, file, srcmap), srcmap.sources()
 
 
@@ -142,7 +145,7 @@ def _tool_hash() -> str:
     return hashlib.sha256(VERSION.encode() + b"".join(data)).hexdigest()[:16]
 
 
-def build_cached(path: str) -> str:
+def build_cached(path: str, tests: bool = False) -> str:
     """Собирает программу в кэш и возвращает путь к бинарнику.
 
     Манифест помнит все файлы программы (модули, sip.toml пакетов) и их хэши:
@@ -150,7 +153,7 @@ def build_cached(path: str) -> str:
     """
     root = os.path.abspath(path)
     tool = _tool_hash()
-    key = hashlib.sha256(f"{tool}\0{root}".encode()).hexdigest()[:20]
+    key = hashlib.sha256(f"{tool}\0{root}\0{tests}".encode()).hexdigest()[:20]
     runs = cache_dir() / "runs"
     manifest = runs / f"{key}.json"
     try:
@@ -161,9 +164,9 @@ def build_cached(path: str) -> str:
         pass
     with open(path, encoding="utf-8") as f:
         src = f.read()
-    units, files = compile_units(src, path)
+    units, files = compile_units(src, path, tests)
     h = hashlib.sha256("\0".join(code for _, code in units).encode()).hexdigest()[:20]
-    exe = cache_dir() / f"{Path(path).stem}-{h}"
+    exe = cache_dir() / f"{Path(path).stem}{'-test' if tests else ''}-{h}"
     if not exe.exists():
         tmp = str(exe) + f".tmp{os.getpid()}"
         cc_build_units(units, tmp)

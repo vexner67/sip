@@ -1377,6 +1377,204 @@ class SeparateCompilationTest(unittest.TestCase):
         self.assertIn("fn f() int = 2 / (1 - 1)", r.stderr)
 
 
+class TestBlocksTest(unittest.TestCase):
+    CALC = ("fn add(a int, b int) int = a + b\n"
+            "fn main()\n    print \"main must not run\"\n"
+            "test \"add\"\n    assert add(2, 2) == 4\n"
+            "test \"lists\"\n    assert [1, 2] + [3] == [1, 2, 4]\n"
+            "test \"order\"\n    x = \"ab\"\n    assert x < \"aa\"\n"
+            "test \"overflow\"\n    add(9223372036854775807, 1)\n")
+
+    def test_failures_are_reported(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"calc.sip": self.CALC})
+        r = sip_cli("test", cwd=d)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("main must not run", r.stdout)
+        self.assertIn("FAIL lists\n    calc.sip:7: AssertionError: [1, 2, 3] != [1, 2, 4]\n", r.stdout)
+        self.assertIn("FAIL order\n    calc.sip:10: AssertionError: not 'ab' < 'aa'\n", r.stdout)
+        self.assertIn("FAIL overflow\n    calc.sip:1: OverflowError: integer overflow", r.stdout)
+        self.assertIn("calc.sip: 3 of 4 tests failed", r.stdout)
+        self.assertNotIn("ok   add", r.stdout)
+
+    def test_filter_verbose_and_packages(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"sip.toml": "[package]\nname = \"calc\"\n", "calc.sip": self.CALC,
+                       "util/strs.sip": "fn shout(s str) str = s.upper() + \"!\"\n"
+                                        "test \"shout\"\n    assert shout(\"hi\") == \"HI!\"\n",
+                       "main.sip": "import util.strs\nprint strs.shout(\"a\")\n"})
+        r = sip_cli("test", "-k", "add", "-v", cwd=os.path.join(d, "util"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ok   add\n", r.stdout)
+        self.assertIn("ok, 1 test\n", r.stdout)
+        self.assertIn("all 2 files passed", r.stdout)
+        r = sip_cli("run", cwd=d)  # блоки test модулей не мешают обычной сборке
+        self.assertEqual((r.returncode, r.stdout), (0, "A!\n"), r.stderr)
+
+    def test_test_blocks_are_type_checked_only_by_sip_test(self):
+        src = "fn f() int = 1\ntest \"bad\"\n    x: int = \"s\"\n"
+        self.assertEqual(run(src + "print f()"), "1\n")
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"t.sip": src})
+        r = sip_cli("test", "t.sip", cwd=d)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("t.sip:3", r.stderr)
+
+    def test_no_tests(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"a.sip": "print 1\n"})
+        r = sip_cli("test", cwd=d)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no tests found", r.stderr)
+
+
+class FmtTest(unittest.TestCase):
+    MESSY = ("\n\n# header\ntype  Point( x int,y int )\nfn first[T:Ord]( xs [T] ) T=xs[0]\n\n\n\n"
+             "fn f(a int,b int = 2)int\n  # inner\n  c=a+b*-1\n  d = xs[1 : n-1]\n  print -c\n"
+             "  m={a:1, \"b\" :2}\n  if c>0 and d!=[]  then return c   # trailing\n"
+             "  r = g(x, reverse=true)\n  ys = [\n        1,2,\n        3 ]\n"
+             "  zs = xs.map(fn(x)\n      y=x*2\n      y+1\n  )\n  return c**2//3\n"
+             "x  =  f(1,b=3)\nprint x , 2..10,-x\n\n\n")
+    WANT = ("# header\ntype Point(x int, y int)\nfn first[T: Ord](xs [T]) T = xs[0]\n\n\n"
+            "fn f(a int, b int = 2) int\n    # inner\n    c = a + b * -1\n    d = xs[1:n - 1]\n    print -c\n"
+            "    m = {a: 1, \"b\": 2}\n    if c > 0 and d != [] then return c  # trailing\n"
+            "    r = g(x, reverse=true)\n    ys = [\n          1, 2,\n          3]\n"
+            "    zs = xs.map(fn(x)\n        y = x * 2\n        y + 1\n    )\n    return c ** 2 // 3\n"
+            "x = f(1, b=3)\nprint x, 2..10, -x\n")
+
+    def test_format(self):
+        from siplang.fmt import format_source
+        out = format_source(self.MESSY)
+        self.assertEqual(out, self.WANT)
+        self.assertEqual(format_source(out), out)
+
+    def test_meaningful_spaces_are_kept(self):
+        from siplang.fmt import format_source
+        src = "type A(x int)\n    fn f() int\n        print .x\n        print -.x\n        .x\n"
+        self.assertEqual(format_source(src), src)
+
+    def test_examples_are_formatted(self):
+        from siplang.fmt import format_source
+        for f in sorted((ROOT / "examples").rglob("*.sip")):
+            with self.subTest(f=f.name):
+                src = f.read_text()
+                self.assertEqual(format_source(src, str(f)), src)
+
+    def test_cli(self):
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, {"a.sip": "x=1\n", "b.sip": "y = 2\n"})
+        r = sip_cli("fmt", "--check", cwd=d)
+        self.assertEqual((r.returncode, r.stdout), (1, "a.sip: not formatted\n"))
+        r = sip_cli("fmt", "a.sip", cwd=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(d, "a.sip").read_text(), "x = 1\n")
+        self.assertEqual(sip_cli("fmt", "--check", cwd=d).returncode, 0)
+
+
+class LspTest(unittest.TestCase):
+    BANK = ("type NotEnough(need int, have int)\n\n"
+            "type Account(owner str, balance int = 0)\n    fn deposit(n int)\n        .balance += n\n\n"
+            "fn take(x int) int\n    if x > 10 then fail NotEnough(x, 10)\n    x\n")
+    MAIN = ("import bank\n\nfn total(xs [int]) int\n    s = 0\n    for x in xs\n        s += x\n    s\n\n"
+            "a = bank.Account(\"ann\")\na.deposit(5)\nname = a.owner\n"
+            "print total([1, 2]), bank.take(3), name.upper()\n")
+
+    def session(self, files: dict, script):
+        """script(open, req) -> собирает сообщения; возвращает ответы и уведомления."""
+        import io
+        import json
+        from siplang.lsp import Server, path_to_uri
+        d = tempfile.mkdtemp(dir=TMP)
+        write_tree(d, files)
+        msgs = []
+
+        def send(m):
+            data = json.dumps(m).encode()
+            msgs.append(b"Content-Length: %d\r\n\r\n" % len(data) + data)
+        uri = path_to_uri(os.path.join(d, "main.sip"))
+        ids = []
+
+        def req(method, params):
+            ids.append(method)
+            send({"jsonrpc": "2.0", "id": len(ids), "method": method, "params": params})
+
+        def note(method, params):
+            send({"jsonrpc": "2.0", "method": method, "params": params})
+        req("initialize", {})
+        note("textDocument/didOpen", {"textDocument": {"uri": uri, "text": files["main.sip"]}})
+        script(uri, req, note)
+        out = io.BytesIO()
+        Server(io.BytesIO(b"".join(msgs)), out).serve()
+        raw = out.getvalue()
+        res, notes = {}, []
+        while raw:
+            head, _, raw = raw.partition(b"\r\n\r\n")
+            n = int(head.split(b":")[1])
+            m = json.loads(raw[:n])
+            raw = raw[n:]
+            if "id" in m:
+                res[m["id"]] = m.get("result")
+            else:
+                notes.append(m["params"])
+        return res, notes, d
+
+    def test_hover_definition_completion(self):
+        def script(uri, req, note):
+            at = lambda l, c: {"textDocument": {"uri": uri}, "position": {"line": l, "character": c}}
+            req("textDocument/hover", at(11, 8))      # 2 total
+            req("textDocument/hover", at(5, 9))       # 3 s
+            req("textDocument/hover", at(11, 28))     # 4 take
+            req("textDocument/hover", at(10, 10))     # 5 owner
+            req("textDocument/definition", at(11, 28))  # 6 take -> bank.sip
+            req("textDocument/definition", at(5, 13))   # 7 x -> for
+            req("textDocument/completion", at(11, 27))  # 8 bank.
+            req("textDocument/completion", at(9, 2))    # 9 a.
+            req("textDocument/completion", at(11, 41))  # 10 name.
+            req("textDocument/documentSymbol", {"textDocument": {"uri": uri}})  # 11
+        res, notes, d = self.session({"bank.sip": self.BANK, "main.sip": self.MAIN}, script)
+        text = lambda r: r["contents"]["value"].split("\n")[1]
+        self.assertEqual(notes[0]["diagnostics"], [])
+        self.assertEqual(text(res[2]), "fn total(xs [int]) int")
+        self.assertEqual(text(res[3]), "s int")
+        self.assertEqual(text(res[4]), "fn take(x int) int")
+        self.assertEqual(text(res[5]), "owner str")
+        self.assertTrue(res[6]["uri"].endswith("bank.sip"))
+        self.assertEqual(res[6]["range"]["start"], {"line": 6, "character": 3})
+        self.assertEqual(res[7]["range"]["start"], {"line": 4, "character": 8})
+        self.assertEqual({c["label"] for c in res[8]}, {"NotEnough", "Account", "take"})
+        self.assertEqual([c["label"] for c in res[9]], ["owner", "balance", "deposit"])
+        self.assertIn("upper", [c["label"] for c in res[10]])
+        self.assertEqual([s["name"] for s in res[11]], ["total"])
+
+    def test_diagnostics_and_formatting(self):
+        bad = self.MAIN.replace("bank.take(3)", "bank.take(\"x\")")
+
+        def script(uri, req, note):
+            note("textDocument/didChange", {"textDocument": {"uri": uri}, "contentChanges": [{"text": bad}]})
+            note("textDocument/didChange", {"textDocument": {"uri": uri},
+                                            "contentChanges": [{"text": "x=1\nprint x\n"}]})
+            req("textDocument/formatting", {"textDocument": {"uri": uri}})
+        res, notes, d = self.session({"bank.sip": self.BANK, "main.sip": self.MAIN}, script)
+        diag = notes[1]["diagnostics"]
+        self.assertEqual(len(diag), 1)
+        self.assertEqual(diag[0]["message"], "argument 'x' of take(): expected int, got str")
+        self.assertEqual(diag[0]["range"]["start"]["line"], 11)
+        self.assertEqual(notes[2]["diagnostics"], [])
+        self.assertEqual(res[2][0]["newText"], "x = 1\nprint x\n")
+
+    def test_error_in_unsaved_module(self):
+        from siplang.lsp import path_to_uri
+
+        def script(uri, req, note):
+            buri = uri[:-len("main.sip")] + "bank.sip"
+            note("textDocument/didOpen", {"textDocument": {"uri": buri, "text": self.BANK.replace("    x\n", "    x +\n")}})
+            note("textDocument/didChange", {"textDocument": {"uri": uri}, "contentChanges": [{"text": self.MAIN}]})
+        res, notes, d = self.session({"bank.sip": self.BANK, "main.sip": self.MAIN}, script)
+        bank = [n for n in notes if n["uri"].endswith("bank.sip") and n["diagnostics"]]
+        self.assertTrue(bank, notes)
+        self.assertEqual(bank[-1]["diagnostics"][0]["range"]["start"]["line"], 8)
+
+
 class ExamplesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -1517,10 +1517,11 @@ class Checker:
             if name in self.p.fns:
                 fi = self.p.fns[name]
                 e.ckind, e.fn = "fn", fi
+                dn = getattr(fi.node, "display", name)  # имя, как в исходнике модуля
                 if fi.tparams or getattr(e, "explicit", None) is not None:
-                    return self.generic_call(e, fi, f"{name}()",
-                                             dict(zip(fi.tparams, self.explicit_targs(e, fi.tparams, f"{name}()"))))
-                self.bind_args(e, fi.params, f"{name}()", getattr(fi, "stars", None))
+                    return self.generic_call(e, fi, f"{dn}()",
+                                             dict(zip(fi.tparams, self.explicit_targs(e, fi.tparams, f"{dn}()"))))
+                self.bind_args(e, fi.params, f"{dn}()", getattr(fi, "stars", None))
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)  # вывести тип результата до использования
                 return self.call_ret(fi)
@@ -2641,7 +2642,10 @@ def is_nil(e) -> bool:
 
 
 def check_program(mod: Module, file: str = "<input>", srcmap=None) -> Program:
-    return Checker(file, srcmap).check(mod)
+    p = Checker(file, srcmap).check(mod)
+    tests = getattr(mod, "tests", None)
+    p.tests = None if tests is None else [(name, p.fns[fn]) for name, fn in tests]
+    return p
 
 
 __all__ = ["check_program", "Program", "FnInfo", "Var", "ERROR_KINDS", "tail", "Prim"]

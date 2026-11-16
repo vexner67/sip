@@ -1,6 +1,7 @@
 """Командная строка: sip run | build | check | c."""
 
 import os
+import re
 import sys
 
 from .compiler import build_cached, cc_build, cc_build_units, compile_file, compile_units
@@ -16,6 +17,12 @@ usage:
                                C unit cached by content (--whole: one unit, cross-module
                                inlining, full rebuild)
   sip check FILE.sip...        check syntax and types only
+  sip test [PATH...] [-k TEXT] [-v]
+                               run `test "name"` blocks of each file (default: the
+                               package here, or this folder); -k: only names containing TEXT
+  sip fmt [PATH...] [--check]  format files in place (--check: list unformatted, exit 1)
+  sip lsp                      language server over stdio (diagnostics, hover,
+                               go to definition, completion, formatting)
   sip c FILE.sip [-o OUT.c]    print the generated C
 
 Env: SIP_CC (C compiler, default clang), SIP_CACHE (build cache dir)."""
@@ -132,6 +139,95 @@ def cmd_check(paths: list[str]) -> int:
     return 1 if failed else 0
 
 
+TEST_RE = re.compile(r"^test\s+[\"']", re.M)
+
+
+def sip_files(paths: list[str]) -> list[str]:
+    """Файлы .sip: сами файлы и всё в папках (кроме скрытых)."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            for d, dirs, files in os.walk(p):
+                dirs[:] = sorted(x for x in dirs if not x.startswith("."))
+                out += [os.path.normpath(os.path.join(d, f)) for f in sorted(files) if f.endswith(".sip")]
+        else:
+            out.append(p)
+    return out
+
+
+def default_root() -> str:
+    from .modules import find_package
+    pkg = find_package(os.getcwd())
+    return pkg.root if pkg is not None else "."
+
+
+def cmd_test(args: list[str]) -> int:
+    import subprocess
+    paths, extra = [], []
+    it = iter(args)
+    for a in it:
+        if a == "-k":
+            k = next(it, None)
+            if k is None:
+                return _err("-k needs a text")
+            extra.append(k)
+        elif a == "-v":
+            extra.append("-v")
+        else:
+            paths.append(a)
+    files = []
+    for f in sip_files(paths or [default_root()]):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                if TEST_RE.search(fh.read()):
+                    files.append(f)
+        except OSError as e:
+            return _err(f"{f}: {e.strerror}")
+    if not files:
+        return _err("no tests found (write: test \"name\" and an indented block)")
+    failed = 0
+    for f in files:
+        name = os.path.relpath(f)
+        try:
+            exe = build_cached(f, tests=True)
+        except SipError as e:
+            print(e, file=sys.stderr)
+            failed += 1
+            continue
+        sys.stdout.flush()
+        r = subprocess.run([name, *extra], executable=exe)
+        failed += r.returncode != 0
+    if len(files) > 1:
+        print(f"{len(files) - failed} of {len(files)} files passed" if failed else f"all {len(files)} files passed")
+    return 1 if failed else 0
+
+
+def cmd_fmt(args: list[str]) -> int:
+    from .fmt import format_source
+    check = "--check" in args
+    paths = [a for a in args if a != "--check"]
+    bad = 0
+    for f in sip_files(paths or [default_root()]):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                src = fh.read()
+            out = format_source(src, f)
+        except SipError as e:
+            print(e, file=sys.stderr)
+            bad += 1
+            continue
+        if out == src:
+            continue
+        if check:
+            print(f"{f}: not formatted")
+            bad += 1
+        else:
+            with open(f, "w", encoding="utf-8") as fh:
+                fh.write(out)
+            print(f"formatted {f}")
+    return 1 if bad else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help", "help"):
@@ -153,6 +249,13 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_c(rest)
         if cmd == "check":
             return cmd_check(rest)
+        if cmd == "test":
+            return cmd_test(rest)
+        if cmd == "fmt":
+            return cmd_fmt(rest)
+        if cmd == "lsp":
+            from .lsp import serve
+            return serve()
         if cmd.endswith(".sip"):
             return cmd_run(cmd, rest)
     except SipError as e:

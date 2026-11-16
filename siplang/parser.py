@@ -91,8 +91,17 @@ class Parser:
                 continue
             if self.at("INDENT"):
                 self.error("unexpected indent")
+            if self.at("NAME") and self.peek().value == "test" and self.peek(1).kind == "STRING":
+                body.append(self.parse_test())
+                continue
             body.append(self.parse_stmt())
         return Module(body, line=1)
+
+    def parse_test(self):
+        tok = self.advance()
+        name = self.advance().value[1]
+        self.accept(":")
+        return TestDef(name, self.parse_block(), line=tok.line)
 
     def parse_block(self) -> list:
         self.expect("NEWLINE", "end of line")

@@ -54,6 +54,9 @@ pip install -e .
 | `sip build FILE.sip [-o OUT] [--whole]` | собирает исполняемый файл: каждый модуль — своя единица C из кэша; `--whole` — одной единицей |
 | `sip init NAME` | создаёт пакет: `NAME/sip.toml` и `NAME/main.sip` |
 | `sip check FILE.sip...` | проверяет синтаксис и типы |
+| `sip test [PATH...] [-k TEXT]` | запускает блоки `test "имя"`; печатает только упавшие |
+| `sip fmt [PATH...] [--check]` | форматирует код (`--check` — только проверить) |
+| `sip lsp` | языковой сервер для редактора: ошибки, типы, переход к определению, дополнение |
 | `sip c FILE.sip [-o OUT.c]` | показывает сгенерированный C |
 
 Первая сборка занимает около 0.3 с (это clang), повторный запуск из кэша около 20 мс.
@@ -89,6 +92,8 @@ async fn main()
 | [siplang/modules.py](siplang/modules.py) | `import`, пакеты (`sip.toml`, зависимости), приватные имена |
 | [siplang/cgen.py](siplang/cgen.py) | AST с типами → C |
 | [siplang/native/sip_rt.h](siplang/native/sip_rt.h) | рантайм: строки, аллокатор, ошибки (setjmp), форматирование чисел как в Python, JSON, CSV, HTTP (libcurl), задачи |
+| [siplang/fmt.py](siplang/fmt.py) | `sip fmt`: форматирование по токенам, комментарии сохраняются |
+| [siplang/lsp.py](siplang/lsp.py) | `sip lsp`: языковой сервер |
 | [siplang/compiler.py](siplang/compiler.py) | вызов clang, раздельная компиляция, кэш объектных файлов и бинарников |
 | [siplang/cli.py](siplang/cli.py) | команда `sip` |
 

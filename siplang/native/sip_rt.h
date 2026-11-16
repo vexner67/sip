@@ -558,24 +558,62 @@ static bool sip_kind_matches(int kind, int want) {
     return want == SIP_E_ValueError && kind == SIP_E_ParseError;  /* ParseError — частный случай */
 }
 
-__attribute__((noreturn, cold)) static void sip_die(void) {
-    fflush(stdout);
+/* Текущая ошибка: `файл:строка: Вид: сообщение` и строка исходника */
+static void sip_err_print(FILE *out, const char *indent) {
     int f = 0;
     while (f + 1 < SIP_NFILES && SIP_FILES[f + 1].start < sip_err_line) f++;
     int local = sip_err_line - SIP_FILES[f].start;
     if (sip_err_kind >= SIP_E_USER) {
-        fprintf(stderr, "%s:%d: %.*s", SIP_FILES[f].name, local, (int)sip_err_msg.n, sip_err_msg.p);
+        fprintf(out, "%s%s:%d: %.*s", indent, SIP_FILES[f].name, local, (int)sip_err_msg.n, sip_err_msg.p);
     } else {
-        fprintf(stderr, "%s:%d: %s", SIP_FILES[f].name, local, sip_err_names[sip_err_kind]);
-        if (sip_err_msg.n) fprintf(stderr, ": %.*s", (int)sip_err_msg.n, sip_err_msg.p);
+        fprintf(out, "%s%s:%d: %s", indent, SIP_FILES[f].name, local, sip_err_names[sip_err_kind]);
+        if (sip_err_msg.n) fprintf(out, ": %.*s", (int)sip_err_msg.n, sip_err_msg.p);
     }
-    fputc('\n', stderr);
+    fputc('\n', out);
     if (local > 0 && local <= *SIP_FILES[f].n) {
         const char *s = SIP_FILES[f].lines[local - 1];
         while (*s == ' ') s++;
-        fprintf(stderr, "    %s\n", s);
+        fprintf(out, "%s    %s\n", indent, s);
     }
+}
+
+__attribute__((noreturn, cold)) static void sip_die(void) {
+    fflush(stdout);
+    sip_err_print(stderr, "");
     exit(1);
+}
+
+/* sip test: блоки `test "имя"` корневого файла. Печатаются только упавшие тесты и итог. */
+static int sip_test_n, sip_test_failed, sip_test_verbose;
+static const char *sip_test_filter, *sip_test_file;
+
+static void sip_test_begin(int argc, char **argv) {
+    sip_test_file = argv[0];
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-v")) sip_test_verbose = 1;
+        else sip_test_filter = argv[i];
+    }
+}
+
+static bool sip_test_want(const char *name) { return !sip_test_filter || strstr(name, sip_test_filter); }
+
+static void sip_test_ok(const char *name) {
+    sip_test_n++;
+    if (sip_test_verbose) printf("ok   %s\n", name);
+}
+
+static void sip_test_fail(const char *name) {
+    sip_test_n++;
+    sip_test_failed++;
+    printf("FAIL %s\n", name);
+    sip_err_print(stdout, "    ");
+}
+
+static int sip_test_end(void) {
+    if (sip_test_failed) printf("%s: %d of %d tests failed\n", sip_test_file, sip_test_failed, sip_test_n);
+    else printf("%s: ok, %d test%s\n", sip_test_file, sip_test_n, sip_test_n == 1 ? "" : "s");
+    fflush(stdout);
+    return sip_test_failed ? 1 : 0;
 }
 
 __attribute__((noreturn, cold)) static void sip_reraise(void) {

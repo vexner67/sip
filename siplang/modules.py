@@ -167,6 +167,10 @@ class Loader:
         self.bodies: list = []    # тела модулей-зависимостей в порядке загрузки
         self.packages: dict = {}  # папка -> Package | None
         self.base = "."
+        self.tests = False        # sip test: блоки test корневого файла становятся функциями
+        self.overlay: dict = {}   # путь -> текст (sip lsp: несохранённые файлы редактора)
+        self.root_mods: dict = {}     # псевдонимы import в корневом файле -> exports
+        self.root_natives: dict = {}  # псевдонимы встроенных модулей (math, json, ...)
 
     def package_of(self, path: str) -> Package | None:
         d = os.path.dirname(os.path.abspath(path))
@@ -179,12 +183,22 @@ class Loader:
 
     def load_root(self, path: str, src: str) -> Module:
         mod = Parser(tokenize(src, path), path).parse_module()
+        tests = []
+        if self.tests:
+            for i, s in enumerate(mod.body):
+                if isinstance(s, TestDef):
+                    fname = f"test__{len(tests) + 1}"
+                    tests.append((s.name, fname))
+                    mod.body[i] = FnDef(fname, [], None, s.body, line=s.line)
+        mod.body = [s for s in mod.body if not isinstance(s, TestDef)]
         offset = self.srcmap.add(path, src)
         pkg = self.package_of(path)
         self.base = pkg.root if pkg is not None else os.path.dirname(os.path.abspath(path))
         self.loading.add(os.path.abspath(path))  # import самого себя — циклический импорт
         body = self.process(mod.body, "", path, offset)
-        return Module(self.bodies + body, line=1)
+        out = Module(self.bodies + body, line=1)
+        out.tests = tests if self.tests else None
+        return out
 
     def resolve(self, name: str, from_path: str, node) -> tuple[str, str]:
         """import a.b -> (путь файла, префикс имён).
@@ -222,10 +236,14 @@ class Loader:
             raise SipError(f"circular import of '{name}'", node.line, 0, from_path)
         if path in self.modules:
             return self.modules[path]
-        with open(path, encoding="utf-8") as f:
-            src = f.read()
+        if path in self.overlay:
+            src = self.overlay[path]
+        else:
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
         self.loading.add(path)
         mod = Parser(tokenize(src, path), path).parse_module()
+        mod.body = [s for s in mod.body if not isinstance(s, TestDef)]  # тесты модуля — только для sip test его самого
         offset = self.srcmap.add(path, src)
         exports = {n: prefix + n for n in _top_names(mod.body)}
         body = self.process(mod.body, prefix, path, offset, exports)
@@ -263,6 +281,8 @@ class Loader:
                         names[alias] = ex[n]
             else:
                 rest.append(s)
+        if not prefix:
+            self.root_mods, self.root_natives = mods, natives
         r = Renamer(names, mods, natives, path, offset)
         return [r.top(s) for s in rest]
 
@@ -405,7 +425,10 @@ def _target_names(t) -> set:
     return set()
 
 
-def load_program(path: str, src: str):
+def load_program(path: str, src: str, tests: bool = False, overlay: dict | None = None):
     loader = Loader()
+    loader.tests = tests
+    loader.overlay = overlay or {}
     mod = loader.load_root(path, src)
+    loader.srcmap.loader = loader
     return mod, loader.srcmap

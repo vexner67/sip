@@ -26,4 +26,5 @@ Sip is Python with less noise, statically typed, compiled to native code (via C)
 - JSON and CSV read straight into the expected type: `users: [User] = json.read(p)`, `fn load(p str) [Row] = csv.read(p)`; `json.stringify(x, indent: 2)`, `json.write(p, x)`, `csv.write(p, rows)`. Plain `csv.read(p)` gives `[{str: str}]`.
 - `r = http.get(url, timeout: 5, headers: {...})`: `r.status r.ok r.text r.headers`, `u: User = r.json()`; `http.post(url, json: x)`. 4xx/5xx raise `HttpError`.
 - `async fn f(u str) int`; calling it makes a task; `await f(u)`; `await all(f(u) for u in urls)` runs them concurrently, in order. `await` only inside `async fn` (`async fn main` is fine).
+- Tests: top-level `test "name"` blocks with `assert a == b` (shows both values); `sip test` runs them, `-k text` filters. `sip fmt` formats.
 - Not available: slice steps, decorators other than `@cache`, generic functions as values (wrap in a lambda).
