@@ -32,7 +32,7 @@
 typedef struct { const char *p; int64_t n; } sip_str;
 
 /* исходники для сообщений об ошибках: строка программы line лежит в файле с наибольшим start < line */
-typedef struct { int start; const char *name; const int *n; const char *const *lines; } sip_srcfile;
+typedef struct { int start; const char *name; const int *n; const char *const *lines; int std; } sip_srcfile;
 extern const sip_srcfile SIP_FILES[];
 extern const int SIP_NFILES;
 typedef struct { int64_t lo, hi; } sip_range;
@@ -519,6 +519,7 @@ SIP_GV(int sip_err_kind);
 SIP_GV(sip_str sip_err_msg);
 SIP_GV(int sip_err_line);
 SIP_GV(void *sip_err_obj);
+SIP_GV(int sip_std_line);  /* строка, где код пользователя вызвал стандартную библиотеку */
 
 static inline void sip_try_push(sip_try *t) { t->prev = sip_try_top; sip_try_top = t; }
 static inline void sip_try_pop(void) { sip_try_top = sip_try_top->prev; }
@@ -623,7 +624,16 @@ __attribute__((noreturn, cold)) static void sip_reraise(void) {
     longjmp(t->jb, 1);
 }
 
+/* Ошибка внутри стандартной библиотеки (std/*.sip) показывается на строке вызова в коде пользователя */
+static int sip_user_line(int line) {
+    if (!sip_std_line) return line;
+    int f = 0;
+    while (f + 1 < SIP_NFILES && SIP_FILES[f + 1].start < line) f++;
+    return SIP_FILES[f].std ? sip_std_line : line;
+}
+
 __attribute__((noreturn, cold)) static void sip_raise_obj(int kind, void *obj, sip_str msg, int line) {
+    line = sip_user_line(line);
     sip_err_kind = kind;
     sip_err_obj = obj;
     sip_err_msg = msg;
@@ -888,6 +898,62 @@ static int64_t sip_str_find(sip_str s, sip_str sub) {
 
 static inline bool sip_str_contains(sip_str s, sip_str sub) { return sip_str_find(s, sub) >= 0; }
 
+static int64_t sip_str_rfind(sip_str s, sip_str sub) {
+    if (sub.n > s.n) return -1;
+    for (int64_t i = s.n - sub.n; i >= 0; i--)
+        if (memcmp(s.p + i, sub.p, (size_t)sub.n) == 0) return i;
+    return -1;
+}
+
+static sip_str sip_str_remove_affix(sip_str s, sip_str a, int suffix) {
+    if (a.n > s.n) return s;
+    if (!suffix && memcmp(s.p, a.p, (size_t)a.n) == 0) return (sip_str){s.p + a.n, s.n - a.n};
+    if (suffix && memcmp(s.p + s.n - a.n, a.p, (size_t)a.n) == 0) return (sip_str){s.p, s.n - a.n};
+    return s;
+}
+
+/* mode: 0 ljust, 1 rjust, 2 zfill (нули после знака) */
+static sip_str sip_str_pad(sip_str s, int64_t width, int mode) {
+    if (width <= s.n) return s;
+    if (width > ((int64_t)1 << 40)) sip_raise(SIP_E_OverflowError, SIP_LIT("width is too large"), sip_std_line);
+    char *p = sip_alloc_atomic((size_t)width);
+    int64_t fill = width - s.n;
+    if (mode == 0) { memcpy(p, s.p, (size_t)s.n); memset(p + s.n, ' ', (size_t)fill); }
+    else if (mode == 1) { memset(p, ' ', (size_t)fill); memcpy(p + fill, s.p, (size_t)s.n); }
+    else {
+        int64_t sign = s.n && (s.p[0] == '-' || s.p[0] == '+');
+        if (sign) p[0] = s.p[0];
+        memset(p + sign, '0', (size_t)fill);
+        memcpy(p + sign + fill, s.p + sign, (size_t)(s.n - sign));
+    }
+    return (sip_str){p, width};
+}
+
+/* isupper/islower как в Python: есть буквы, и все они в этом регистре */
+static bool sip_str_cased(sip_str s, int upper) {
+    bool any = false;
+    for (int64_t i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        if (c >= 'a' && c <= 'z') { if (upper) return false; any = true; }
+        else if (c >= 'A' && c <= 'Z') { if (!upper) return false; any = true; }
+    }
+    return any;
+}
+
+/* capitalize (words = 0) и title (words = 1) */
+static sip_str sip_str_title(sip_str s, int words) {
+    char *p = sip_alloc_atomic((size_t)s.n + 1);
+    bool start = true;
+    for (int64_t i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        bool alpha = (c | 32) >= 'a' && (c | 32) <= 'z';
+        if (alpha) p[i] = start ? (char)(c & ~32) : (char)(c | 32);
+        else p[i] = c;
+        start = words ? !alpha : false;
+    }
+    return (sip_str){p, s.n};
+}
+
 static int64_t sip_str_count(sip_str s, sip_str sub) {
     if (sub.n == 0) return s.n + 1;
     int64_t c = 0;
@@ -930,6 +996,7 @@ static bool sip_str_all(sip_str s, int kind) {
         char c = s.p[i];
         bool ok = kind == 0 ? (c >= '0' && c <= '9')
                 : kind == 1 ? ((c | 32) >= 'a' && (c | 32) <= 'z')
+                : kind == 3 ? ((c >= '0' && c <= '9') || ((c | 32) >= 'a' && (c | 32) <= 'z'))
                 : sip_isspace(c);
         if (!ok) return false;
     }
@@ -1027,6 +1094,13 @@ static void str_range(sip_sb *b, sip_range r) {
     str_int(b, r.hi + 1); sip_sb_putc(b, ')');
 }
 
+static void str_ptr(sip_sb *b, void *p) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "<ptr %p>", p);
+    sip_sb_put(b, buf, n);
+}
+
+#define repr_ptr str_ptr
 #define repr_int str_int
 #define repr_float str_float
 #define repr_bool str_bool
@@ -1178,6 +1252,26 @@ static void sip_args_done(const char *usage) {
 }
 
 static inline sip_str sip_cstr(const char *s) { return (sip_str){s, (int64_t)strlen(s)}; }
+
+/* FFI: строка для C (копия с нулём в конце; живёт, пока на неё есть ссылки) и обратно */
+static const char *sip_ffi_cstr(sip_str s) {
+    char *p = sip_alloc_atomic((size_t)s.n + 1);
+    if (s.n) memcpy(p, s.p, (size_t)s.n);
+    p[s.n] = 0;
+    return p;
+}
+
+static sip_str sip_from_c(const char *s) {
+    size_t n = strlen(s);
+    char *p = sip_alloc_atomic(n + 1);
+    memcpy(p, s, n + 1);
+    return (sip_str){p, (int64_t)n};
+}
+
+/* extern fn: имя символа C с префиксом платформы (_ на macOS) */
+#define SIP_STR_(x) #x
+#define SIP_XSTR_(x) SIP_STR_(x)
+#define SIP_SYM(name) SIP_XSTR_(__USER_LABEL_PREFIX__) name
 
 static int64_t sip_arg_int(const char *s, const char *name, const char *usage) {
     char *end;
@@ -2015,3 +2109,202 @@ static void sip_gather(sip_task **ts, int64_t n, int line) {
     }
 }
 #endif
+
+/* ---------- стандартная библиотека: помощники для std/os.sip и std/re.sip (extern "sip") ----------
+ * Ошибки указывают на строку, где код пользователя вызвал функцию библиотеки (sip_std_line). */
+#include <dirent.h>
+#include <regex.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define SIP_NIL_STR ((sip_str){NULL, 0})
+
+__attribute__((noreturn, cold)) static void sip_os_fail(sip_str path) {
+    int kind = errno == ENOENT ? SIP_E_NotFound : SIP_E_IOError;
+    sip_raisef(kind, sip_std_line, "%.*s: %s", (int)path.n, path.p, strerror(errno));
+}
+
+static sip_str sip_os_getenv(sip_str name) {
+    const char *v = getenv(sip_ffi_cstr(name));
+    return v ? sip_from_c(v) : SIP_NIL_STR;
+}
+
+static void sip_os_setenv(sip_str name, sip_str value) {
+    if (setenv(sip_ffi_cstr(name), sip_ffi_cstr(value), 1)) sip_os_fail(name);
+}
+
+static void sip_os_unsetenv(sip_str name) { unsetenv(sip_ffi_cstr(name)); }
+
+static sip_str sip_os_cwd(void) {
+    char buf[4096];
+    if (!getcwd(buf, sizeof buf)) sip_os_fail(SIP_LIT("."));
+    return sip_from_c(buf);
+}
+
+static void sip_os_chdir(sip_str p) { if (chdir(sip_ffi_cstr(p))) sip_os_fail(p); }
+
+/* 0 — нет, 1 — файл, 2 — папка, 3 — что-то другое */
+static int64_t sip_os_kind(sip_str p) {
+    struct stat st;
+    if (stat(sip_ffi_cstr(p), &st)) return 0;
+    return S_ISREG(st.st_mode) ? 1 : S_ISDIR(st.st_mode) ? 2 : 3;
+}
+
+static int64_t sip_os_size(sip_str p) {
+    struct stat st;
+    if (stat(sip_ffi_cstr(p), &st)) sip_os_fail(p);
+    return (int64_t)st.st_size;
+}
+
+static double sip_os_mtime(sip_str p) {
+    struct stat st;
+    if (stat(sip_ffi_cstr(p), &st)) sip_os_fail(p);
+#ifdef __APPLE__
+    return (double)st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec / 1e9;
+#else
+    return (double)st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9;
+#endif
+}
+
+static void sip_os_mkdir(sip_str p, bool exist_ok) {
+    if (mkdir(sip_ffi_cstr(p), 0777) == 0) return;
+    if (errno == EEXIST && exist_ok && sip_os_kind(p) == 2) return;
+    sip_os_fail(p);
+}
+
+static void sip_os_remove(sip_str p) { if (remove(sip_ffi_cstr(p))) sip_os_fail(p); }
+
+static void sip_os_rename(sip_str a, sip_str b) { if (rename(sip_ffi_cstr(a), sip_ffi_cstr(b))) sip_os_fail(a); }
+
+static void *sip_os_opendir(sip_str p) {
+    DIR *d = opendir(sip_ffi_cstr(p));
+    if (!d) sip_os_fail(p);
+    return d;
+}
+
+static sip_str sip_os_readdir(void *d) {
+    struct dirent *e;
+    while ((e = readdir((DIR *)d)) != NULL) {
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) return sip_from_c(e->d_name);
+    }
+    return SIP_NIL_STR;
+}
+
+static void sip_os_closedir(void *d) { closedir((DIR *)d); }
+
+static int64_t sip_os_status_of(int r) {
+    if (r == -1) return -1;
+    return WIFEXITED(r) ? WEXITSTATUS(r) : 128 + WTERMSIG(r);
+}
+
+static int64_t sip_os_system(sip_str cmd) {
+    fflush(stdout);
+    return sip_os_status_of(system(sip_ffi_cstr(cmd)));
+}
+
+SIP_GV(int64_t sip_os_last);
+
+static sip_str sip_os_output(sip_str cmd) {
+    fflush(stdout);
+    FILE *f = popen(sip_ffi_cstr(cmd), "r");
+    if (!f) sip_os_fail(cmd);
+    sip_sb sb = sip_sb_new();
+    char buf[8192];
+    size_t k;
+    while ((k = fread(buf, 1, sizeof buf, f)) > 0) sip_sb_put(&sb, buf, (int64_t)k);
+    sip_os_last = sip_os_status_of(pclose(f));
+    return sip_sb_done(&sb);
+}
+
+static int64_t sip_os_status(void) { return sip_os_last; }
+
+static int64_t sip_os_pid(void) { return (int64_t)getpid(); }
+
+static sip_str sip_os_platform(void) {
+#if defined(__APPLE__)
+    return SIP_LIT("darwin");
+#elif defined(__linux__)
+    return SIP_LIT("linux");
+#else
+    return SIP_LIT("unix");
+#endif
+}
+
+/* Регулярные выражения: POSIX ERE (regex.h) и сокращения \d \w \s \D \W \S, в том числе внутри [...] */
+typedef struct { regex_t re; int64_t ngroups; } sip_re;
+typedef struct { int64_t n; regmatch_t m[]; } sip_re_match;
+
+static void *sip_re_compile(sip_str pat) {
+    sip_sb sb = sip_sb_new();
+    int in_class = 0;
+    for (int64_t i = 0; i < pat.n; i++) {
+        char c = pat.p[i];
+        if (c == '\\' && i + 1 < pat.n) {
+            char d = pat.p[++i];
+            const char *cls = d == 'd' ? "0-9" : d == 'w' ? "[:alnum:]_" : d == 's' ? "[:space:]" : NULL;
+            const char *neg = d == 'D' ? "0-9" : d == 'W' ? "[:alnum:]_" : d == 'S' ? "[:space:]" : NULL;
+            if (cls) {
+                if (in_class) sip_sb_put(&sb, cls, (int64_t)strlen(cls));
+                else { sip_sb_putc(&sb, '['); sip_sb_put(&sb, cls, (int64_t)strlen(cls)); sip_sb_putc(&sb, ']'); }
+            } else if (neg && !in_class) {
+                sip_sb_put(&sb, "[^", 2); sip_sb_put(&sb, neg, (int64_t)strlen(neg)); sip_sb_putc(&sb, ']');
+            } else if (d == 'n' || d == 't' || d == 'r') {
+                sip_sb_putc(&sb, d == 'n' ? '\n' : d == 't' ? '\t' : '\r');
+            } else if (in_class) {
+                sip_sb_putc(&sb, d);  /* [\]] и т. п.: символ как есть */
+            } else {
+                sip_sb_putc(&sb, '\\'); sip_sb_putc(&sb, d);
+            }
+            continue;
+        }
+        if (!in_class && c == '[') {
+            in_class = 1;
+            sip_sb_putc(&sb, c);
+            if (i + 1 < pat.n && pat.p[i + 1] == '^') sip_sb_putc(&sb, pat.p[++i]);
+            if (i + 1 < pat.n && pat.p[i + 1] == ']') sip_sb_putc(&sb, pat.p[++i]);
+            continue;
+        }
+        if (in_class && c == '[' && i + 1 < pat.n && pat.p[i + 1] == ':') {  /* [:alpha:] */
+            const char *end = memchr(pat.p + i + 2, ']', (size_t)(pat.n - i - 2));
+            if (end) {
+                int64_t k = end - pat.p;
+                sip_sb_put(&sb, pat.p + i, k - i + 1);
+                i = k;
+                continue;
+            }
+        }
+        if (in_class && c == ']') in_class = 0;
+        sip_sb_putc(&sb, c);
+    }
+    sip_str t = sip_sb_done(&sb);
+    sip_re *r = malloc(sizeof *r);  /* шаблоны кэширует std/re.sip, поэтому не освобождаются */
+    int err = regcomp(&r->re, sip_ffi_cstr(t), REG_EXTENDED);
+    if (err) {
+        char msg[256];
+        regerror(err, &r->re, msg, sizeof msg);
+        free(r);
+        sip_raisef(SIP_E_ValueError, sip_std_line, "bad regex '%.*s': %s", (int)pat.n, pat.p, msg);
+    }
+    r->ngroups = (int64_t)r->re.re_nsub;
+    return r;
+}
+
+static void *sip_re_subject(sip_str s) { return (void *)sip_ffi_cstr(s); }
+
+static void *sip_re_exec(void *rp, void *subj, int64_t start) {
+    sip_re *r = rp;
+    const char *s = subj;
+    int64_t n = r->ngroups + 1;
+    sip_re_match *m = sip_alloc_atomic(sizeof *m + (size_t)n * sizeof(regmatch_t));
+    m->n = n;
+    if (regexec(&r->re, s + start, (size_t)n, m->m, start > 0 ? REG_NOTBOL : 0)) return NULL;
+    for (int64_t i = 0; i < n; i++) {
+        if (m->m[i].rm_so >= 0) { m->m[i].rm_so += start; m->m[i].rm_eo += start; }
+    }
+    return m;
+}
+
+static int64_t sip_re_ngroups(void *m) { return ((sip_re_match *)m)->n - 1; }
+static int64_t sip_re_start(void *m, int64_t i) { return (int64_t)((sip_re_match *)m)->m[i].rm_so; }
+static int64_t sip_re_end(void *m, int64_t i) { return (int64_t)((sip_re_match *)m)->m[i].rm_eo; }

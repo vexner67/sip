@@ -8,10 +8,11 @@
 from __future__ import annotations
 
 import copy
+import os
 
 from .errors import SipError
 from .nodes import *  # noqa: F403
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, Generic, IfaceT, ListT, OptT, Prim, RecordT, SetT,
+from .types import (BOOL, FLOAT, INT, PTR, RANGE, STR, UNIT, DictT, FnT, Generic, IfaceT, ListT, OptT, Prim, RecordT, SetT,
                     SumT, TaskT, TParam, TupleT,
                     TVar, comparable, deep, hashable, instantiate, is_resolved, opt, prune, same, show, subst,
                     truthy_ok)
@@ -285,7 +286,7 @@ class Checker:
                 if t.args:
                     self.err(f"type parameter '{n}' takes no type arguments", t)
                 return self.tscope[n]
-            simple = {"int": INT, "float": FLOAT, "bool": BOOL, "str": STR}
+            simple = {"int": INT, "float": FLOAT, "bool": BOOL, "str": STR, "ptr": PTR}
             if n in simple and not t.args:
                 return simple[n]
             if n == "http.Response":
@@ -445,6 +446,7 @@ class Checker:
             p.fns[fn.name] = FnInfo(fn, f"f_{fn.name}")
         for fi in list(p.fns.values()) + p.methods:
             fi.mod = self.mod_of(fi.node)
+            fi.std = is_std(fi.mod)
             self.signature(fi)
 
         # верхний уровень: присвоенные там имена — глобальные переменные; у каждого модуля своя функция
@@ -748,9 +750,32 @@ class Checker:
             if not fi.params:
                 self.err("@cache needs at least one parameter", n)
 
+    def check_extern(self, fi: FnInfo):
+        """extern fn: только типы, которые есть в C; тела нет."""
+        n = fi.node
+        fi.state = "done"
+        if n.extern == "sip" and not is_std(self.mod_of(n)):
+            self.err('extern "sip" is reserved for the standard library; use extern fn or extern "lib"', n)
+        if getattr(fi, "parent", None) is not None:
+            self.err("extern fn must be declared at the top level", n)
+        ok = (INT, FLOAT, BOOL, STR, PTR)
+        for (name, t, _), c in zip(fi.params, n.ctypes):
+            pt = prune(t)
+            if not (pt in ok or (isinstance(pt, OptT) and prune(pt.inner) in (STR, PTR))):
+                self.err(f"extern fn parameter '{name}' must be int, float, bool, str, ptr, a C number type "
+                         f"(i32, u8, usize, f32, ...) or str?/ptr?, not {show(pt)}", n)
+        if n.ret is None:
+            fi.ret = UNIT
+        rt = prune(fi.ret)
+        if not (rt in ok or rt is UNIT or (isinstance(rt, OptT) and prune(rt.inner) in (STR, PTR))):
+            self.err(f"extern fn result must be int, float, bool, str, ptr, str?, ptr? or a C number type, "
+                     f"not {show(rt)}", n)
+
     def check_fn(self, fi: FnInfo):
         if fi.state != "new":
             return
+        if getattr(fi.node, "extern", None) is not None:
+            return self.check_extern(fi)
         fi.state = "busy"
         saved = (self.cur, self.scopes, self.lambdas, self.tscope)
         self.cur, self.scopes, self.lambdas, self.tscope = fi, [], [], fi.tscope
@@ -2407,6 +2432,14 @@ def _str_onestr(result):
     return spec
 
 
+def _str_oneint(result):
+    def spec(c, e):
+        (t,) = c.args(e, 1)
+        c.expect(INT, t, e, f"{e.mname}() width")
+        return result
+    return spec
+
+
 def m_str_split(c, e):
     ts = c.args(e, 0, 1)
     if ts:
@@ -2435,6 +2468,10 @@ STR_METHODS = {
     "isdigit": _str_noarg(BOOL), "isalpha": _str_noarg(BOOL), "isspace": _str_noarg(BOOL),
     "split": m_str_split, "startswith": _str_onestr(BOOL), "endswith": _str_onestr(BOOL),
     "find": _str_onestr(INT), "count": _str_onestr(INT), "replace": m_str_replace, "join": m_str_join,
+    "rfind": _str_onestr(INT), "removeprefix": _str_onestr(STR), "removesuffix": _str_onestr(STR),
+    "zfill": _str_oneint(STR), "ljust": _str_oneint(STR), "rjust": _str_oneint(STR),
+    "isalnum": _str_noarg(BOOL), "isupper": _str_noarg(BOOL), "islower": _str_noarg(BOOL),
+    "capitalize": _str_noarg(STR), "title": _str_noarg(STR),
 }
 
 
@@ -2639,6 +2676,13 @@ SET_METHODS = {
 
 def is_nil(e) -> bool:
     return isinstance(e, Const) and e.value == "None"
+
+
+STD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "std")
+
+
+def is_std(path) -> bool:
+    return bool(path) and os.path.abspath(path).startswith(STD_DIR + os.sep)
 
 
 def check_program(mod: Module, file: str = "<input>", srcmap=None) -> Program:

@@ -186,7 +186,8 @@ class CGen:
                 src.append(f"extern const int SIP_NSRC_{i};")
         if root:
             src.append("const sip_srcfile SIP_FILES[] = {")
-            src += [f"    {{{off}, {c_bytes(path.encode())}, &SIP_NSRC_{i}, SIP_SRC_{i}}},"
+            from .checker import is_std
+            src += [f"    {{{off}, {c_bytes(path.encode())}, &SIP_NSRC_{i}, SIP_SRC_{i}, {int(is_std(path))}}},"
                     for i, (off, path, lines) in enumerate(files)]
             src.append("};")
             src.append(f"const int SIP_NFILES = {len(files)};")
@@ -320,7 +321,112 @@ class CGen:
         out += ["    " * d + t for d, t in self.lines]
         return "\n".join(out) + ("\n" if out else "")
 
+    def in_std(self, node) -> bool:
+        from .checker import is_std
+        return is_std(self.srcmap.locate(node.line)[0]) if self.srcmap is not None and node.line else False
+
+    C_RANGE = {"int8_t": ("INT8_MIN", "INT8_MAX"), "int16_t": ("INT16_MIN", "INT16_MAX"),
+               "int32_t": ("INT32_MIN", "INT32_MAX"), "uint8_t": ("0", "UINT8_MAX"),
+               "uint16_t": ("0", "UINT16_MAX"), "uint32_t": ("0", "UINT32_MAX"), "uint64_t": ("0", None),
+               "size_t": ("0", None)}
+
+    def gen_extern(self, fi):
+        """Обёртка extern fn: значения Sip -> типы C, вызов, результат -> значение Sip.
+
+        Символ объявляется под своим именем C через __asm__, поэтому объявление не спорит
+        с заголовками (strlen из string.h и т. п.). extern "sip" вызывает функцию рантайма
+        напрямую, со строками sip_str.
+        """
+        n = fi.node
+        sip_abi = n.extern == "sip"
+        dn = getattr(n, "display", n.name)
+        line = n.line
+        params, cparams, args, pre = [], [], [], []
+        for (name, t, _), c in zip(fi.params, n.ctypes):
+            pt = deep(t)
+            v = f"v_{name}"
+            params.append(f"{self.c(t)} {v}")
+            if sip_abi:
+                args.append(v)
+                continue
+            if pt is INT:
+                ct = c or "int64_t"
+                lo, hi = self.C_RANGE.get(ct, (None, None))
+                if lo is not None:
+                    cond = f"{v} < {lo}" + (f" || {v} > {hi}" if hi else "")
+                    msg = c_bytes(f"argument '{name}' of {dn}() does not fit in C {ct}".encode())
+                    pre.append(f"if (SIP_UNLIKELY({cond})) sip_raise(SIP_E_OverflowError, SIP_LIT({msg}), {line});")
+                cparams.append(ct)
+                args.append(f"({ct}){v}")
+            elif pt is FLOAT:
+                cparams.append(c or "double")
+                args.append(f"({c or 'double'}){v}")
+            elif pt is BOOL:
+                cparams.append("bool")
+                args.append(v)
+            elif pt is STR:
+                cparams.append("const char *")
+                args.append(f"sip_ffi_cstr({v})")
+            elif isinstance(pt, OptT) and deep(pt.inner) is STR:
+                cparams.append("const char *")
+                args.append(f"({v}.has ? sip_ffi_cstr({v}.v) : NULL)")
+            else:  # ptr, ptr?
+                cparams.append("void *")
+                args.append(v)
+        rt = deep(fi.ret)
+        body = list(pre)
+        if sip_abi:
+            call = f"{n.csym}({', '.join(args)})"
+            if isinstance(rt, OptT) and deep(rt.inner) is STR:
+                body.append(f"sip_str r = {call};")
+                body.append(f"return r.p ? (({self.c(rt)}){{true, r}}) : {nil_code(rt)};")
+            elif rt is UNIT:
+                body.append(f"{call};")
+            else:
+                body.append(f"return {call};")
+        else:
+            if rt is UNIT:
+                cret = "void"
+            elif rt is INT:
+                cret = n.cret or "int64_t"
+            elif rt is FLOAT:
+                cret = n.cret or "double"
+            elif rt is BOOL:
+                cret = "bool"
+            elif rt is STR or (isinstance(rt, OptT) and deep(rt.inner) is STR):
+                cret = "const char *"
+            else:
+                cret = "void *"
+            sym = f"sipc_{fi.cname}"
+            self.fn_code.append(f"extern {cret} {sym}({', '.join(cparams) or 'void'}) "
+                                f"__asm__(SIP_SYM({c_bytes(n.csym.encode())}));\n")
+            call = f"{sym}({', '.join(args)})"
+            null = c_bytes(f"{dn}() returned NULL".encode())
+            if rt is UNIT:
+                body.append(f"{call};")
+            else:
+                body.append(f"{cret} r = {call};")
+                if rt is INT and cret in ("uint64_t", "size_t"):
+                    msg = c_bytes(f"{dn}() result does not fit in int".encode())
+                    body.append(f"if (SIP_UNLIKELY(r > (uint64_t)INT64_MAX)) "
+                                f"sip_raise(SIP_E_OverflowError, SIP_LIT({msg}), {line});")
+                if rt is STR or rt is T_.PTR:
+                    body.append(f"if (SIP_UNLIKELY(!r)) sip_raise(SIP_E_NilError, SIP_LIT({null}), {line});")
+                if rt is STR:
+                    body.append("return sip_from_c(r);")
+                elif isinstance(rt, OptT) and deep(rt.inner) is STR:
+                    body.append(f"return r ? (({self.c(rt)}){{true, sip_from_c(r)}}) : {nil_code(rt)};")
+                elif rt in (INT, FLOAT):
+                    body.append(f"return ({self.c(rt)})r;")
+                else:
+                    body.append("return r;")
+        sig = f"{self.linkage(fi)}{self.c(rt)} {fi.cname}({', '.join(params) or 'void'})"
+        self.protos.append(sig + ";")
+        self.fn_code.append(sig + " {\n" + "".join(f"    {b}\n" for b in body) + "}\n")
+
     def gen_fn(self, fi, top=False):
+        if getattr(fi.node, "extern", None) is not None:
+            return self.gen_extern(fi)
         self.begin(fi)
         vol = "volatile " if fi.has_try else ""
         params = []
@@ -1026,7 +1132,10 @@ class CGen:
         return f"{text}LL" if int(text) > 2 ** 31 - 1 else text
 
     def lit(self, raw: str, quote: str) -> bytes:
-        return ast.literal_eval(quote + raw + quote).encode("utf-8")
+        import warnings
+        with warnings.catch_warnings():  # "\d" в регулярках: неизвестная escape-последовательность остаётся как есть
+            warnings.simplefilter("ignore")
+            return ast.literal_eval(quote + raw + quote).encode("utf-8")
 
     def e_Str(self, e):
         if all(isinstance(p, str) for p in e.parts):
@@ -1183,7 +1292,10 @@ class CGen:
     def e_Call(self, e):
         kind = e.ckind
         if kind == "fn":
-            return f"{self.call_name(e)}({', '.join(self.eval_args(e.bound))})"
+            args = self.eval_args(e.bound)
+            if getattr(e.fn, "std", False) and not self.in_std(e):
+                self.emit(f"sip_std_line = {e.line};")  # ошибки внутри std — на этой строке
+            return f"{self.call_name(e)}({', '.join(args)})"
         if kind == "method":
             codes = self.eval_args([e.func.obj] + e.bound)
             return f"{self.call_name(e)}({', '.join(codes)})"
@@ -1986,6 +2098,39 @@ class CGen:
     def ms_find(self, e, t):
         return "sip_str_find({}, {})".format(*self.recv_args(e))
 
+    def ms_rfind(self, e, t):
+        return "sip_str_rfind({}, {})".format(*self.recv_args(e))
+
+    def ms_removeprefix(self, e, t):
+        return "sip_str_remove_affix({}, {}, 0)".format(*self.recv_args(e))
+
+    def ms_removesuffix(self, e, t):
+        return "sip_str_remove_affix({}, {}, 1)".format(*self.recv_args(e))
+
+    def ms_ljust(self, e, t):
+        return "sip_str_pad({}, {}, 0)".format(*self.recv_args(e))
+
+    def ms_rjust(self, e, t):
+        return "sip_str_pad({}, {}, 1)".format(*self.recv_args(e))
+
+    def ms_zfill(self, e, t):
+        return "sip_str_pad({}, {}, 2)".format(*self.recv_args(e))
+
+    def ms_isalnum(self, e, t):
+        return f"sip_str_all({self.recv_args(e)[0]}, 3)"
+
+    def ms_isupper(self, e, t):
+        return f"sip_str_cased({self.recv_args(e)[0]}, 1)"
+
+    def ms_islower(self, e, t):
+        return f"sip_str_cased({self.recv_args(e)[0]}, 0)"
+
+    def ms_capitalize(self, e, t):
+        return f"sip_str_title({self.recv_args(e)[0]}, 0)"
+
+    def ms_title(self, e, t):
+        return f"sip_str_title({self.recv_args(e)[0]}, 1)"
+
     def ms_count(self, e, t):
         return "sip_str_count({}, {})".format(*self.recv_args(e))
 
@@ -2265,11 +2410,50 @@ def _header(file: str, split: bool, root: bool, http: bool, use_async: bool) -> 
         RUNTIME])
 
 
+def native_links(prog: Program, srcmap) -> list:
+    """Что нужно компоновщику для extern fn: строки-пометки для compiler.py.
+
+    extern "z" — библиотека (-lz); extern "glue.c" — файл C рядом с модулем;
+    [c] flags в sip.toml пакета — флаги для clang (-I, -L, ...).
+    """
+    import os
+    out, seen = [], set()
+
+    def add(line):
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    for fi in prog.fns.values():
+        lib = getattr(fi.node, "extern", None)
+        if not lib or lib == "sip":
+            continue
+        mod = srcmap.locate(fi.node.line)[0] if srcmap is not None else ""
+        if lib.endswith(".c"):
+            path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(mod)), lib))
+            if not os.path.isfile(path):
+                file, line = srcmap.locate(fi.node.line)
+                raise SipError(f"C source '{lib}' not found (looked for {path})", line, 0, file)
+            add(f"// sip-csrc: {path}")
+            if srcmap is not None and path not in srcmap.extra:
+                srcmap.extra.append(path)  # правка .c пересобирает программу
+        elif "/" in lib or lib.endswith((".a", ".so", ".dylib")):
+            add(f"// sip-lib: {os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(mod)), lib))}")
+        else:
+            add(f"// sip-lib: -l{lib}")
+    loader = getattr(srcmap, "loader", None)
+    if loader is not None:
+        for pkg in loader.packages.values():
+            for f in getattr(pkg, "cflags", []) if pkg is not None else []:
+                add(f"// sip-flag: {f}")
+    return out
+
+
 def generate_c(prog: Program, file: str, srcmap) -> str:
     """Вся программа одной единицей компиляции: clang видит и встраивает всё сразу."""
     g = CGen(prog, file, srcmap)
     parts = g.unit({path for _, path, _ in srcmap.files}, True, False)
-    return "\n".join([_header(file, False, True, g.uses_http, g.uses_async), *parts]) + "\n"
+    links = native_links(prog, srcmap)
+    return "\n".join([_header(file, False, True, g.uses_http, g.uses_async), *links, *parts]) + "\n"
 
 
 def generate_units(prog: Program, file: str, srcmap) -> list:
@@ -2284,9 +2468,11 @@ def generate_units(prog: Program, file: str, srcmap) -> list:
         gens.append((i, path, g, g.unit({path}, i == 0, True)))
     http = any(g.uses_http for _, _, g, _ in gens)
     use_async = any(g.uses_async for _, _, g, _ in gens)
+    links = native_links(prog, srcmap)
     for i, path, _, parts in gens:
         name = Path(path).stem if i == 0 else f"{i}_{Path(path).stem}"
-        units.append((name, "\n".join([_header(path, True, i == 0, http, use_async), *parts]) + "\n"))
+        extra = links if i == 0 else []
+        units.append((name, "\n".join([_header(path, True, i == 0, http, use_async), *extra, *parts]) + "\n"))
     return units
 
 

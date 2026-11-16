@@ -25,6 +25,7 @@ BOOL = Prim("bool")
 STR = Prim("str")
 UNIT = Prim("unit")
 RANGE = Prim("range")
+PTR = Prim("ptr")  # указатель C (FFI): непрозрачный, nil — NULL
 NUMERIC = (INT, FLOAT)
 
 
@@ -206,14 +207,15 @@ def subst(t: Type, m: dict) -> Type:
 
 def is_ref(t: Type) -> bool:
     """Тип хранится как указатель, и nil для него — NULL."""
-    return isinstance(prune(t), (ListT, DictT, RecordT, SumT, SetT))
+    t = prune(t)
+    return t is PTR or isinstance(t, (ListT, DictT, RecordT, SumT, SetT))
 
 
 def no_ptrs(t: Type) -> bool:
     """В значении типа нет указателей: его память сборщик мусора не сканирует."""
     t = prune(t)
     if isinstance(t, Prim):
-        return t is not STR
+        return t is not STR and t is not PTR  # ptr может указывать на память сборщика
     if isinstance(t, TupleT):
         return all(no_ptrs(x) for x in t.items)
     if isinstance(t, OptT):
@@ -362,6 +364,8 @@ def ctype(t: Type) -> str:
         return "void"
     if t is RANGE:
         return "sip_range"
+    if t is PTR:
+        return "void *"
     if isinstance(t, OptT) and is_ref(t.inner):
         return ctype(t.inner)
     if isinstance(t, SetT):

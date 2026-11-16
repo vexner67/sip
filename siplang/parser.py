@@ -141,6 +141,8 @@ class Parser:
                 return self.parse_type_def()
             if tok.value == "interface" and nxt.kind == "NAME":
                 return self.parse_interface()
+            if tok.value == "extern" and nxt.kind in ("fn", "STRING"):
+                return self.parse_extern()
             if tok.value in HINTS and nxt.kind in ("NAME", ":", "("):
                 self.error(f"'{tok.value}' is not Sip: {HINTS[tok.value]}")
         if k == "if":
@@ -426,6 +428,47 @@ class Parser:
             self.accept(":")
             body = self.parse_block()
         return FnDef(name, params, ret, body, is_async, decorators, is_method, tparams, line=tok.line)
+
+    # типы C для extern fn: в Sip это int или float, на границе — проверка диапазона
+    C_INTS = {"i8": "int8_t", "i16": "int16_t", "i32": "int32_t", "i64": "int64_t", "u8": "uint8_t",
+              "u16": "uint16_t", "u32": "uint32_t", "u64": "uint64_t", "usize": "size_t"}
+    C_FLOATS = {"f32": "float", "f64": "double"}
+
+    def parse_extern(self):
+        """extern ["lib" | "file.c" | "sip"] fn name(x int, s str) i32 [= c_symbol]"""
+        tok = self.advance()
+        lib = self.advance().value[1] if self.at("STRING") else ""
+        self.expect("fn", "'fn' after extern")
+        name = self.expect("NAME", "function name").value
+        if self.at("["):
+            self.error("an extern fn cannot have type parameters")
+        self.expect("(")
+        params = self.parse_params(")")
+        self.expect(")")
+        ret = None if self.at("=", "NEWLINE") else self.parse_type()
+        csym = name
+        if self.accept("="):
+            csym = self.expect("NAME", "the name of the C function (extern fn has no body)").value
+        elif self.at(":"):
+            self.error("an extern fn has no body: it is implemented in C")
+        self.end_line()
+        fn = FnDef(name, params, ret, [], line=tok.line)
+        fn.extern, fn.csym = lib, csym
+
+        def ctype_of(t):
+            if isinstance(t, TName) and not t.args and t.name in self.C_INTS:
+                return self.C_INTS[t.name], TName("int", line=t.line)
+            if isinstance(t, TName) and not t.args and t.name in self.C_FLOATS:
+                return self.C_FLOATS[t.name], TName("float", line=t.line)
+            return None, t
+        fn.ctypes = []
+        for p in params:
+            if p.star or p.default is not None:
+                self.error("extern fn parameters cannot have defaults or *", tok)
+            c, p.type = ctype_of(p.type)
+            fn.ctypes.append(c)
+        fn.cret, fn.ret = ctype_of(ret) if ret is not None else (None, None)
+        return fn
 
     def parse_tparams(self) -> list:
         """[T, U: Shape] после имени функции или типа."""

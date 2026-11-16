@@ -57,7 +57,7 @@ def repr_call(t, sb: str, val: str) -> str:
 
 def eq_expr(t, a: str, b: str) -> str:
     t = deep(t)
-    if t in (INT, FLOAT, BOOL):
+    if t in (INT, FLOAT, BOOL) or (isinstance(t, Prim) and t.name == "ptr"):
         return f"({a} == {b})"
     return f"eq_{key(t)}({a}, {b})"
 

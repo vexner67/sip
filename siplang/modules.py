@@ -20,6 +20,8 @@ from .lexer import tokenize
 from .nodes import *  # noqa: F403
 from .parser import Parser
 
+STD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "std")
+
 # Встроенные модули и их члены. Вызов `math.sqrt(x)` становится встроенной функцией "math.sqrt".
 NATIVE = {
     "math": {"sqrt", "floor", "ceil", "trunc", "log", "log2", "log10", "exp", "sin", "cos", "tan", "asin",
@@ -84,11 +86,12 @@ NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 class Package:
     """Папка с sip.toml: имя пакета и его зависимости {имя: папка}."""
 
-    def __init__(self, root: str, name: str, deps: dict, toml: str):
+    def __init__(self, root: str, name: str, deps: dict, toml: str, cflags=None):
         self.root = root
         self.name = name
         self.deps = deps
         self.toml = toml
+        self.cflags = cflags or []  # [c] flags: для extern fn (-I, -L, -D ...)
 
 
 def fetch_git(name: str, url: str, rev: str, where: str, line: int) -> str:
@@ -143,7 +146,14 @@ def read_package(root: str) -> Package:
         else:
             raise SipError(f"dependency '{dname}' needs path or git", 0, 0, toml)
         deps[dname] = d
-    return Package(os.path.abspath(root), name, deps, toml)
+    flags = (data.get("c") or {}).get("flags") or []
+    if not isinstance(flags, list) or not all(isinstance(f, str) for f in flags):
+        raise SipError('[c] flags must be a list of strings, e.g. flags = ["-I/opt/include", "-L/opt/lib"]', 0, 0, toml)
+    root = os.path.abspath(root)
+    for i, f in enumerate(flags):  # -Iinclude и -Llib — от папки пакета
+        if f[:2] in ("-I", "-L") and len(f) > 2 and not os.path.isabs(f[2:]):
+            flags[i] = f[:2] + os.path.join(root, f[2:])
+    return Package(root, name, deps, toml, flags)
 
 
 def find_package(start: str) -> Package | None:
@@ -215,6 +225,7 @@ class Loader:
             tried.append(os.path.join(droot, *(parts[1:] or parts[:1])) + ".sip")
         if pkg is not None:
             tried.append(os.path.join(pkg.root, *parts) + ".sip")
+        tried.append(os.path.join(STD_DIR, *parts) + ".sip")  # стандартная библиотека: os, path, re
         for path in tried:
             if os.path.isfile(path):
                 return os.path.abspath(path), self.prefix(path)
@@ -222,6 +233,9 @@ class Loader:
 
     def prefix(self, path: str) -> str:
         """Префикс имён модуля: из пакета и пути внутри него, чтобы модули разных пакетов не путались."""
+        if os.path.abspath(path).startswith(STD_DIR + os.sep):
+            rel = os.path.relpath(path, STD_DIR)[:-4]
+            return "__".join(["std"] + [re.sub(r"\W", "_", p) for p in rel.split(os.sep)]) + "__"
         pkg = self.package_of(path)
         if pkg is not None and pkg.root != self.base:
             label = [pkg.name] + os.path.relpath(path, pkg.root)[:-4].split(os.sep)

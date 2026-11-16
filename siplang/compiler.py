@@ -10,6 +10,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -57,17 +58,23 @@ def compile_file(path: str) -> str:
         return compile_source(f.read(), path)
 
 
+def _marks(c_code: str, what: str) -> list:
+    return re.findall(rf"^// sip-{what}: (.+)$", c_code, re.M)
+
+
 def _libs(c_code: str) -> list:
     libs = ["-lcurl"] if "\n#define SIP_USE_HTTP 1\n" in c_code else []
     if "\n#define SIP_USE_ASYNC 1\n" in c_code:
         libs.append("-pthread")
-    return libs
+    return _marks(c_code, "flag") + _marks(c_code, "lib") + libs
 
 
-def _cc(cmd: list) -> None:
+def _cc(cmd: list, user: bool = False) -> None:
+    """user: в сборке участвует код C пользователя (extern), и ошибка может быть его."""
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        raise SipError("C compiler failed (this is a bug in sip):\n" + r.stderr.strip()[:4000], 0, 0, "sip")
+        what = "C compiler failed" + ("" if user else " (this is a bug in sip)")
+        raise SipError(what + ":\n" + r.stderr.strip()[:4000], 0, 0, "sip")
 
 
 def cc_build(c_code: str, out: str, extra: list[str] | None = None) -> None:
@@ -78,7 +85,9 @@ def cc_build(c_code: str, out: str, extra: list[str] | None = None) -> None:
     with open(c_path, "w", encoding="utf-8") as f:
         f.write(c_code)
     try:
-        _cc([find_cc(), *CFLAGS, *(extra or []), c_path, "-o", out, "-lm", *_libs(c_code)])
+        user = bool(_marks(c_code, "csrc") or _marks(c_code, "lib"))
+        _cc([find_cc(), *CFLAGS, *(extra or []), c_path, *_marks(c_code, "csrc"), "-o", out, "-lm",
+             *_libs(c_code)], user=user)
     finally:
         if os.environ.get("SIP_KEEP_C") is None:
             os.remove(c_path)
@@ -87,28 +96,38 @@ def cc_build(c_code: str, out: str, extra: list[str] | None = None) -> None:
 def cc_build_units(units: list, out: str, extra: list[str] | None = None) -> dict:
     """Единицы C -> объектные файлы (из кэша, если текст не менялся) -> исполняемый файл.
 
+    Файлы C из extern "file.c" компилируются так же, отдельными единицами.
     Возвращает {"compiled": n, "cached": m}.
     """
     cc = find_cc()
     flags = [*CFLAGS, *(extra or [])]
     obj_dir = cache_dir() / "obj"
     obj_dir.mkdir(parents=True, exist_ok=True)
+    root = units[0][1]
+    items = [(name, code, flags) for name, code in units]
+    for src in _marks(root, "csrc"):
+        try:
+            text = Path(src).read_text(encoding="utf-8")
+        except OSError as e:
+            raise SipError(f"{src}: {e.strerror}", 0, 0, "sip") from None
+        # #line: ошибки clang указывают на сам файл пользователя
+        items.append((Path(src).stem + "_c", f"#line 1 {json.dumps(src)}\n{text}", [*flags, *_marks(root, "flag")]))
     jobs, objs = [], []
-    for name, code in units:
-        h = hashlib.sha256("\0".join([VERSION, cc, *flags, code]).encode()).hexdigest()[:24]
+    for name, code, fl in items:
+        h = hashlib.sha256("\0".join([VERSION, cc, *fl, code]).encode()).hexdigest()[:24]
         obj = obj_dir / f"{name}-{h}.o"
         objs.append(str(obj))
         if not obj.exists():
-            jobs.append((name, code, obj))
+            jobs.append((name, code, obj, fl))
 
     def build(job):
-        name, code, obj = job
+        name, code, obj, fl = job
         tmp = f"{obj}.tmp{os.getpid()}"
         c_path = tmp + ".c"
         with open(c_path, "w", encoding="utf-8") as f:
             f.write(code)
         try:
-            _cc([cc, *flags, "-c", c_path, "-o", tmp])
+            _cc([cc, *fl, "-c", c_path, "-o", tmp], user=fl is not flags)
             os.replace(tmp, obj)
         finally:
             if os.environ.get("SIP_KEEP_C") is None and os.path.exists(c_path):
@@ -118,8 +137,8 @@ def cc_build_units(units: list, out: str, extra: list[str] | None = None) -> dic
         with ThreadPoolExecutor(max_workers=min(len(jobs), os.cpu_count() or 4)) as ex:
             list(ex.map(build, jobs))
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    _cc([cc, *flags, *objs, "-o", out, "-lm", *_libs(units[0][1])])
-    return {"compiled": len(jobs), "cached": len(units) - len(jobs)}
+    _cc([cc, *flags, *objs, "-o", out, "-lm", *_libs(root)], user=bool(_marks(root, "lib") or _marks(root, "csrc")))
+    return {"compiled": len(jobs), "cached": len(items) - len(jobs)}
 
 
 def cache_dir() -> Path:
