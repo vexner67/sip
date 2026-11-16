@@ -36,7 +36,7 @@ fn sh(x int, n int) int = x * P2[n]
 type Fix(at int, label str, kind str)
 
 type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [], cl {str: int} = {},
-         data [int] = [], dl {str: int} = {}, bss int = 0, bl {str: int} = {}, nlabel int = 0)
+         data [int] = [], dl {str: int} = {}, bss int = 0, bl {str: int} = {}, nlabel int = 0, lpos int = -1)
 
     fn emit(w int)
         .code.append(w)
@@ -49,6 +49,7 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
 
     fn here(label str)
         .tl[label] = len(.code)
+        .lpos = len(.code)
 
     fn fix(label str, kind str, w int)
         .fixes.append(Fix(len(.code), label, kind))
@@ -137,6 +138,42 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
     fn mov(rd int, rm int)
         if rd != rm then .rrr(2852127712, rd, 0, rm)
 
+    # dst = src, где src — промежуточный регистр, который дальше не читается: если его только что записала
+    # простая команда (mov, add/sub, movz/movn, cset) и сюда нет перехода, она сразу пишет в dst
+    fn mov_tmp(dst int, src int)
+        n = len(.code)
+        fixed = len(.fixes) > 0 and .fixes[len(.fixes) - 1].at == n - 1
+        if dst != src and n > 0 and .lpos != n and not fixed
+            w = .code[n - 1]
+            if (w & 31) == src and .retargetable(w)
+                .code[n - 1] = w - src + dst
+                return
+        .mov(dst, src)
+
+    # последняя команда — mul rd, rn, rm с rd == src (и сюда нет перехода): заменить на madd r, rn, rm, ra
+    fn fuse_madd(r int, src int, ra int) bool
+        n = len(.code)
+        fixed = len(.fixes) > 0 and .fixes[len(.fixes) - 1].at == n - 1
+        if n == 0 or .lpos == n or fixed then return false
+        w = .code[n - 1]
+        if (w & 4292934656) != 2600500224 or (w & 31) != src or ra == src then return false
+        rn = (w // 32) & 31
+        rm = (w // 65536) & 31
+        if rn == src or rm == src then return false
+        .code[n - 1] = 2600468480 + sh(rm, 16) + sh(ra, 10) + sh(rn, 5) + r
+        true
+
+    fn retargetable(w int) bool
+        m21 = w & 4280287232  # 0xFF200000: регистровые формы
+        m23 = w & 4286578688  # 0xFF800000: непосредственные
+        if m21 == 2852126720 or m21 == 2332033024 or m21 == 3405774848 then return true  # orr, add, sub
+        if m21 == 3388997632 or m21 == 2315255808 then return true  # eor, and
+        if m21 == 2600468480 or m21 == 2583691264 then return true  # mul, madd, smulh; sdiv, csel, cset
+        if m23 == 2449473536 or m23 == 2466250752 then return true  # and (imm), asr
+        if m23 == 2432696320 or m23 == 3506438144 then return (w // 32) & 31 != 31  # add/sub imm (не sp)
+        if m23 == 3531603968 or m23 == 2457862144 then return true  # movz, movn
+        (w & 4294905824) == 2594113504  # cset
+
     fn add_imm(rd int, rn int, imm int)
         .emit(2432696320 + sh(imm, 10) + sh(rn, 5) + rd)
 
@@ -169,6 +206,10 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
     # cmp rn, rm, asr #63 — после mul и smulh: не равно — переполнение
     fn cmp_asr63(rn int, rm int) = .rrr(3951098911, 0, rn, rm)
 
+    # если cond: флаги от rn - imm, иначе флаги = nzcv
+    fn ccmp_imm(rn int, imm int, nzcv int, cond int)
+        .emit(4198500352 + sh(imm, 16) + sh(cond, 12) + sh(rn, 5) + nzcv)
+
     fn cset(rd int, cond int)
         .emit(2594113504 + sh(cond ^ 1, 12) + rd)
 
@@ -190,6 +231,27 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
     fn strb(rt int, rn int, off int)
         .emit(956301312 + sh(off, 10) + sh(rn, 5) + rt)
 
+    # пара регистров: [rn + off], [rn + off]! (pre) и [rn], off (post); off кратно 8, -512..504
+    fn pair(base int, rt int, rt2 int, rn int, off int)
+        .emit(base + sh((off // 8) & 127, 15) + sh(rt2, 10) + sh(rn, 5) + rt)
+
+    fn stp(rt int, rt2 int, rn int, off int) = .pair(2835349504, rt, rt2, rn, off)
+    fn stp_pre(rt int, rt2 int, rn int, off int) = .pair(2843738112, rt, rt2, rn, off)
+    fn ldp(rt int, rt2 int, rn int, off int) = .pair(2839543808, rt, rt2, rn, off)
+    fn ldp_post(rt int, rt2 int, rn int, off int) = .pair(2831155200, rt, rt2, rn, off)
+
+    # rd = rn >> k (арифметический сдвиг)
+    fn asr(rd int, rn int, k int)
+        .emit(2470509568 + sh(k, 16) + sh(rn, 5) + rd)
+
+    # rd = rn & (2**k - 1), 1 <= k <= 63
+    fn and_low(rd int, rn int, k int)
+        .emit(2453667840 + sh(k - 1, 10) + sh(rn, 5) + rd)
+
+    # rd = если cond, то rn, иначе rm
+    fn csel(rd int, rn int, rm int, cond int)
+        .emit(2592079872 + sh(rm, 16) + sh(cond, 12) + sh(rn, 5) + rd)
+
     fn push_frame()  # stp x29, x30, [sp, #-16]!; mov x29, sp
         .emit(2847898621)
         .emit(2432697341)
@@ -208,6 +270,10 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
     fn bcond(cond int, label str) = .fix(label, "b19", 1409286144 + cond)
     fn cbz(rt int, label str) = .fix(label, "b19", 3019898880 + rt)
     fn cbnz(rt int, label str) = .fix(label, "b19", 3036676096 + rt)
+
+    # переход, если бит bit (0..31) регистра rt равен нулю (tbz) или единице (tbnz); ±32 КБ
+    fn tbz(rt int, bit int, label str) = .fix(label, "b14", 905969664 + sh(bit, 19) + rt)
+    fn tbnz(rt int, bit int, label str) = .fix(label, "b14", 922746880 + sh(bit, 19) + rt)
 
     # rd = адрес метки (код или строка в __TEXT: в пределах ±1 МБ)
     fn adr(rd int, label str) = .fix(label, "adr", 268435456 + rd)
@@ -248,6 +314,9 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
             if f.kind == "b26"
                 if d % 4 != 0 or d < -134217728 or d >= 134217728 then fail ValueError("branch out of range: {f.label}")
                 w = w + ((d // 4) & 67108863)
+            elif f.kind == "b14"
+                if d % 4 != 0 or d < -32768 or d >= 32768 then fail ValueError("branch out of range: {f.label}")
+                w = w + sh((d // 4) & 16383, 5)
             elif f.kind == "b19"
                 if d % 4 != 0 or d < -1048576 or d >= 1048576 then fail ValueError("branch out of range: {f.label}")
                 w = w + sh((d // 4) & 524287, 5)

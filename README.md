@@ -97,7 +97,7 @@ async fn main()
 | [siplang/std/](siplang/std/) | стандартная библиотека на Sip: `os`, `path`, `re`; `rt.sip` — рантайм на Sip, подключается к каждой программе |
 | [siplang/compiler.py](siplang/compiler.py) | вызов clang, раздельная компиляция, кэш объектных файлов и бинарников |
 | [siplang/cli.py](siplang/cli.py) | команда `sip` |
-| [selfhost/](selfhost/) | компилятор на самом Sip: лексер, парсер, загрузчик модулей, проверка типов и генерация C совпадают с Python байт в байт; `sipc` собирает сам себя без Python; `sipc native` — свой бэкенд arm64/Mach-O без C (пока int, bool, функции, циклы) |
+| [selfhost/](selfhost/) | компилятор на самом Sip: лексер, парсер, загрузчик модулей, проверка типов и генерация C совпадают с Python байт в байт; `sipc` собирает сам себя без Python; `sipc native` — свой бэкенд arm64/Mach-O без C с оптимизатором, не медленнее clang -O3 (пока int, bool, функции, циклы) |
 
 ## Документация
 

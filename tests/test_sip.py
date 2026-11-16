@@ -1885,6 +1885,12 @@ NATIVE_ERRORS = {
     "noret": "fn g(a int) int\n    if a > 0\n        return 1\nprint g(1)\nprint g(0)\n",
     "neg": "x = -9223372036854775807 - 1\nprint -x\n",
     "divneg": "x = -9223372036854775807 - 1\nprint x // -1\n",
+    "mulc": "x = 3074457345618258603\nprint x * 2\nprint x * 3\n",
+    "divm1": "fn d(a int, b int) int = a // b\nprint d(7, -1)\nprint d(-9223372036854775807 - 1, -1)\n",
+    "modvar0": "fn m(a int, b int) int = a % b\nfor i in 0..3\n    print m(10, 2 - i)\n",
+    "rangemask": "fn f(a int) int\n    b = a % 1000\n    c = b * 9223372036854775\n    return c * 2\nprint f(1)\nprint f(999)\n",
+    "doubling": "z = 3\nfor i in 1..80\n    z = z * 2 + 1\n    print z\n",
+    "loopadd": "w = 0\nfor i in 0..9223372036854775806\n    w = i + 1\n    if i > 3 then w = 9223372036854775807 + i\nprint w\n",
 }
 
 
@@ -1919,6 +1925,23 @@ class NativeTest(unittest.TestCase):
         out, _, rc = self.both((ROOT / "tests" / "native_basic.sip").read_text())
         self.assertEqual(rc, 0)
         self.assertIn("primes: 10", out)
+
+    def test_arith(self):
+        """деление и остаток при всех знаках, умножение на константы, перестановки, диапазоны"""
+        out, _, rc = self.both((ROOT / "tests" / "native_arith.sip").read_text())
+        self.assertEqual(rc, 0)
+        self.assertNotIn("mismatch", out)
+
+    def test_bench_programs(self):
+        """программы bench/native (уменьшенные): совпадение с C"""
+        for p in sorted((ROOT / "bench" / "native").glob("*.sip")):
+            with self.subTest(p.stem):
+                src = p.read_text()
+                for big, small in (("3000000", "30000"), ("2000000", "20000"), ("300000000", "300000"),
+                                   ("3000", "300"), ("fib(38)", "fib(20)")):
+                    src = src.replace(big, small)
+                _, _, rc = self.both(src)
+                self.assertEqual(rc, 0)
 
     def test_fib(self):
         out, _, _ = self.both((ROOT / "bench" / "speed" / "fib.sip").read_text())
