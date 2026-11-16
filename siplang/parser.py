@@ -130,6 +130,8 @@ class Parser:
             nxt = self.peek(1)
             if tok.value == "type" and nxt.kind == "NAME":
                 return self.parse_type_def()
+            if tok.value == "interface" and nxt.kind == "NAME":
+                return self.parse_interface()
             if tok.value in HINTS and nxt.kind in ("NAME", ":", "("):
                 self.error(f"'{tok.value}' is not Sip: {HINTS[tok.value]}")
         if k == "if":
@@ -391,6 +393,7 @@ class Parser:
         is_async = bool(self.accept("async"))
         self.expect("fn")
         name = self.expect("NAME", "function name").value
+        tparams = self.parse_tparams()
         self.expect("(")
         params = self.parse_params(")")
         self.expect(")")
@@ -412,7 +415,58 @@ class Parser:
         else:
             self.accept(":")
             body = self.parse_block()
-        return FnDef(name, params, ret, body, is_async, decorators, is_method, line=tok.line)
+        return FnDef(name, params, ret, body, is_async, decorators, is_method, tparams, line=tok.line)
+
+    def parse_tparams(self) -> list:
+        """[T, U: Shape] после имени функции или типа."""
+        out = []
+        if not self.accept("["):
+            return out
+        while not self.at("]"):
+            tok = self.expect("NAME", "type parameter name")
+            bound = None
+            if self.accept(":"):
+                bound = self.parse_type()
+            out.append(TParamDef(tok.value, bound, line=tok.line))
+            if not self.accept(","):
+                break
+        self.expect("]")
+        if not out:
+            self.error("empty type parameter list")
+        return out
+
+    def parse_interface(self):
+        tok = self.advance()  # `interface`
+        name = self.expect("NAME", "interface name").value
+        methods = []
+        self.accept(":")
+        if self.at("NEWLINE") and self.peek(1).kind == "INDENT":
+            self.advance()
+            self.advance()
+            while not self.at("DEDENT", "EOF"):
+                if self.accept("NEWLINE"):
+                    continue
+                mtok = self.expect("fn", "'fn' (an interface lists method signatures)")
+                mname = self.expect("NAME", "method name").value
+                if self.at("["):
+                    self.error("interface methods cannot have type parameters")
+                self.expect("(")
+                params = self.parse_params(")")
+                self.expect(")")
+                if params and params[0].name == "self":
+                    params = params[1:]
+                self.accept("->")
+                ret = None if self.at("NEWLINE") else self.parse_type()
+                if self.at("=", ":"):
+                    self.error("interface methods have no body: write only the signature")
+                self.end_line()
+                methods.append(FnDef(mname, params, ret, [], is_method=True, line=mtok.line))
+            self.accept("DEDENT")
+        else:
+            self.end_line()
+        if not methods:
+            self.error("an interface needs at least one method: fn name(...) Type", tok)
+        return Interface(name, methods, line=tok.line)
 
     def parse_params(self, closing: str) -> list:
         params = []
@@ -488,6 +542,7 @@ class Parser:
     def parse_type_def(self):
         tok = self.advance()  # `type`
         name = self.expect("NAME", "type name").value
+        tparams = self.parse_tparams()
         if self.accept("="):
             variants = []
             self.accept("|")
@@ -503,13 +558,13 @@ class Parser:
             fields, methods = self.parse_type_body()
             if fields:
                 self.error("a sum type cannot have fields: put them in the variants")
-            return SumType(name, variants, methods, line=tok.line)
+            return SumType(name, variants, methods, tparams, line=tok.line)
         fields = []
         if self.accept("("):
             fields = self.parse_params(")")
             self.expect(")")
         more, methods = self.parse_type_body()
-        return Record(name, fields + more, methods, line=tok.line)
+        return Record(name, fields + more, methods, tparams, line=tok.line)
 
     def parse_type_body(self) -> tuple[list, list]:
         self.accept(":")

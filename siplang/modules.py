@@ -51,12 +51,12 @@ def _top_names(body) -> list:
     for s in body:
         if isinstance(s, FnDef):
             names.append(s.name)
-        elif isinstance(s, Record):
+        elif isinstance(s, (Record, Interface)):
             names.append(s.name)
         elif isinstance(s, SumType):
             names.append(s.name)
             names += [v.name for v in s.variants]
-    names += Checker().assigned([s for s in body if not isinstance(s, (FnDef, Record, SumType))])
+    names += Checker().assigned([s for s in body if not isinstance(s, (FnDef, Record, SumType, Interface))])
     return names
 
 
@@ -172,7 +172,7 @@ class Renamer:
         return self.new(name, local) or name
 
     def top(self, s):
-        if isinstance(s, (FnDef, Record, SumType)):
+        if isinstance(s, (FnDef, Record, SumType, Interface)):
             if s.name in self.names:
                 s.display = s.name
                 s.name = self.names[s.name]
@@ -211,7 +211,11 @@ class Renamer:
         if isinstance(node, Variant) and node.name in self.names:
             node.display = node.name
             node.name = self.names[node.name]
+        if isinstance(node, (Record, SumType)) and node.tparams:
+            local = local | {tp.name for tp in node.tparams}  # T в полях — не имя модуля
         if isinstance(node, FnDef):
+            node.tparams = self.rn(node.tparams, local)
+            local = local | {tp.name for tp in node.tparams}
             inner = local | _fn_locals(node)
             if node.is_method:
                 inner = inner | {"self"}

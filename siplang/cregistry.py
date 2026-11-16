@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SetT, SumT, TaskT,
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, IfaceT, ListT, OptT, Prim, RecordT, SetT, SumT, TaskT,
                     TupleT,
                     comparable, ctype, deep, hashable, is_ref, key, no_ptrs)
 
@@ -160,6 +160,11 @@ class Registry:
             self.need(t.ret)
         elif isinstance(t, TaskT):
             self.need(FnT([], t.ret))
+        elif isinstance(t, IfaceT):
+            for ps, ret in t.methods.values():
+                for _, pt in ps:
+                    self.need(pt)
+                self.need(ret)
         self.order.append(k)
         return k
 
@@ -182,6 +187,10 @@ class Registry:
             elif isinstance(t, FnT):
                 ps = ", ".join(["void *"] + [ctype(p) for p in t.params])
                 tuples.append(f"typedef struct {{ {ctype(t.ret)} (*fn)({ps}); void *env; }} {k};")
+            elif isinstance(t, IfaceT):
+                # значение интерфейса: объект и таблица его методов
+                tuples.append(f"struct {k}_vt;")
+                tuples.append(f"typedef struct {{ void *o; const struct {k}_vt *vt; }} {k};")
         for k in self.order:
             t = self.types[k]
             gen = getattr(self, "gen_" + type(t).__name__)
@@ -941,6 +950,18 @@ static void {k}_remove({d} s, {ce} x, int line) {{
               f"{'' if unit else ' return t->result;'} }}\n"
               f"static bool eq_{k}({k} a, {k} b) {{ return a == b; }}\n"
               f'static void repr_{k}(sip_sb *b, {k} t) {{ (void)t; sip_sb_put(b, "<task>", 6); }}')
+        return body, ps, im
+
+    def gen_IfaceT(self, k, t):
+        slots = []
+        for mname, (ps, ret) in t.methods.items():
+            args = ", ".join(["void *"] + [ctype(pt) for _, pt in ps])
+            slots.append(f"{ctype(ret)} (*m_{mname})({args});")
+        slots.append("void (*repr)(sip_sb *, void *);")
+        body = f"struct {k}_vt {{ {' '.join(slots)} }};"
+        ps = [f"static bool eq_{k}({k} a, {k} b);", f"static void repr_{k}(sip_sb *b, {k} v);"]
+        im = (f"static bool eq_{k}({k} a, {k} b) {{ return a.o == b.o; }}\n"
+              f"static void repr_{k}(sip_sb *b, {k} v) {{ v.vt->repr(b, v.o); }}")
         return body, ps, im
 
     def gen_RecordT(self, k, t):

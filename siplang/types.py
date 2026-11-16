@@ -44,22 +44,106 @@ class TupleT(Type):
     items: list
 
 
-@dataclass(eq=False, repr=False)
-class RecordT(Type):
-    name: str
-    fields: dict = field(default_factory=dict)    # имя -> тип, в порядке объявления
-    defaults: dict = field(default_factory=dict)  # имя -> узел выражения
-    methods: dict = field(default_factory=dict)   # имя -> FnInfo
+class TParam(Type):
+    """Параметр типа T в fn f[T] или type Box[T].
+
+    Тело обобщённой функции проверяется один раз: T — отдельный тип, который
+    совпадает только сам с собой. Код C генерируется для каждого набора
+    настоящих типов: на это время SUBST подставляет вместо T настоящий тип.
+    needs — что тело делает со значениями T (<, +, ключ словаря); это проверяется
+    в месте вызова.
+    """
+
+    def __init__(self, name: str, bound=None):
+        self.name = name
+        self.bound = bound   # IfaceT или None
+        self.needs: dict = {}  # "ord" | "hash" | "num" | "add" -> True
 
 
-@dataclass(eq=False, repr=False)
-class SumT(Type):
-    name: str
-    variants: dict = field(default_factory=dict)  # имя варианта -> [(поле, тип)]
-    methods: dict = field(default_factory=dict)
+SUBST: dict = {}  # TParam -> тип, пока генерируется экземпляр обобщённой функции
+
+
+class Generic(Type):
+    """Запись или тип-сумма; у обобщённых (Box[T]) есть params и args.
+
+    Box[int] — отдельный объект с base = Box и args = [int]; его поля
+    вычисляются подстановкой при первом обращении. У самого Box args = params.
+    """
+
+    _members = ""  # имя словаря, который зависит от параметров: fields или variants
+
+    def __init__(self, name: str):
+        self.name = name
+        self.methods: dict = {}  # имя -> FnInfo
+        self.params: list = []
+        self.args: list = []
+        self.base = self
+        self._lazy = None
+        setattr(self, "_" + self._members, {})
+
+    def __getattr__(self, name):
+        # атрибуты, которые добавили базовому типу после создания экземпляра (cdefaults и т. п.)
+        base = self.__dict__.get("base")
+        if base is None or base is self or name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(base, name)
+
+    def _get(self):
+        if self._lazy is not None:
+            m, self._lazy = self._lazy, None
+            setattr(self, "_" + self._members, self._substituted(m))
+        return getattr(self, "_" + self._members)
+
+
+class RecordT(Generic):
+    _members = "fields"
+
+    def __init__(self, name: str, fields: dict | None = None):
+        super().__init__(name)
+        self.defaults: dict = {}  # имя -> узел выражения
+        if fields:
+            self._fields.update(fields)
+
+    @property
+    def fields(self) -> dict:  # имя -> тип, в порядке объявления
+        return self._get()
+
+    def _substituted(self, m):
+        return {n: subst(t, m) for n, t in self.base._fields.items()}
+
+
+class SumT(Generic):
+    _members = "variants"
+
+    @property
+    def variants(self) -> dict:  # имя варианта -> [(поле, тип)]
+        return self._get()
+
+    def _substituted(self, m):
+        return {v: [(n, subst(t, m)) for n, t in fs] for v, fs in self.base._variants.items()}
 
     def index(self, variant: str) -> int:
         return list(self.variants).index(variant)
+
+
+def instantiate(base: Generic, args: list) -> Generic:
+    """Box[args]: новый объект с теми же методами и подставленными полями."""
+    if not base.params:
+        return base
+    inst = object.__new__(type(base))
+    inst.__dict__.update(base.__dict__)
+    inst.base = base
+    inst.args = list(args)
+    inst._lazy = dict(zip(base.params, inst.args))
+    return inst
+
+
+class IfaceT(Type):
+    """interface Shape: значение любого типа, у которого есть нужные методы."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.methods: dict = {}  # имя -> ([(имя параметра, тип)], тип результата)
 
 
 @dataclass(eq=False, repr=False)
@@ -90,6 +174,34 @@ class TaskT(Type):
 def opt(t: Type) -> Type:
     """T -> T?, без вложенных T??."""
     return t if isinstance(prune(t), OptT) else OptT(t)
+
+
+def subst(t: Type, m: dict) -> Type:
+    """Тип, в котором параметры из m заменены их значениями."""
+    while isinstance(t, TVar) and t.ref is not None:
+        t = t.ref
+    if isinstance(t, TParam) and t in m:  # раньше SUBST: поля Box[U] — это U, даже внутри экземпляра с T
+        return m[t]
+    t = prune(t)
+    if isinstance(t, TParam):
+        return t
+    if isinstance(t, ListT):
+        return ListT(subst(t.elem, m))
+    if isinstance(t, DictT):
+        return DictT(subst(t.key, m), subst(t.val, m))
+    if isinstance(t, TupleT):
+        return TupleT([subst(i, m) for i in t.items])
+    if isinstance(t, OptT):
+        return OptT(subst(t.inner, m))
+    if isinstance(t, SetT):
+        return SetT(subst(t.elem, m))
+    if isinstance(t, FnT):
+        return FnT([subst(p, m) for p in t.params], subst(t.ret, m))
+    if isinstance(t, TaskT):
+        return TaskT(subst(t.ret, m))
+    if isinstance(t, Generic) and t.args:
+        return instantiate(t.base, [subst(a, m) for a in t.args])
+    return t
 
 
 def is_ref(t: Type) -> bool:
@@ -124,9 +236,15 @@ def _next_tv() -> int:
 
 
 def prune(t: Type) -> Type:
-    while isinstance(t, TVar) and t.ref is not None:
-        t = t.ref
-    return t
+    while True:
+        if isinstance(t, TVar):
+            if t.ref is None:
+                return t
+            t = t.ref
+        elif SUBST and isinstance(t, TParam) and t in SUBST:
+            t = SUBST[t]
+        else:
+            return t
 
 
 def deep(t: Type) -> Type:
@@ -146,6 +264,8 @@ def deep(t: Type) -> Type:
         return FnT([deep(p) for p in t.params], deep(t.ret))
     if isinstance(t, TaskT):
         return TaskT(deep(t.ret))
+    if isinstance(t, Generic) and t.args:
+        return instantiate(t.base, [deep(a) for a in t.args])
     return t
 
 
@@ -167,6 +287,8 @@ def is_resolved(t: Type) -> bool:
         return all(is_resolved(p) for p in t.params) and is_resolved(t.ret)
     if isinstance(t, TaskT):
         return is_resolved(t.ret)
+    if isinstance(t, Generic):
+        return all(is_resolved(a) for a in t.args)
     return True
 
 
@@ -180,7 +302,10 @@ def show(t: Type) -> str:
         return f"{{{show(t.key)}: {show(t.val)}}}"
     if isinstance(t, TupleT):
         return "(" + ", ".join(show(i) for i in t.items) + ")"
-    if isinstance(t, (RecordT, SumT)):
+    if isinstance(t, Generic):
+        dn = getattr(t, "display", t.name)
+        return dn + ("[" + ", ".join(show(a) for a in t.args) + "]" if t.args else "")
+    if isinstance(t, (TParam, IfaceT)):
         return getattr(t, "display", t.name)
     if isinstance(t, OptT):
         return show(t.inner) + "?"
@@ -207,10 +332,11 @@ def key(t: Type) -> str:
         return f"D_{key(t.key)}__{key(t.val)}"
     if isinstance(t, TupleT):
         return f"T{len(t.items)}_" + "_".join(key(i) for i in t.items)
-    if isinstance(t, RecordT):
-        return f"R_{t.name}"
-    if isinstance(t, SumT):
-        return f"S_{t.name}"
+    if isinstance(t, Generic):
+        args = "__" + "_".join(key(a) for a in t.args) if t.args else ""
+        return ("R_" if isinstance(t, RecordT) else "S_") + t.name + args
+    if isinstance(t, IfaceT):
+        return f"I_{t.name}"
     if isinstance(t, OptT):
         return f"O_{key(t.inner)}"
     if isinstance(t, SetT):
@@ -264,11 +390,16 @@ def same(a: Type, b: Type) -> bool:
                 and same(a.ret, b.ret))
     if isinstance(a, TaskT):
         return same(a.ret, b.ret)
+    if isinstance(a, Generic):
+        return a.base is b.base and all(same(x, y) for x, y in zip(a.args, b.args))
     return False
 
 
 def hashable(t: Type) -> bool:
     t = prune(t)
+    if isinstance(t, TParam):
+        t.needs["hash"] = True  # проверится в месте вызова
+        return True
     if t in (INT, FLOAT, BOOL, STR):
         return True
     if isinstance(t, TupleT):
@@ -279,6 +410,9 @@ def hashable(t: Type) -> bool:
 def comparable(t: Type) -> bool:
     """Можно ли сравнивать на < и сортировать."""
     t = prune(t)
+    if isinstance(t, TParam):
+        t.needs["ord"] = True
+        return True
     if t in (INT, FLOAT, BOOL, STR):
         return True
     if isinstance(t, TupleT):

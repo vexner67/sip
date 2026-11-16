@@ -16,7 +16,9 @@ from .checker import ERROR_KINDS, Program
 from .cregistry import JsonTypeError, Registry, cmp_fn, eq_expr, fmt_call, hash_fn, nil_code, opt_has, opt_val
 from .errors import SipError
 from .nodes import *  # noqa: F403
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, RecordT, SetT, SumT, TaskT, TupleT,
+from . import types as T_
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, Generic, IfaceT, ListT, OptT, RecordT, SetT, SumT,
+                    TaskT, TupleT,
                     ctype,
                     deep, is_ref, key, prune)
 
@@ -74,6 +76,10 @@ class CGen:
         self.protos: list[str] = []
         self.statics: list[str] = []
         self.wrappers: set = set()
+        self.insts: dict = {}     # имя экземпляра обобщённой функции -> (FnInfo, типы)
+        self.pending: list = []   # экземпляры, код которых ещё не сгенерирован
+        self.isuf = ""            # суффикс имён лямбд и вложенных функций внутри экземпляра
+        self.vtables: set = set()
         # состояние текущей функции
         self.fi = None
         self.lines: list = []
@@ -133,9 +139,12 @@ class CGen:
     def generate(self) -> str:
         p = self.p
         for fi in list(p.fns.values()) + p.methods:
-            self.gen_fn(fi)
+            if not fi.allparams:
+                self.gen_fn(fi)  # обобщённые — по экземпляру на каждый набор типов, когда их вызовут
         self.gen_fn(p.top, top=True)
         main = self.gen_main()
+        while self.pending:
+            self.gen_instance(*self.pending.pop(0))
         globals_ = [f"static {self.c(v.ty)} {v.cname};" for v in p.globals.values()]
         src_lines = [line for _, _, lines in self.srcmap.files for line in lines]
         header = [
@@ -277,6 +286,72 @@ class CGen:
             self.gen_async(fi, params, name, ret)
         if fi.cache:
             self.gen_cache(fi, params)
+
+    def instance(self, fi, targs) -> str:
+        """Имя C экземпляра fi для настоящих типов targs (генерируется позже)."""
+        args = [deep(a) for a in targs]
+        name = getattr(fi, "cname0", fi.cname) + "__" + "_".join(key(a) for a in args)
+        if name not in self.insts:
+            if len(self.insts) > 5000:
+                self.err(f"{fi.name}(): too many instances of a generic function (recursion over growing types?)",
+                         fi.node)
+            self.insts[name] = (fi, args)
+            self.pending.append((fi, args, name))
+        return name
+
+    def gen_instance(self, fi, args, name):
+        fi.cname0 = getattr(fi, "cname0", fi.cname)
+        T_.SUBST.clear()
+        T_.SUBST.update(zip(fi.allparams, args))
+        fi.cname = name
+        self.isuf = name[len(fi.cname0):]
+        try:
+            self.gen_fn(fi)
+        finally:
+            fi.cname = fi.cname0
+            self.isuf = ""
+            T_.SUBST.clear()
+
+    def call_name(self, e) -> str:
+        """Имя функции C для вызова e.fn (экземпляр, если функция обобщённая)."""
+        fi = e.fn
+        if not fi.allparams:
+            return fi.cname
+        return self.instance(fi, e.targs)
+
+    def method_name(self, fi, rt) -> str:
+        """Метод fi настоящего типа rt (для T: Shape и таблиц интерфейсов)."""
+        if not fi.allparams:
+            return fi.cname
+        return self.instance(fi, list(rt.args))
+
+    def vtable(self, it, rt) -> str:
+        """Таблица методов интерфейса it для типа rt: адрес static const структуры."""
+        ik, rk = self.k(it), self.k(rt)
+        name = f"vt_{ik}__{rk}"
+        if name in self.vtables:
+            return f"&{name}"
+        self.vtables.add(name)
+        rc = self.c(rt)
+        slots = []
+        for mname, (ps, ret) in it.methods.items():
+            fi = rt.methods[mname]
+            cname = self.method_name(fi, rt)
+            pdecl = ", ".join(["void *o"] + [f"{self.c(t)} p{i}" for i, (_, t) in enumerate(ps)])
+            args = ", ".join([f"({rc})o"] + [f"p{i}" for i in range(len(ps))])
+            thunk = f"vtm_{ik}__{rk}_{mname}"
+            sig = f"static {self.c(ret)} {thunk}({pdecl})"
+            self.protos.append(sig + ";")
+            body = f"{cname}({args});" if deep(ret) is UNIT else f"return {cname}({args});"
+            self.fn_code.append(f"{sig} {{ {body} }}\n")
+            slots.append(thunk)
+        rthunk = f"vtr_{ik}__{rk}"
+        self.protos.append(f"static void {rthunk}(sip_sb *b, void *o);")
+        self.fn_code.append(f"static void {rthunk}(sip_sb *b, void *o) {{ {fmt_call(rt, 'b', f'({rc})o')} }}\n")
+        slots.append(rthunk)
+        self.protos.append(f"static const struct {ik}_vt {name};")
+        self.fn_code.append(f"static const struct {ik}_vt {name} = {{{', '.join(slots)}}};\n")
+        return f"&{name}"
 
     def gen_async(self, fi, params, body_name, ret):
         """async fn f(a, b): f(a, b) только создаёт задачу, тело (f_body) выполнит await."""
@@ -623,6 +698,14 @@ class CGen:
 
     def s_FnDef(self, s):
         fi = s.fi
+        base = fi.cname
+        fi.cname = base + self.isuf  # своя копия в каждом экземпляре обобщённой функции
+        try:
+            self.nested_fn(s, fi)
+        finally:
+            fi.cname = base
+
+    def nested_fn(self, s, fi):
         caps = list(fi.captures.values())
         if caps:
             fields = " ".join(f"{self.c(v.ty)} {v.cname};" for v in caps)
@@ -788,6 +871,10 @@ class CGen:
 
     def convert(self, code: str, raw, to, line) -> str:
         raw, to = deep(raw), deep(to)
+        inner = to.inner if isinstance(to, OptT) else to
+        if isinstance(inner, IfaceT) and not isinstance(raw, (IfaceT, OptT)):
+            code = f"(({self.c(inner)}){{(void *)({code}), {self.vtable(inner, raw)}}})"
+            raw = inner
         if isinstance(raw, OptT) and not isinstance(to, OptT):
             return f"unwrap_{self.k(raw)}({code}, {line})"
         if isinstance(to, OptT) and not isinstance(raw, OptT):
@@ -902,16 +989,17 @@ class CGen:
     def e_Lambda(self, e):
         ft = deep(e.ty)
         fk = self.k(ft)
-        name = f"lam_{e.lid}"
+        lid = f"{e.lid}{self.isuf}"
+        name = f"lam_{lid}"
         caps = list(e.captures.values())
         if caps:
             fields = " ".join(f"{self.c(v.ty)} {v.cname};" for v in caps)
-            self.statics.append(f"struct env_{e.lid} {{ {fields} }};")
+            self.statics.append(f"struct env_{lid} {{ {fields} }};")
         # тело лямбды — отдельная функция C со своим состоянием генератора
         saved = (self.lines, self.decls, self.depth, self.ctl)
         self.lines, self.decls, self.depth, self.ctl = [], [], 1, []
         if caps:
-            self.decls.append(f"struct env_{e.lid} *env = envp;")
+            self.decls.append(f"struct env_{lid} *env = envp;")
             for v in caps:
                 self.decls.append(f"{self.c(v.ty)} {v.cname} = env->{v.cname};")
         vol = "volatile " if getattr(e, "has_try", False) else ""
@@ -940,7 +1028,7 @@ class CGen:
         self.fn_code.append(sig + " {\n" + body + "}\n")
         if not caps:
             return f"(({fk}){{{name}, NULL}})"
-        env = self.tmp(f"struct env_{e.lid} *", "env")
+        env = self.tmp(f"struct env_{lid} *", "env")
         self.emit(f"{env} = sip_alloc(sizeof *{env});")
         for v in caps:
             self.emit(f"{env}->{v.cname} = {v.cname};")
@@ -978,10 +1066,17 @@ class CGen:
     def e_Call(self, e):
         kind = e.ckind
         if kind == "fn":
-            return f"{e.fn.cname}({', '.join(self.eval_args(e.bound))})"
+            return f"{self.call_name(e)}({', '.join(self.eval_args(e.bound))})"
         if kind == "method":
             codes = self.eval_args([e.func.obj] + e.bound)
-            return f"{e.fn.cname}({', '.join(codes)})"
+            return f"{self.call_name(e)}({', '.join(codes)})"
+        if kind == "imethod":
+            rt = deep(self.ty(e.func.obj))
+            codes = self.eval_args([e.func.obj] + e.bound)
+            if isinstance(rt, IfaceT):  # через таблицу методов
+                r = self.spill(codes[0], rt)
+                return f"{r}.vt->m_{e.mname}({', '.join([r + '.o'] + codes[1:])})"
+            return f"{self.method_name(rt.methods[e.mname], rt)}({', '.join(codes)})"
         if kind == "ctor":
             return f"{self.k(e.record)}_new({', '.join(self.eval_args(e.bound))})"
         if kind == "variant":

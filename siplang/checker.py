@@ -11,9 +11,14 @@ import copy
 
 from .errors import SipError
 from .nodes import *  # noqa: F403
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SetT, SumT, TaskT,
-                    TupleT,
-                    TVar, comparable, deep, hashable, is_resolved, opt, prune, same, show, truthy_ok)
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, Generic, IfaceT, ListT, OptT, Prim, RecordT, SetT,
+                    SumT, TaskT, TParam, TupleT,
+                    TVar, comparable, deep, hashable, instantiate, is_resolved, opt, prune, same, show, subst,
+                    truthy_ok)
+
+# что тело обобщённой функции делает со значениями T -> как это назвать в ошибке
+NEED_TEXT = {"ord": "comparison with < (or sorting, min, max)", "hash": "use as a dict key or set item",
+             "num": "arithmetic", "add": "'+'"}
 
 ERROR_KINDS = ["Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
                "ZeroDivisionError", "AssertionError", "IOError", "NilError",
@@ -48,6 +53,9 @@ class FnInfo:
         self.state = "new"
         self.has_try = False
         self.cache = False
+        self.tparams: list = []     # свои параметры типа: fn f[T]
+        self.allparams: list = []   # параметры владельца (type Box[T]) и свои
+        self.tscope: dict = {}
 
     @property
     def line(self):
@@ -59,6 +67,7 @@ class Program:
         self.records: dict = {}
         self.sums: dict = {}
         self.variants: dict = {}   # имя варианта -> SumT
+        self.ifaces: dict = {}     # имя -> IfaceT
         self.fns: dict = {}        # имя -> FnInfo (функции верхнего уровня)
         self.methods: list = []    # все методы
         self.globals: dict = {}
@@ -117,6 +126,9 @@ class Checker:
         self.nested: list = []   # вложенные функции (FnInfo)
         self.typed: list = []    # json.parse и т.п.: тип результата берётся из контекста
         self.nils: list = []     # литералы nil: тип без контекста потом станет int?
+        self.tscope: dict = {}   # параметры типа, видимые сейчас: имя -> TParam
+        self.inst_checks: list = []  # вызовы обобщённых функций: (параметры, аргументы, узел, что)
+        self.all_tparams: list = []
 
     # ---------- общее ----------
 
@@ -158,6 +170,8 @@ class Checker:
                     and self.unify(a.ret, b.ret))
         if isinstance(a, TaskT):
             return self.unify(a.ret, b.ret)
+        if isinstance(a, Generic):  # Box[T] и Box[int]
+            return a.base is b.base and all(self.unify(x, y) for x, y in zip(a.args, b.args))
         return False  # разные Prim, разные записи
 
     def expect(self, want, got, node, what: str, src=None):
@@ -170,8 +184,11 @@ class Checker:
         pw, pg = prune(want), prune(got)
         if pw is FLOAT and pg is INT:
             return
+        if self.to_iface(pw, pg, node, what, src):
+            return
         if src is not None and isinstance(pw, OptT) and not isinstance(pg, (OptT, TVar)) and pg is not UNIT:
-            self.expect(pw.inner, got, node, what)
+            if not self.to_iface(prune(pw.inner), pg, node, what, src):
+                self.expect(pw.inner, got, node, what)
             src.cty = want
             return
         if isinstance(pg, OptT) and not isinstance(pw, (OptT, TVar)):
@@ -183,6 +200,21 @@ class Checker:
         if not self.unify(want, got):
             hint = " (write 0.0 for a float)" if pw is INT and pg is FLOAT else ""
             self.err(f"{what}: expected {show(want)}, got {show(got)}{hint}", node)
+
+    def to_iface(self, pw, pg, node, what, src) -> bool:
+        """Значение записи (или T: Shape) там, где ждут интерфейс: упаковать с таблицей методов."""
+        if not isinstance(pw, IfaceT) or not isinstance(pg, (Generic, TParam, IfaceT)) or pg is pw:
+            return False
+        why = self.implements(pg, pw)
+        if why:
+            self.err(f"{what}: {show(pg)} is not a {show(pw)}: {why}", node)
+        if src is None:
+            self.err(f"{what}: expected {show(pw)}, got {show(pg)}; convert it where the value is created, "
+                     f"e.g. `x: {show(pw)} = ...`", node)
+        if isinstance(pg, IfaceT):
+            self.err(f"{what}: converting {show(pg)} to {show(pw)} {UNSUPPORTED}", node)
+        src.cty = pw
+        return True
 
     def unite(self, items, what: str):
         """Общий тип нескольких значений [(узел, тип)]: int+float -> float, T+nil -> T?."""
@@ -218,6 +250,15 @@ class Checker:
     def numeric(self, t) -> bool:
         return prune(t) in (INT, FLOAT)
 
+    @staticmethod
+    def num_param(t) -> bool:
+        """Число-параметр типа: abs(x), sum(xs) для x: T — T должен быть int или float."""
+        t = prune(t)
+        if isinstance(t, TParam):
+            t.needs["num"] = True
+            return True
+        return False
+
     def need_resolved(self, t, node, what: str):
         if not is_resolved(t):
             hint = "x: int? = nil" if isinstance(prune(t), OptT) else "xs: [int] = []"
@@ -226,15 +267,32 @@ class Checker:
     def to_type(self, t):
         if isinstance(t, TName):
             n = t.name
+            if n in self.tscope:
+                if t.args:
+                    self.err(f"type parameter '{n}' takes no type arguments", t)
+                return self.tscope[n]
             simple = {"int": INT, "float": FLOAT, "bool": BOOL, "str": STR}
             if n in simple and not t.args:
                 return simple[n]
             if n == "http.Response":
                 return RESPONSE
-            if n in self.p.records:
-                return self.p.records[n]
-            if n in self.p.sums:
-                return self.p.sums[n]
+            if n in self.p.records or n in self.p.sums:
+                base = self.p.records.get(n) or self.p.sums[n]
+                dn = getattr(base, "display", n)
+                if not base.params:
+                    if t.args:
+                        self.err(f"type '{dn}' takes no type arguments", t)
+                    return base
+                if len(t.args) != len(base.params):
+                    ex = ", ".join("int" for _ in base.params)
+                    if not t.args:
+                        self.err(f"type '{dn}' needs {len(base.params)} type argument(s), e.g. {dn}[{ex}]", t)
+                    self.err(f"type '{dn}' takes {len(base.params)} type argument(s), got {len(t.args)}", t)
+                return instantiate(base, [self.to_type(a) for a in t.args])
+            if n in self.p.ifaces:
+                if t.args:
+                    self.err(f"interface '{n}' takes no type arguments", t)
+                return self.p.ifaces[n]
             if n == "Response":
                 return RESPONSE
             if n in ("list", "dict", "tuple"):
@@ -271,15 +329,20 @@ class Checker:
         top_stmts = []
         fn_nodes = []
         for s in mod.body:
-            if isinstance(s, Record):
-                if s.name in p.records or s.name in p.sums:
-                    self.err(f"type '{s.name}' is already defined", s)
+            if isinstance(s, (Record, SumType, Interface)) and (
+                    s.name in p.records or s.name in p.sums or s.name in p.ifaces):
+                self.err(f"type '{getattr(s, 'display', s.name)}' is already defined", s)
+            if isinstance(s, Interface):
+                it = IfaceT(s.name)
+                it.display = getattr(s, "display", s.name)
+                p.ifaces[s.name] = it
+            elif isinstance(s, Record):
                 p.records[s.name] = RecordT(s.name)
                 p.records[s.name].display = getattr(s, "display", s.name)
+                self.type_params(p.records[s.name], s)
             elif isinstance(s, SumType):
-                if s.name in p.records or s.name in p.sums:
-                    self.err(f"type '{s.name}' is already defined", s)
                 st = SumT(s.name)
+                self.type_params(st, s)
                 st.display = getattr(s, "display", s.name)
                 st.vdisplay = {v.name: getattr(v, "display", v.name) for v in s.variants}
                 p.sums[s.name] = st
@@ -294,8 +357,29 @@ class Checker:
             else:
                 top_stmts.append(s)
 
+        # параметры типов с ограничением T: Shape и методы интерфейсов
+        for s in mod.body:
+            if isinstance(s, (Record, SumType)):
+                base = p.records.get(s.name) or p.sums.get(s.name)
+                self.bind_bounds(base.params, s.tparams)
+            elif isinstance(s, Interface):
+                it = p.ifaces[s.name]
+                for m in s.methods:
+                    if m.name in it.methods:
+                        self.err(f"method '{m.name}' is already declared in {it.display}", m)
+                    ps = []
+                    for prm in m.params:
+                        if prm.type is None or prm.default is not None or prm.star:
+                            self.err(f"interface method parameter '{prm.name}' needs a plain type, e.g. "
+                                     f"{prm.name} int", prm)
+                        ps.append((prm.name, self.to_type(prm.type)))
+                    it.methods[m.name] = (ps, UNIT if m.ret is None else self.to_type(m.ret))
+
         # поля и варианты (типы могут ссылаться друг на друга)
         for s in mod.body:
+            if isinstance(s, (Record, SumType)):
+                base = p.records.get(s.name) or p.sums.get(s.name)
+                self.tscope = {tp.name: tp for tp in base.params}
             if isinstance(s, Record):
                 rt = p.records[s.name]
                 for f in s.fields:
@@ -335,11 +419,12 @@ class Checker:
                     fi = FnInfo(m, f"m_{s.name}_{m.name}", st)
                     st.methods[m.name] = fi
                     p.methods.append(fi)
+            self.tscope = {}
 
         for fn in fn_nodes:
             if fn.name in p.fns:
                 self.err(f"function '{fn.name}' is already defined", fn)
-            if fn.name in p.records or fn.name in p.variants:
+            if fn.name in p.records or fn.name in p.variants or fn.name in p.ifaces:
                 self.err(f"'{fn.name}' is already a type", fn)
             p.fns[fn.name] = FnInfo(fn, f"f_{fn.name}")
         for fi in list(p.fns.values()) + p.methods:
@@ -366,8 +451,11 @@ class Checker:
         self.check_typed(0)
         for name, v in p.globals.items():
             self.need_resolved(v.ty, None, f"global '{name}'")
+        self.check_instances()
         if "main" in p.fns:
             m = p.fns["main"]
+            if m.tparams:
+                self.err("main cannot have type parameters", m.node)
             stars = getattr(m, "stars", {})
             if "**" in stars:
                 self.err("main cannot take **kwargs; use flags: fn main(name str, n = 1)", m.node)
@@ -381,6 +469,123 @@ class Checker:
                     self.err(f"main parameter '{name}' must be int, float, str or bool (or T? = nil)", m.node)
             p.main = m
         return p
+
+    def type_params(self, base, node):
+        """type Box[T, U]: параметры типа; Box внутри своих методов — это Box[T, U]."""
+        names = set()
+        for tp in node.tparams:
+            if tp.name in names:
+                self.err(f"type parameter '{tp.name}' is repeated", tp)
+            names.add(tp.name)
+            P = TParam(tp.name)
+            self.all_tparams.append(P)
+            base.params.append(P)
+        base.args = list(base.params)
+
+    def bind_bounds(self, params, defs):
+        for P, tp in zip(params, defs):
+            if tp.bound is None:
+                continue
+            b = self.to_type(tp.bound)
+            if not isinstance(b, IfaceT):
+                self.err(f"'{tp.name}: {show(b)}': a bound must be an interface", tp)
+            P.bound = b
+
+    def implements(self, t, it) -> str | None:
+        """Почему тип t не подходит под интерфейс it (или None, если подходит)."""
+        t = prune(t)
+        if isinstance(t, IfaceT):
+            if t is it:
+                return None
+            for name, (ps, ret) in it.methods.items():
+                if name not in t.methods:
+                    return f"{show(t)} has no method {name}()"
+                ps2, ret2 = t.methods[name]
+                if len(ps) != len(ps2) or not all(same(a, b) for (_, a), (_, b) in zip(ps, ps2)) \
+                        or not same(ret, ret2):
+                    return f"{show(t)}.{name}() has a different signature"
+            return None
+        if isinstance(t, TParam):
+            if t.bound is None:
+                return f"type parameter {t.name} has no bound; write [{t.name}: {show(it)}]"
+            return self.implements(t.bound, it)
+        if not isinstance(t, Generic):
+            return f"{show(t)} has no methods"
+        m = dict(zip(t.base.params, t.args))
+        for name, (ps, ret) in it.methods.items():
+            fi = t.methods.get(name)
+            if fi is None:
+                return f"{show(t)} has no method {name}()"
+            if fi.tparams:
+                return f"{show(t)}.{name}() has type parameters"
+            if fi.state == "new" and isinstance(prune(fi.ret), TVar):
+                self.check_fn(fi)
+            fps = [subst(pt, m) for _, pt, _ in fi.params]
+            want = "(" + ", ".join(show(pt) for _, pt in ps) + ")" + ("" if ret is UNIT else " " + show(ret))
+            if len(fps) != len(ps) or not all(same(a, b) for a, (_, b) in zip(fps, ps)) \
+                    or not same(subst(self.call_ret(fi), m), ret) or getattr(fi, "stars", None):
+                got = "(" + ", ".join(show(pt) for pt in fps) + ")"
+                r = subst(self.call_ret(fi), m)
+                got += "" if prune(r) is UNIT else " " + show(r)
+                return f"{show(t)}.{name}{got} does not match {show(it)}.{name}{want}"
+        return None
+
+    def need_ok(self, t, need) -> bool:
+        t = prune(t)
+        if need == "ord":
+            return comparable(t)
+        if need == "hash":
+            return hashable(t)
+        if isinstance(t, TParam):
+            t.needs[need] = True
+            return True
+        if need == "num":
+            return t in (INT, FLOAT)
+        return t in (INT, FLOAT, STR) or isinstance(t, ListT)  # "add"
+
+    def check_instances(self):
+        """Подходят ли типы в вызовах обобщённых функций под то, что делает их тело.
+
+        Сначала требования переносятся на параметры внешних обобщённых функций
+        (f[T] вызывает g(x) с x: T — T получает требования g), потом
+        проверяются настоящие типы.
+        """
+        def total():
+            return sum(len(P.needs) for P in self.all_tparams)
+        while True:
+            before = total()
+            for params, args, _, _ in self.inst_checks:
+                for P, a in zip(params, args):
+                    for need in list(P.needs):
+                        self.need_ok(a, need)
+            if total() == before:
+                break
+        for params, args, node, what in self.inst_checks:
+            for P, a in zip(params, args):
+                if not is_resolved(a):
+                    self.err(f"{what}: cannot infer type parameter {P.name}; give the arguments types", node)
+                for need in P.needs:
+                    if not self.need_ok(a, need):
+                        self.err(f"{what}: {P.name} = {show(a)} does not support {NEED_TEXT[need]}, "
+                                 f"which the function uses", node)
+                if P.bound is not None:
+                    why = self.implements(a, P.bound)
+                    if why:
+                        self.err(f"{what}: {P.name} = {show(a)} is not a {show(P.bound)}: {why}", node)
+
+    def generic_call(self, e, fi, what, m):
+        """Вызов функции или метода с параметрами типа: m — уже известные (тип владельца)."""
+        for P in fi.tparams:
+            if P not in m:
+                m[P] = TVar()
+        params = [(n, subst(t, m), d) for n, t, d in fi.params]
+        self.bind_args(e, params, what, getattr(fi, "stars", None))
+        if fi.state == "new" and isinstance(prune(fi.ret), TVar):
+            self.check_fn(fi)
+        e.targs = [m[P] for P in fi.allparams]
+        if fi.allparams:
+            self.inst_checks.append((fi.allparams, e.targs, e, what))
+        return subst(self.call_ret(fi), m)
 
     def default_nils(self, start: int):
         """nil, тип которого ничто не уточнило (print nil, (1, nil)), хранится как int?."""
@@ -420,6 +625,9 @@ class Checker:
         elif isinstance(t, TupleT):
             for i in t.items:
                 self.default_tvars(i)
+        elif isinstance(t, Generic):
+            for a in t.args:
+                self.default_tvars(a)
 
     def default_type(self, e):
         if not literal_default(e):
@@ -430,6 +638,34 @@ class Checker:
         return t
 
     def signature(self, fi: FnInfo):
+        n = fi.node
+        if getattr(fi, "parent", None) is not None:
+            if n.tparams:
+                self.err(f"a nested function cannot have type parameters {UNSUPPORTED}; "
+                         f"declare it at the top level", n)
+            scope = dict(self.tscope)
+        else:
+            scope = {P.name: P for P in fi.owner.params} if fi.owner is not None else {}
+        for tp in n.tparams:
+            if tp.name in scope:
+                self.err(f"type parameter '{tp.name}' is already defined", tp)
+            if tp.name in self.p.records or tp.name in self.p.sums or tp.name in self.p.ifaces \
+                    or tp.name in ("int", "float", "str", "bool"):
+                self.err(f"type parameter '{tp.name}' hides the type {tp.name}; use another name, e.g. T", tp)
+            P = TParam(tp.name)
+            self.all_tparams.append(P)
+            scope[tp.name] = P
+            fi.tparams.append(P)
+        fi.tscope = scope
+        fi.allparams = (list(fi.owner.params) if fi.owner is not None else []) + fi.tparams
+        saved, self.tscope = self.tscope, scope
+        try:
+            self.bind_bounds(fi.tparams, n.tparams)
+            self.signature_types(fi)
+        finally:
+            self.tscope = saved
+
+    def signature_types(self, fi: FnInfo):
         n = fi.node
         fi.is_async = n.is_async
         if n.is_async and n.decorators:
@@ -485,8 +721,8 @@ class Checker:
         if fi.state != "new":
             return
         fi.state = "busy"
-        saved = (self.cur, self.scopes, self.lambdas)
-        self.cur, self.scopes, self.lambdas = fi, [], []
+        saved = (self.cur, self.scopes, self.lambdas, self.tscope)
+        self.cur, self.scopes, self.lambdas, self.tscope = fi, [], [], fi.tscope
         if fi.owner is not None:
             fi.locals["self"] = Var("self", fi.owner, "self", "param")
         for name, t, _ in fi.params:
@@ -516,7 +752,7 @@ class Checker:
         if fi.cache and prune(fi.ret) is UNIT:
             self.err("@cache function must return a value", fi.node)
         fi.state = "done"
-        self.cur, self.scopes, self.lambdas = saved
+        self.cur, self.scopes, self.lambdas, self.tscope = saved
 
     def assigned(self, stmts: list, augs: list | None = None) -> list:
         """Имена, которым что-то присваивается: это локальные переменные.
@@ -799,6 +1035,8 @@ class Checker:
         s.info = []
         for expr, name in s.items:
             t = prune(self.expr(expr))
+            if isinstance(t, Generic) and t.args:
+                self.err(f"with on a generic type {UNSUPPORTED}", expr)
             methods = t.methods if isinstance(t, (RecordT, SumT)) else {}
             enter, exit_ = methods.get("enter"), methods.get("exit")
             if exit_ is None and enter is None:
@@ -955,6 +1193,8 @@ class Checker:
         """Тип выражения. Если opt=False, значение T? сразу проверяется на nil и даёт T."""
         if isinstance(e, Lambda):
             t = self.e_Lambda(e, want)
+        elif isinstance(e, (ListLit, DictLit)) and want is not None:
+            t = getattr(self, "e_" + type(e).__name__)(e, want)
         else:
             m = getattr(self, "e_" + type(e).__name__, None)
             if m is None:
@@ -1010,10 +1250,17 @@ class Checker:
             st = self.p.variants[e.id]
             if st.variants[e.id]:
                 self.err(f"'{e.id}' needs its fields: {e.id}(...)", e)
+            if st.params:
+                st = instantiate(st, [TVar() for _ in st.params])
+                self.nils.append(e)  # print Empty: тип без контекста станет Opt[int]
             e.variant = (st, e.id)
             return st
         if e.id in self.p.fns:
             fi = self.p.fns[e.id]
+            if fi.tparams:
+                ps = ", ".join(n for n, _, _ in fi.params)
+                self.err(f"generic function '{e.id}' cannot be used as a value; wrap it: "
+                         f"fn({ps}) = {e.id}({ps})", e)
             if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                 self.check_fn(fi)
             e.fnref = fi
@@ -1133,13 +1380,49 @@ class Checker:
             if bound[i] is None:
                 if default is None:
                     self.err(f"{what} is missing argument '{n}'", call)
-                bound[i] = default
+                bound[i] = copy.deepcopy(default)  # свой узел: у Stack[int]() и Stack[str]() разные типы []
             at = self.expr(bound[i], opt=True, want=t)
             self.expect(t, at, bound[i], f"argument '{n}' of {what}", src=bound[i])
         call.bound = bound
 
+    def expr_type(self, n):
+        """Выражение в квадратных скобках Stack[int]() как тип."""
+        if isinstance(n, Name):
+            return TName(n.id, line=n.line)
+        if isinstance(n, Index) and isinstance(n.obj, Name):
+            items = n.index.items if isinstance(n.index, TupleLit) else [n.index]
+            return TName(n.obj.id, [self.expr_type(i) for i in items], line=n.line)
+        if isinstance(n, ListLit) and len(n.items) == 1:
+            return TList(self.expr_type(n.items[0]), line=n.line)
+        if isinstance(n, SetLit) and len(n.items) == 1:
+            return TSet(self.expr_type(n.items[0]), line=n.line)
+        if isinstance(n, DictLit) and len(n.pairs) == 1 and n.pairs[0][0] is not None:
+            k, v = n.pairs[0]
+            return TDict(self.expr_type(k), self.expr_type(v), line=n.line)
+        if isinstance(n, TupleLit):
+            return TTuple([self.expr_type(i) for i in n.items], line=n.line)
+        if isinstance(n, Str) and n.parts == [n.parts[0]] and isinstance(n.parts[0], str):
+            return TName(n.parts[0], line=n.line)  # {name: int}: ключ-слово стал строкой
+        self.err("expected a type in [...]", n)
+
+    def explicit_targs(self, e, params, what):
+        """f[int](...) / Box[str](...): явные параметры типа (или None)."""
+        ex = getattr(e, "explicit", None)
+        if ex is None:
+            return [TVar() for _ in params]
+        if not params:
+            self.err(f"{what} has no type parameters", e)
+        if len(ex) != len(params):
+            self.err(f"{what} takes {len(params)} type argument(s), got {len(ex)}", e)
+        return ex
+
     def e_Call(self, e):
         f = e.func
+        if isinstance(f, Index) and isinstance(f.obj, Name) and self.lookup(f.obj.id) is None and (
+                f.obj.id in self.p.fns or f.obj.id in self.p.records or f.obj.id in self.p.variants):
+            items = f.index.items if isinstance(f.index, TupleLit) else [f.index]
+            e.explicit = [self.to_type(self.expr_type(i)) for i in items]
+            f = e.func = f.obj
         if isinstance(f, SelfAttr) and self.owner() is not None and f.name in self.owner().owner.methods:
             f = e.func = Attr(Name("self", line=f.line), f.name, line=f.line)  # .other() внутри метода
         if isinstance(f, Name):
@@ -1148,19 +1431,28 @@ class Checker:
                 return self.call_value(e)
             if name in self.p.fns:
                 fi = self.p.fns[name]
-                self.bind_args(e, fi.params, f"{name}()", getattr(fi, "stars", None))
                 e.ckind, e.fn = "fn", fi
+                if fi.tparams or getattr(e, "explicit", None) is not None:
+                    return self.generic_call(e, fi, f"{name}()",
+                                             dict(zip(fi.tparams, self.explicit_targs(e, fi.tparams, f"{name}()"))))
+                self.bind_args(e, fi.params, f"{name}()", getattr(fi, "stars", None))
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)  # вывести тип результата до использования
                 return self.call_ret(fi)
             if name in self.p.records:
                 rt = self.p.records[name]
+                targs = self.explicit_targs(e, rt.params, f"type '{show(rt)}'")
+                if rt.params:
+                    rt = instantiate(rt, targs)
                 params = [(fn, ft, rt.defaults.get(fn)) for fn, ft in rt.fields.items()]
                 self.bind_args(e, params, f"{name}()")
                 e.ckind, e.record = "ctor", rt
                 return rt
             if name in self.p.variants:
                 st = self.p.variants[name]
+                targs = self.explicit_targs(e, st.params, f"type '{show(st)}'")
+                if st.params:
+                    st = instantiate(st, targs)
                 params = [(fn, ft, None) for fn, ft in st.variants[name]]
                 self.bind_args(e, params, f"{name}()")
                 e.ckind, e.variant = "variant", (st, name)
@@ -1177,13 +1469,28 @@ class Checker:
                 return self.e_Call(e)
             if isinstance(rt, (RecordT, SumT)) and f.name in rt.methods:
                 fi = rt.methods[f.name]
-                self.bind_args(e, fi.params, f"{rt.name}.{f.name}()", getattr(fi, "stars", None))
                 e.ckind, e.fn = "method", fi
+                if fi.allparams:
+                    return self.generic_call(e, fi, f"{show(rt)}.{f.name}()", dict(zip(rt.base.params, rt.args)))
+                self.bind_args(e, fi.params, f"{rt.name}.{f.name}()", getattr(fi, "stars", None))
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)
                 return self.call_ret(fi)
             if isinstance(rt, RecordT) and f.name in rt.fields:
                 return self.call_value(e)
+            it = rt.bound if isinstance(rt, TParam) else rt
+            if isinstance(it, IfaceT):
+                # s.area() у интерфейса — через таблицу методов; у T: Shape — метод настоящего типа
+                if f.name not in it.methods:
+                    self.err(f"{show(rt)} has no method '{f.name}'" + (
+                        f" (its bound {show(it)} does not declare it)" if it is not rt else ""), e)
+                ps, ret = it.methods[f.name]
+                self.bind_args(e, [(n, t, None) for n, t in ps], f"{show(rt)}.{f.name}()")
+                e.ckind, e.mname = "imethod", f.name
+                return ret
+            if isinstance(rt, TParam):
+                self.err(f"{rt.name} has no method '{f.name}': give it a bound, e.g. [{rt.name}: Iface], "
+                         f"where interface Iface declares fn {f.name}(...)", e)
             e.ckind, e.mname, e.recv = "bmethod", f.name, f.obj
             return self.bmethod(e, rt, f.name)
         return self.call_value(e)
@@ -1286,6 +1593,12 @@ class Checker:
             self.unify(pl, pr)
             return pl
         pl, pr = prune(lt), prune(rt)
+        if isinstance(pl, TParam) or isinstance(pr, TParam):
+            if pl is not pr or op not in ("+", "-", "*", "/", "//", "%", "**"):
+                self.err(f"cannot apply '{op}' to {show(lt)} and {show(rt)}"
+                         + (" (both sides must be the same type parameter)" if op in "+-*/%" else ""), e)
+            pl.needs["add" if op == "+" else "num"] = True
+            return pl
         if isinstance(pl, SetT) and isinstance(pr, SetT) and op in ("|", "&", "-", "^"):
             return self.join(lt, rt, e, f"'{op}'")
         if op in ("+", "-", "*", "/", "//", "%", "**"):
@@ -1362,6 +1675,8 @@ class Checker:
                 self.err(f"'not' needs bool, number, str, list or dict, not {show(t)}", e)
             return BOOL
         if e.op in ("-", "+"):
+            if self.num_param(t):
+                return t
             if not self.numeric(t):
                 self.err(f"cannot apply '{e.op}' to {show(t)}", e)
             return t
@@ -1386,7 +1701,15 @@ class Checker:
         self.expect(INT, self.expr(e.hi), e.hi, "range end")
         return RANGE
 
-    def e_ListLit(self, e):
+    def e_ListLit(self, e, want=None):
+        pw = prune(want) if want is not None else None
+        if isinstance(pw, ListT) and e.items and self.wants_iface(pw.elem):
+            # shapes: [Shape] = [Circle(1), Rect(2, 3)]: каждый элемент упаковывается в интерфейс
+            for item in e.items:
+                if isinstance(item, Starred):
+                    self.err(f"*spread {UNSUPPORTED}", item)
+                self.expect(pw.elem, self.expr(item, opt=True), item, "list item", src=item)
+            return ListT(pw.elem)
         items = []
         for item in e.items:
             if isinstance(item, Starred):
@@ -1400,7 +1723,17 @@ class Checker:
     def e_TupleLit(self, e):
         return TupleT([self.expr(i, opt=True) for i in e.items])
 
-    def e_DictLit(self, e):
+    def wants_iface(self, t) -> bool:
+        t = prune(t)
+        return isinstance(t, IfaceT) or isinstance(t, OptT) and isinstance(prune(t.inner), IfaceT)
+
+    def e_DictLit(self, e, want=None):
+        pw = prune(want) if want is not None else None
+        if isinstance(pw, DictT) and e.pairs and self.wants_iface(pw.val) and all(k is not None for k, _ in e.pairs):
+            for k, v in e.pairs:
+                self.expect(pw.key, self.expr(k), k, "dict key")
+                self.expect(pw.val, self.expr(v, opt=True), v, "dict value", src=v)
+            return DictT(pw.key, pw.val)
         kt = TVar()
         vals = []
         for k, v in e.pairs:
@@ -1638,7 +1971,7 @@ def b_bool(c, e):
 
 def b_abs(c, e):
     (t,) = c.args(e, 1)
-    if not c.numeric(t):
+    if not c.numeric(t) and not c.num_param(t):
         c.err(f"abs() needs a number, not {show(t)}", e)
     return t
 
@@ -1671,7 +2004,7 @@ def b_minmax(c, e):
 def b_sum(c, e):
     (t,) = c.args(e, 1)
     elem = _seq_elem(c, e, t, "sum")
-    if not c.numeric(elem):
+    if not c.numeric(elem) and not c.num_param(elem):
         c.err(f"sum() needs numbers, not {show(elem)}", e)
     return elem
 
@@ -1679,7 +2012,7 @@ def b_sum(c, e):
 def b_avg(c, e):
     (t,) = c.args(e, 1)
     elem = _seq_elem(c, e, t, "avg")
-    if not c.numeric(elem):
+    if not c.numeric(elem) and not c.num_param(elem):
         c.err(f"avg() needs numbers, not {show(elem)}", e)
     return FLOAT
 

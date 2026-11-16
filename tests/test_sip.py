@@ -860,6 +860,204 @@ class WithTest(unittest.TestCase):
                       errors_of("type T(n int)\n    fn exit(x int)\n        pass\nwith T(1)\n    pass"))
 
 
+class GenericsTest(unittest.TestCase):
+    PROGRAM = """\
+fn first[T](xs [T]) T = xs[0]
+
+fn biggest[T](xs [T]) T
+    best = xs[0]
+    for x in xs
+        if x > best then best = x
+    best
+
+fn pair[A, B](a A, b B) (B, A) = (b, a)
+
+fn total[T](xs [T]) T = sum(xs)
+
+type Box[T](v T)
+    fn get() T = .v
+    fn map[U](f fn(T) U) Box[U] = Box(f(.v))
+
+type Opt[T] = Empty | Some(v T)
+    fn or_else(d T) T = match self
+        Some(v) -> v
+        Empty -> d
+
+type Tree[T] = Leaf | Node(l Tree[T], v T, r Tree[T])
+
+fn insert[T](t Tree[T], x T) Tree[T] = match t
+    Leaf -> Node(Leaf, x, Leaf)
+    Node(l, v, r) -> if x < v then Node(insert(l, x), v, r) else Node(l, v, insert(r, x))
+
+fn items[T](t Tree[T]) [T] = match t
+    Leaf -> []
+    Node(l, v, r) -> items(l) + [v] + items(r)
+
+interface Shape
+    fn area() float
+    fn name() str
+
+type Circle(r float)
+    fn area() float = 3.0 * .r * .r
+    fn name() str = "circle"
+
+type Rect(w float, h float)
+    fn area() float = .w * .h
+    fn name() str = "rect"
+
+fn sum_area[T: Shape](xs [T]) float = sum(x.area() for x in xs)
+
+print first([3, 4]), first(["a", "b"]), biggest([3, 9, 2]), biggest(["x", "yy"])
+print pair(1, "one"), total([1.5, 2.5]), total([1, 2, 3])
+b = Box(41)
+print b.get() + 1, b.map(fn(x) = "n{x}").get(), b
+o: Opt[str] = Empty
+print o.or_else("none"), Some(5).or_else(0)
+t: Tree[int] = Leaf
+for x in [5, 2, 8, 1]
+    t = insert(t, x)
+print items(t)
+ws: Tree[str] = Leaf
+for w in "pear apple fig".split()
+    ws = insert(ws, w)
+print items(ws)
+shapes: [Shape] = [Circle(1.0), Rect(2.0, 3.0)]
+for s in shapes
+    print s.name(), s.area(), s
+print sum_area([Circle(1.0), Circle(2.0)]), sum_area(shapes)
+"""
+
+    def test_generic_functions_types_and_interfaces(self):
+        self.assertEqual(run(self.PROGRAM), (
+            "3 a 9 yy\n('one', 1) 4.0 6\n42 n41 Box(v=41)\nnone 5\n[1, 2, 5, 8]\n['apple', 'fig', 'pear']\n"
+            "circle 3.0 Circle(r=1.0)\nrect 6.0 Rect(w=2.0, h=3.0)\n15.0 9.0\n"))
+
+    def test_explicit_args_json_equality(self):
+        self.assertEqual(run("""\
+type Box[T](v T)
+type Opt[T] = Empty | Some(v T)
+
+interface Shape
+    fn area() float
+    fn bigger(o Shape) bool
+
+type Sq(s float)
+    fn area() float = .s * .s
+    fn bigger(o Shape) bool = .area() > o.area()
+
+fn first[T](xs [T]) T? = if xs then xs[0] else nil
+
+print Empty, Some(Box(Box(2))), Box(1) == Box(1), Box("a") == Box("b")
+bs: [Box[int]] = json.parse("[{{\\"v\\": 1}}, {{\\"v\\": 5}}]")
+print bs, json.stringify(Box([1, 2]))
+a: Shape = Sq(2.0)
+b: Shape = Sq(1.0)
+print a.bigger(b), b.bigger(a), a == a, a == b
+print first[int]([]), first(["z"]), first([1.5])
+d = {k: Box(k) for k in ["x", "y"]}
+print d["y"].v
+"""), "Empty() Some(v=Box(v=Box(v=2))) True False\n[Box(v=1), Box(v=5)] {\"v\": [1, 2]}\n"
+      "True False True False\nNone z 1.5\ny\n")
+
+    def test_instances_get_own_lambdas_and_nested_fns(self):
+        src = """\
+@cache
+fn ident[T](x T) T = x
+
+fn apply_all[T](xs [T], f fn(T) T) [T]
+    fn twice(x T) T = f(f(x))
+    ys = xs.map(fn(x) = twice(x))
+    ys.map(fn(y)
+        z = f(y)
+        return z
+    )
+
+type Stack[T](items [T] = [])
+    fn push(x T)
+        .items.append(x)
+    fn pop() T = .items.pop()
+
+fn group[K, V](xs [V], key fn(V) K) {K: [V]}
+    out: {K: [V]} = {}
+    for x in xs
+        k = key(x)
+        if k not in out then out[k] = []
+        out[k].append(x)
+    out
+
+print apply_all([1, 2], fn(x) = x * 10), apply_all(["a"], fn(s) = s + "!"), ident(5), ident("x")
+st = Stack[int]()
+st.push(7)
+ss: Stack[str] = Stack()
+ss.push("q")
+print st.pop(), ss.pop(), group([1, 2, 3, 4], fn(x) = x % 2 == 0)
+"""
+        self.assertEqual(run(src), "[1000, 2000] ['a!!!'] 5 x\n7 q {False: [1, 3], True: [2, 4]}\n")
+
+    def test_dynamic_interface_values(self):
+        src = """\
+interface Named
+    fn name() str
+    fn greet(other str, n int) str
+
+type Dog(nick str)
+    fn name() str = "dog " + .nick
+    fn greet(other str, n int) str = "woof " * n + other
+
+type Animal = Cat(lives int) | Fish
+    fn name() str = match self
+        Cat(l) -> "cat {l}"
+        Fish -> "fish"
+    fn greet(other str, n int) str = "{self.name()} ignores {other}"
+
+type Wrap[T](v T)
+    fn name() str = "wrap {.v}"
+    fn greet(other str, n int) str = "{.v}-{other}-{n}"
+
+fn names[T: Named](xs [T]) [str] = [x.name() for x in xs]
+
+zoo: [Named] = [Dog("rex"), Cat(9), Fish, Wrap(3)]
+for a in zoo
+    print a.greet("bob", 2)
+print names(zoo), names([Cat(1), Fish])
+maybe: Named? = nil
+print maybe == nil
+maybe = Dog("z")
+d: {str: Named} = {a: Dog("x"), b: Fish}
+print maybe.name(), d["b"].name(), d
+"""
+        self.assertEqual(run(src), (
+            "woof woof bob\ncat 9 ignores bob\nfish ignores bob\n3-bob-2\n"
+            "['dog rex', 'cat 9', 'fish', 'wrap 3'] ['cat 1', 'fish']\nTrue\n"
+            "dog z fish {'a': Dog(nick='x'), 'b': Fish()}\n"))
+
+    def test_errors(self):
+        big = "fn big[T](xs [T]) T\n    b = xs[0]\n    for x in xs\n        if x > b then b = x\n    b\n"
+        shape = "interface Shape\n    fn area() float\n"
+        cases = [
+            ("type P(x int)\n" + big + "print big([P(1)])", "T = P does not support comparison with <"),
+            ("fn f[T](xs [T]) T = sum(xs)\nprint f([\"a\"])", "T = str does not support arithmetic"),
+            ("fn f[T](xs [T]) {T: int} = xs.count()\nprint f([[1]])", "does not support use as a dict key"),
+            ("fn o[T](xs [T]) T = i(xs)\nfn i[U](xs [U]) U = sorted(xs)[0]\ntype P(x int)\nprint o([P(1)])",
+             "o(): T = P does not support comparison"),
+            (shape + "type Sq(s float)\nfn f[T: Shape](xs [T]) float = 1.0\nprint f([Sq(1.0)])",
+             "T = Sq is not a Shape: Sq has no method area()"),
+            (shape + "type Sq(s float)\n    fn area() int = 1\nx: Shape = Sq(1.0)",
+             "Sq.area() int does not match Shape.area() float"),
+            ("fn f[T](x T) T = x + 1", "cannot apply '+' to T and int"),
+            ("fn f[T](x T) T = x\nprint [1].map(f)", "generic function 'f' cannot be used as a value"),
+            ("type Box[T](v T)\nfn g(b Box) int = 1", "type 'Box' needs 1 type argument(s), e.g. Box[int]"),
+            ("type Box(v int)\nfn g(b Box[int]) int = 1", "type 'Box' takes no type arguments"),
+            ("fn f[T](x T) float = x.area()", "T has no method 'area': give it a bound"),
+            ("fn f[int](x int) int = x", "hides the type int"),
+            ("fn f(x int) int = x\nprint f[int](1)", "f() has no type parameters"),
+            ("interface I\n", "an interface needs at least one method"),
+        ]
+        for src, want in cases:
+            with self.subTest(want=want):
+                self.assertIn(want, errors_of(src))
+
+
 class GcTest(unittest.TestCase):
     """Сборщик мусора: SIP_GC_MIN=0 собирает мусор на каждом новом блоке памяти."""
 

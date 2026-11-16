@@ -385,6 +385,7 @@ class FnDef(Node):
     is_async: bool = False
     decorators: list = field(default_factory=list)
     is_method: bool = False
+    tparams: list = field(default_factory=list)  # [TParamDef]: fn first[T](xs [T]) T
 
 
 @dataclass
@@ -392,6 +393,7 @@ class Record(Node):
     name: str
     fields: list  # [Param]
     methods: list
+    tparams: list = field(default_factory=list)
 
 
 @dataclass
@@ -405,6 +407,21 @@ class SumType(Node):
     name: str
     variants: list
     methods: list
+    tparams: list = field(default_factory=list)
+
+
+@dataclass
+class TParamDef(Node):
+    """Параметр типа: T или T: Shape (T должен реализовать интерфейс Shape)."""
+    name: str
+    bound: Node | None = None
+
+
+@dataclass
+class Interface(Node):
+    """interface Shape: методы без тел; тип подходит, если у него есть такие методы."""
+    name: str
+    methods: list  # [FnDef] с пустым телом
 
 
 @dataclass
