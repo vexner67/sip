@@ -16,7 +16,10 @@ extern "sip" fn _copy(p ptr, i int, s str) = sip_rt_copy
 extern "sip" fn _str(p ptr, n int) str = sip_rt_str
 extern "sip" fn _sb() ptr = sip_rt_sb
 extern "sip" fn _put(b ptr, s str) = sip_rt_put
+extern "sip" fn _putc(b ptr, c int) = sip_rt_putc
+extern "sip" fn _putf(b ptr, x float) = sip_rt_putf
 extern "sip" fn _done(b ptr) str = sip_rt_done
+extern "sip" fn _atof(s str) float = sip_rt_atof
 
 fn _space(c int) bool = c == 32 or (c >= 9 and c <= 13)
 
@@ -190,3 +193,423 @@ fn parse_int(s str) int
     if digits == 0 then fail ParseError("invalid int: '{_head(s)}'")
     if big or (not neg and v == -9223372036854775807 - 1) then fail OverflowError("int out of range: '{_head(s)}'")
     if neg then v else -v
+
+# ---------- JSON ----------
+# Для каждого типа компилятор генерирует на C функцию разбора (jdec_K) и вывода (jenc_K); они читают
+# и пишут текст функциями ниже. Путь до значения ($.users[0].age) копится в keys и idx (у ключа idx = -1)
+# только ради сообщений об ошибках. jp_obj_next кладёт ключ в key, _jp_num — признак целого в isint.
+
+type Jp(s str, i int, keys [str], idx [int], key str, isint bool)
+
+fn jp_new(s str) Jp = Jp(s, 0, [], [], "", false)
+
+fn _jp_where(p Jp) str
+    ln = 1
+    col = 1
+    for k in 0..min(p.i, len(p.s)) - 1
+        if _byte(p.s, k) == 10
+            ln += 1
+            col = 1
+        else
+            col += 1
+    "line {ln}, column {col}"
+
+fn _jp_path(p Jp) str
+    b = _sb()
+    _putc(b, 36)
+    for j in 0..len(p.keys) - 1
+        if p.idx[j] < 0
+            _putc(b, 46)
+            _put(b, p.keys[j])
+        else
+            _put(b, "[{p.idx[j]}]")
+    _done(b)
+
+fn _jp_syn(p Jp, what str) str = "invalid JSON: {what} ({_jp_where(p)})"
+
+fn jp_fail(p Jp, msg str)
+    fail ParseError("JSON {_jp_path(p)}: {msg}")
+
+fn _jp_ws(p Jp)
+    s = p.s
+    n = len(s)
+    i = p.i
+    while i < n
+        c = _byte(s, i)
+        if c != 32 and c != 10 and c != 13 and c != 9 then break
+        i += 1
+    p.i = i
+
+# следующий байт после пробелов; 0 — конец текста
+fn _jp_peek(p Jp) int
+    _jp_ws(p)
+    if p.i < len(p.s) then _byte(p.s, p.i) else 0
+
+fn _jp_kind(p Jp) str
+    c = _jp_peek(p)
+    if c == 34 then return "string"
+    if c == 123 then return "object"
+    if c == 91 then return "array"
+    if c == 116 or c == 102 then return "bool"
+    if c == 110 then return "null"
+    if c == 0 then return "end of input"
+    if c == 45 or _digit(c) then "number" else "invalid value"
+
+# «ожидали X, а пришло Y» с путём до значения
+fn _jp_type(p Jp, want str) str
+    got = _jp_kind(p)
+    if got == "invalid value" then return _jp_syn(p, "unexpected character")
+    "JSON {_jp_path(p)}: expected {want}, got {got} ({_jp_where(p)})"
+
+fn jp_want(p Jp, c int, what str)
+    if _jp_peek(p) != c then fail ParseError(_jp_type(p, what))
+    p.i += 1
+
+fn _jp_word(p Jp, w str) bool
+    if len(p.s) - p.i >= len(w) and _eq_at(p.s, p.i, w)
+        p.i += len(w)
+        return true
+    false
+
+fn jp_null(p Jp) bool = _jp_peek(p) == 110 and _jp_word(p, "null")
+
+fn jp_bool(p Jp) bool
+    c = _jp_peek(p)
+    if c == 116 and _jp_word(p, "true") then return true
+    if c == 102 and _jp_word(p, "false") then return false
+    fail ParseError(_jp_type(p, "bool"))
+
+fn _hexval(c int) int
+    if _digit(c) then return c - 48
+    if c >= 97 and c <= 102 then return c - 87
+    if c >= 65 and c <= 70 then return c - 55
+    -1
+
+fn _jp_hex4(p Jp) int
+    if len(p.s) - p.i < 4 then fail ParseError(_jp_syn(p, "bad \\u escape"))
+    v = 0
+    for k in 0..3
+        d = _hexval(_byte(p.s, p.i))
+        if d < 0 then fail ParseError(_jp_syn(p, "bad \\u escape"))
+        p.i += 1
+        v = v * 16 + d
+    v
+
+fn _utf8(b ptr, cp int)
+    if cp < 128
+        _putc(b, cp)
+    elif cp < 2048
+        _putc(b, 192 | (cp // 64))
+        _putc(b, 128 | (cp & 63))
+    elif cp < 65536
+        _putc(b, 224 | (cp // 4096))
+        _putc(b, 128 | ((cp // 64) & 63))
+        _putc(b, 128 | (cp & 63))
+    else
+        _putc(b, 240 | (cp // 262144))
+        _putc(b, 128 | ((cp // 4096) & 63))
+        _putc(b, 128 | ((cp // 64) & 63))
+        _putc(b, 128 | (cp & 63))
+
+# конец куска без кавычек, обратных косых и управляющих байтов
+fn _plain_end(s str, i int) int
+    n = len(s)
+    j = i
+    while j < n
+        c = _byte(s, j)
+        if c == 34 or c == 92 or c < 32 then break
+        j += 1
+    j
+
+fn jp_str(p Jp) str
+    jp_want(p, 34, "string")
+    s = p.s
+    n = len(s)
+    start = p.i
+    i = _plain_end(s, start)
+    if i < n and _byte(s, i) == 34  # без экранирования — кусок исходного текста, без копии
+        p.i = i + 1
+        return _sub(s, start, i)
+    b = _sb()
+    _put(b, _sub(s, start, i))
+    while true
+        if i >= n
+            p.i = i
+            fail ParseError(_jp_syn(p, "unterminated string"))
+        c = _byte(s, i)
+        if c == 34 then break
+        if c < 32
+            p.i = i
+            fail ParseError(_jp_syn(p, "control character in string"))
+        if c != 92
+            j = _plain_end(s, i)
+            _put(b, _sub(s, i, j))
+            i = j
+            continue
+        i += 1
+        if i >= n
+            p.i = i
+            fail ParseError(_jp_syn(p, "unterminated string"))
+        c = _byte(s, i)
+        i += 1
+        if c == 34 or c == 92 or c == 47
+            _putc(b, c)
+        elif c == 98
+            _putc(b, 8)
+        elif c == 102
+            _putc(b, 12)
+        elif c == 110
+            _putc(b, 10)
+        elif c == 114
+            _putc(b, 13)
+        elif c == 116
+            _putc(b, 9)
+        elif c == 117
+            p.i = i
+            cp = _jp_hex4(p)
+            if cp >= 55296 and cp < 56320 and len(s) - p.i >= 6 and _byte(s, p.i) == 92 and _byte(s, p.i + 1) == 117
+                save = p.i
+                p.i += 2
+                lo = _jp_hex4(p)
+                if lo >= 56320 and lo < 57344
+                    cp = 65536 + ((cp - 55296) * 1024) + (lo - 56320)
+                else
+                    p.i = save
+            _utf8(b, cp)
+            i = p.i
+        else
+            p.i = i - 1
+            fail ParseError(_jp_syn(p, "bad escape"))
+    p.i = i + 1
+    _done(b)
+
+fn _jp_digits(p Jp)
+    s = p.s
+    i = p.i
+    while i < len(s) and _digit(_byte(s, i))
+        i += 1
+    p.i = i
+
+fn _jp_need_digit(p Jp)
+    if p.i >= len(p.s) or not _digit(_byte(p.s, p.i)) then fail ParseError(_jp_syn(p, "bad number"))
+
+# число: начало токена, isint — без дробной части и экспоненты; -1 NaN, -2 Infinity, -3 -Infinity
+fn _jp_num(p Jp) int
+    c = _jp_peek(p)
+    p.isint = false
+    if c != 45 and not _digit(c)
+        if c == 78 and _jp_word(p, "NaN") then return -1
+        if c == 73 and _jp_word(p, "Infinity") then return -2
+        fail ParseError(_jp_type(p, "number"))
+    s = p.s
+    start = p.i
+    if c == 45
+        p.i += 1
+        if _jp_word(p, "Infinity") then return -3
+    _jp_need_digit(p)
+    if _byte(s, p.i) == 48 then p.i += 1 else _jp_digits(p)
+    isint = true
+    if p.i < len(s) and _byte(s, p.i) == 46
+        isint = false
+        p.i += 1
+        _jp_need_digit(p)
+        _jp_digits(p)
+    if p.i < len(s) and (_byte(s, p.i) | 32) == 101
+        isint = false
+        p.i += 1
+        if p.i < len(s) and (_byte(s, p.i) == 43 or _byte(s, p.i) == 45) then p.i += 1
+        _jp_need_digit(p)
+        _jp_digits(p)
+    p.isint = isint
+    start
+
+# цифры s[lo:hi] (может быть минус) -> int; копится со знаком минус, чтобы поместилось и -2**63
+fn _jp_dec(p Jp, s str, lo int, hi int) int
+    neg = _byte(s, lo) == 45
+    j = if neg then lo + 1 else lo
+    v = 0
+    while j < hi
+        d = _byte(s, j) - 48
+        if v < -922337203685477580 or (v == -922337203685477580 and d > 8) then fail ParseError("JSON {_jp_path(p)}: integer out of range")
+        v = v * 10 - d
+        j += 1
+    if neg then return v
+    if v == -9223372036854775807 - 1 then fail ParseError("JSON {_jp_path(p)}: integer out of range")
+    -v
+
+fn jp_int(p Jp) int
+    save = p.i
+    start = _jp_num(p)
+    if not p.isint
+        p.i = save
+        fail ParseError("JSON {_jp_path(p)}: expected int, got float ({_jp_where(p)})")
+    _jp_dec(p, p.s, start, p.i)
+
+fn jp_float(p Jp) float
+    start = _jp_num(p)
+    if start == -1 then return _atof("nan")
+    if start == -2 then return _atof("inf")
+    if start == -3 then return _atof("-inf")
+    _atof(_sub(p.s, start, p.i))
+
+# обход массива после '[': i — номер элемента
+fn jp_arr_next(p Jp, i int) bool
+    c = _jp_peek(p)
+    if c == 93
+        p.i += 1
+        return false
+    if i > 0
+        if c != 44 then fail ParseError(_jp_syn(p, "expected ',' or ']'"))
+        p.i += 1
+    elif c == 0
+        fail ParseError(_jp_syn(p, "expected ']'"))
+    true
+
+# обход объекта после '{': ключ — в p.key
+fn jp_obj_next(p Jp, i int) bool
+    c = _jp_peek(p)
+    if c == 125
+        p.i += 1
+        return false
+    if i > 0
+        if c != 44 then fail ParseError(_jp_syn(p, "expected ',' or '}}'"))
+        p.i += 1
+    if _jp_peek(p) != 34 then fail ParseError(_jp_syn(p, "expected a string key"))
+    p.key = jp_str(p)
+    if _jp_peek(p) != 58 then fail ParseError(_jp_syn(p, "expected ':'"))
+    p.i += 1
+    true
+
+fn jp_skip(p Jp)
+    c = _jp_peek(p)
+    if c == 34
+        jp_str(p)
+    elif c == 123
+        p.i += 1
+        i = 0
+        while jp_obj_next(p, i)
+            jp_skip(p)
+            i += 1
+    elif c == 91
+        p.i += 1
+        i = 0
+        while jp_arr_next(p, i)
+            jp_skip(p)
+            i += 1
+    elif c == 116 or c == 102
+        jp_bool(p)
+    elif jp_null(p)
+        pass
+    elif c == 45 or _digit(c) or c == 78 or c == 73
+        _jp_num(p)
+    else
+        fail ParseError(_jp_syn(p, if c != 0 then "unexpected character" else "unexpected end of input"))
+    pass
+
+fn jp_key(p Jp, k str)
+    p.keys.append(k)
+    p.idx.append(-1)
+
+fn jp_idx(p Jp, i int)
+    p.keys.append("")
+    p.idx.append(i)
+
+fn jp_up(p Jp)
+    p.keys.pop()
+    p.idx.pop()
+
+fn jp_key_int(p Jp, k str) int
+    i = if len(k) > 0 and _byte(k, 0) == 45 then 1 else 0
+    ok = len(k) > i and len(k) < 21
+    j = i
+    while ok and j < len(k)
+        ok = _digit(_byte(k, j))
+        j += 1
+    if not ok then jp_fail(p, "object key is not an int")
+    _jp_dec(p, k, 0, len(k))
+
+fn jp_end(p Jp)
+    if _jp_peek(p) != 0 then fail ParseError(_jp_syn(p, "extra data after the value"))
+
+# поле "type" объекта (для типов-сумм); позиция не меняется
+fn jp_tag(p Jp) str
+    save = p.i
+    jp_want(p, 123, "object")
+    tag = ""
+    found = false
+    i = 0
+    while jp_obj_next(p, i)
+        if p.key == "type" and _jp_peek(p) == 34
+            tag = jp_str(p)
+            found = true
+        else
+            jp_skip(p)
+        i += 1
+    p.i = save
+    if not found then jp_fail(p, "object has no \"type\" field")
+    tag
+
+# вывод: ind < 0 — в одну строку, как json.dumps; иначе с отступом ind
+_SPACES = "                                                                "
+
+fn je_sep(b ptr, ind int, depth int, first bool)
+    if not first then _putc(b, 44)
+    if ind < 0
+        if not first then _putc(b, 32)
+        return
+    _putc(b, 10)
+    k = ind * depth
+    while k > 0
+        m = min(k, 64)
+        _put(b, _sub(_SPACES, 0, m))
+        k -= m
+
+fn je_close(b ptr, ind int, depth int, c int)
+    if ind >= 0 then je_sep(b, ind, depth, true)
+    _putc(b, c)
+
+_HEX = "0123456789abcdef"
+
+fn je_str(b ptr, s str)
+    _putc(b, 34)
+    n = len(s)
+    start = 0
+    i = _plain_end(s, 0)
+    while i < n
+        _put(b, _sub(s, start, i))
+        c = _byte(s, i)
+        if c == 34
+            _put(b, "\\\"")
+        elif c == 92
+            _put(b, "\\\\")
+        elif c == 10
+            _put(b, "\\n")
+        elif c == 13
+            _put(b, "\\r")
+        elif c == 9
+            _put(b, "\\t")
+        elif c == 8
+            _put(b, "\\b")
+        elif c == 12
+            _put(b, "\\f")
+        else
+            _put(b, "\\u00")
+            _put(b, _sub(_HEX, c // 16, (c // 16) + 1))
+            _put(b, _sub(_HEX, c & 15, (c & 15) + 1))
+        start = i + 1
+        i = _plain_end(s, start)
+    _put(b, _sub(s, start, n))
+    _putc(b, 34)
+
+fn je_float(b ptr, x float)
+    if x != x
+        _put(b, "NaN")
+    elif x > 1.7976931348623157e308
+        _put(b, "Infinity")
+    elif x < -1.7976931348623157e308
+        _put(b, "-Infinity")
+    else
+        _putf(b, x)
+
+fn je_bool(b ptr, x bool)
+    _put(b, if x then "true" else "false")

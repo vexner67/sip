@@ -200,9 +200,12 @@ class Registry:
             protos += ps
             impls.append(im)
         jp = [v[0] for v in self.jfuncs.values()]
-        ji = [v[1] for v in self.jfuncs.values()]
         return "\n".join(["/* ---- типы ---- */", *fwd, *tuples, *bodies,
-                          "/* ---- вспомогательные функции ---- */", *protos, *impls, *jp, *ji])
+                          "/* ---- вспомогательные функции ---- */", *protos, *impls, *jp])
+
+    def jimpls(self) -> list:
+        """Тела функций JSON и CSV: они вызывают рантайм на Sip, поэтому идут после объявлений программы."""
+        return [v[1] for v in self.jfuncs.values() if v[1]]
 
     # ---------- JSON ----------
 
@@ -214,8 +217,8 @@ class Registry:
         if name not in self.jfuncs:
             ct = ctype(t)
             sig = f"static {ct} {name}(sip_str s, int line)"
-            self.jfuncs[name] = (sig + ";", sig + f" {{ sip_jp jp = sip_jp_new(s, line); sip_jp *p = &jp; "
-                                             f"{ct} v = {dec}; sip_jp_end(p); return v; }}")
+            self.jfuncs[name] = (sig + ";", sig + f" {{ R_std__rt__Jp p = f_std__rt__jp_new(s); "
+                                             f"{ct} v = {dec}; f_std__rt__jp_end(p); return v; }}")
         return name
 
     def jdump(self, t) -> str:
@@ -376,9 +379,9 @@ class Registry:
         return name
 
     def jdec(self, t) -> str:
-        """Выражение C, которое читает значение типа t из sip_jp *p."""
+        """Выражение C, которое читает значение типа t из R_std__rt__Jp p."""
         t = deep(t)
-        prim = {INT: "sip_jp_int(p)", FLOAT: "sip_jp_float(p)", BOOL: "sip_jp_bool(p)", STR: "sip_jp_str(p)"}
+        prim = {INT: "f_std__rt__jp_int(p)", FLOAT: "f_std__rt__jp_float(p)", BOOL: "f_std__rt__jp_bool(p)", STR: "f_std__rt__jp_str(p)"}
         if t in prim:
             return prim[t]
         if isinstance(t, Prim) or isinstance(t, FnT):
@@ -387,8 +390,8 @@ class Registry:
         name = f"jdec_{k}"
         if name not in self.jfuncs:
             ct = ctype(t)
-            self.jfuncs[name] = (f"static {ct} {name}(sip_jp *p);", "")
-            self.jfuncs[name] = (self.jfuncs[name][0], f"static {ct} {name}(sip_jp *p) {{\n{self.jdec_body(k, t)}\n}}")
+            self.jfuncs[name] = (f"static {ct} {name}(R_std__rt__Jp p);", "")
+            self.jfuncs[name] = (self.jfuncs[name][0], f"static {ct} {name}(R_std__rt__Jp p) {{\n{self.jdec_body(k, t)}\n}}")
         return f"{name}(p)"
 
     def jdec_fields(self, fields, what) -> tuple:
@@ -397,13 +400,13 @@ class Registry:
         for fn, ft, _ in fields:
             lines.append(f"    {ctype(ft)} jf_{fn} = ({ctype(ft)}){{0}}; bool js_{fn} = false;")
         lines.append("    sip_str k;")
-        lines.append("    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {")
-        lines.append("        int64_t m = sip_jp_path_key(p, k);")
+        lines.append("    for (int64_t i = 0; f_std__rt__jp_obj_next(p, i) && (k = p->f_key, true); i++) {")
+        lines.append("        f_std__rt__jp_key(p, k);")
         for i, (fn, ft, _) in enumerate(fields):
             lines.append(f"        {'else ' if i else ''}if (sip_str_is(k, {_clit(fn)})) "
                          f"{{ jf_{fn} = {self.jdec(ft)}; js_{fn} = true; }}")
-        lines.append(f"        {'else ' if fields else ''}sip_jp_skip(p);")
-        lines.append("        p->path.n = m;")
+        lines.append(f"        {'else ' if fields else ''}f_std__rt__jp_skip(p);")
+        lines.append("        f_std__rt__jp_up(p);")
         lines.append("    }")
         for fn, ft, dflt in fields:
             if isinstance(deep(ft), OptT):
@@ -412,71 +415,71 @@ class Registry:
                 lines.append(f"    if (!js_{fn}) {self.const_code(dflt, f'jf_{fn}')}")
             else:
                 msg = f"missing field '{fn}'".replace('"', '\\"')
-                lines.append(f'    if (!js_{fn}) sip_jp_fail(p, "{msg}");')
+                lines.append(f'    if (!js_{fn}) f_std__rt__jp_fail(p, SIP_LIT("{msg}"));')
         return lines, ", ".join(f"jf_{fn}" for fn, _, _ in fields)
 
     def jdec_body(self, k, t) -> str:
         if isinstance(t, ListT):
-            return (f'    sip_jp_want(p, \'[\', "list");\n    {k} l = {k}_new(0);\n'
-                    f"    for (int64_t i = 0; sip_jp_arr_next(p, i); i++) {{\n"
-                    f"        int64_t m = sip_jp_path_idx(p, i);\n        {k}_push(l, {self.jdec(t.elem)});\n"
-                    f"        p->path.n = m;\n    }}\n    return l;")
+            return (f'    f_std__rt__jp_want(p, \'[\', SIP_LIT("list"));\n    {k} l = {k}_new(0);\n'
+                    f"    for (int64_t i = 0; f_std__rt__jp_arr_next(p, i); i++) {{\n"
+                    f"        f_std__rt__jp_idx(p, i);\n        {k}_push(l, {self.jdec(t.elem)});\n"
+                    f"        f_std__rt__jp_up(p);\n    }}\n    return l;")
         if isinstance(t, SetT):
             d = ctype(t)
-            return (f'    sip_jp_want(p, \'[\', "list");\n    {d} s = {d}_new();\n'
-                    f"    for (int64_t i = 0; sip_jp_arr_next(p, i); i++) {{\n"
-                    f"        int64_t m = sip_jp_path_idx(p, i);\n        {d}_set(s, {self.jdec(t.elem)}, true);\n"
-                    f"        p->path.n = m;\n    }}\n    return s;")
+            return (f'    f_std__rt__jp_want(p, \'[\', SIP_LIT("list"));\n    {d} s = {d}_new();\n'
+                    f"    for (int64_t i = 0; f_std__rt__jp_arr_next(p, i); i++) {{\n"
+                    f"        f_std__rt__jp_idx(p, i);\n        {d}_set(s, {self.jdec(t.elem)}, true);\n"
+                    f"        f_std__rt__jp_up(p);\n    }}\n    return s;")
         if isinstance(t, DictT):
             kt = deep(t.key)
             if kt is STR:
                 kc = "k"
             elif kt is INT:
-                kc = "sip_jp_key_int(p, k)"
+                kc = "f_std__rt__jp_key_int(p, k)"
             else:
                 raise JsonTypeError(f"{show_t(t)} cannot be read from JSON: keys must be str or int")
-            return (f'    sip_jp_want(p, \'{{\', "dict");\n    {k} d = {k}_new();\n    sip_str k;\n'
-                    f"    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {{\n"
-                    f"        int64_t m = sip_jp_path_key(p, k);\n        {ctype(kt)} key = {kc};\n"
+            return (f'    f_std__rt__jp_want(p, \'{{\', SIP_LIT("dict"));\n    {k} d = {k}_new();\n    sip_str k;\n'
+                    f"    for (int64_t i = 0; f_std__rt__jp_obj_next(p, i) && (k = p->f_key, true); i++) {{\n"
+                    f"        f_std__rt__jp_key(p, k);\n        {ctype(kt)} key = {kc};\n"
                     f"        {k}_set(d, key, {self.jdec(t.val)});\n"
-                    f"        p->path.n = m;\n    }}\n    return d;")
+                    f"        f_std__rt__jp_up(p);\n    }}\n    return d;")
         if isinstance(t, OptT):
             inner = self.jdec(t.inner)
             if is_ref(t.inner):
-                return f"    if (sip_jp_null(p)) return NULL;\n    return {inner};"
-            return f"    if (sip_jp_null(p)) return ({k}){{0}};\n    return ({k}){{true, {inner}}};"
+                return f"    if (f_std__rt__jp_null(p)) return NULL;\n    return {inner};"
+            return f"    if (f_std__rt__jp_null(p)) return ({k}){{0}};\n    return ({k}){{true, {inner}}};"
         if isinstance(t, TupleT):
             n = len(t.items)
-            lines = [f'    sip_jp_want(p, \'[\', "list");', f"    {k} r;", "    int64_t m;"]
+            lines = [f'    f_std__rt__jp_want(p, \'[\', SIP_LIT("list"));', f"    {k} r;"]
             for i, it in enumerate(t.items):
-                lines.append(f'    if (!sip_jp_arr_next(p, {i})) sip_jp_fail(p, "expected a list of {n} items");')
-                lines.append(f"    m = sip_jp_path_idx(p, {i}); r.f{i} = {self.jdec(it)}; p->path.n = m;")
-            lines.append(f'    if (sip_jp_arr_next(p, {n})) sip_jp_fail(p, "expected a list of {n} items");')
+                lines.append(f'    if (!f_std__rt__jp_arr_next(p, {i})) f_std__rt__jp_fail(p, SIP_LIT("expected a list of {n} items"));')
+                lines.append(f"    f_std__rt__jp_idx(p, {i}); r.f{i} = {self.jdec(it)}; f_std__rt__jp_up(p);")
+            lines.append(f'    if (f_std__rt__jp_arr_next(p, {n})) f_std__rt__jp_fail(p, SIP_LIT("expected a list of {n} items"));')
             lines.append("    return r;")
             return "\n".join(lines)
         if isinstance(t, RecordT):
             fields = [(fn, ft, getattr(t, "cdefaults", {}).get(fn)) for fn, ft in t.fields.items()]
             lines, args = self.jdec_fields(fields, getattr(t, "display", t.name))
-            return "\n".join([f'    sip_jp_want(p, \'{{\', "object");', *lines, f"    return {k}_new({args});"])
+            return "\n".join([f'    f_std__rt__jp_want(p, \'{{\', SIP_LIT("object"));', *lines, f"    return {k}_new({args});"])
         if isinstance(t, SumT):
-            lines = ["    sip_str tag = sip_jp_tag(p);"]
+            lines = ["    sip_str tag = f_std__rt__jp_tag(p);"]
             for vname, fields in t.variants.items():
                 dn = getattr(t, "vdisplay", {}).get(vname, vname)
                 fl = [(fn, ft, None) for fn, ft in fields]
                 body, args = self.jdec_fields(fl, dn)
                 lines.append(f"    if (sip_str_is(tag, {_clit(dn)})) {{")
-                lines.append(f'        sip_jp_want(p, \'{{\', "object");')
+                lines.append(f'        f_std__rt__jp_want(p, \'{{\', SIP_LIT("object"));')
                 lines += ["    " + x for x in body]
                 lines.append(f"        return {k}_new_{vname}({args});")
                 lines.append("    }")
-            lines.append('    sip_jp_fail(p, "unknown \\"type\\"");')
+            lines.append('    f_std__rt__jp_fail(p, SIP_LIT("unknown \\"type\\""));')
             return "\n".join(lines)
         raise JsonTypeError(f"{show_t(t)} cannot be read from JSON")
 
     def jenc(self, t, v: str, d: str) -> str:
         """Оператор C: дописать JSON значения v в sip_sb *b (отступ ind, глубина d)."""
         t = deep(t)
-        prim = {INT: "str_int", FLOAT: "sip_je_float", BOOL: "sip_je_bool", STR: "sip_je_str"}
+        prim = {INT: "str_int", FLOAT: "f_std__rt__je_float", BOOL: "f_std__rt__je_bool", STR: "f_std__rt__je_str"}
         if t in prim:
             return f"{prim[t]}(b, {v});"
         if isinstance(t, Prim) or isinstance(t, FnT):
@@ -495,15 +498,15 @@ class Registry:
         lines = ["    sip_sb_putc(b, '{');"]
         first = "true"
         if tag is not None:
-            lines.append(f"    sip_je_sep(b, ind, d + 1, true); sip_sb_put(b, {_clit(chr(34) + 'type' + chr(34) + ': ')});"
-                         f" sip_je_str(b, (sip_str){{{_clit(tag)}}});")
+            lines.append(f"    f_std__rt__je_sep(b, ind, d + 1, true); sip_sb_put(b, {_clit(chr(34) + 'type' + chr(34) + ': ')});"
+                         f" f_std__rt__je_str(b, (sip_str){{{_clit(tag)}}});")
             first = "false"
         for fn, ft, ex in items:
-            lines.append(f"    sip_je_sep(b, ind, d + 1, {first}); "
+            lines.append(f"    f_std__rt__je_sep(b, ind, d + 1, {first}); "
                          f"sip_sb_put(b, {_clit(json_key(fn) + ': ')}); {self.jenc(ft, ex, 'd + 1')}")
             first = "false"
         if items or tag is not None:
-            lines.append("    sip_je_close(b, ind, d, '}');")
+            lines.append("    f_std__rt__je_close(b, ind, d, '}');")
         else:
             lines.append("    sip_sb_putc(b, '}');")
         return lines
@@ -515,27 +518,27 @@ class Registry:
             else:
                 n, item = "v->n", "v->e[i].k"
             return (f"    sip_sb_putc(b, '[');\n    for (int64_t i = 0; i < {n}; i++) {{\n"
-                    f"        sip_je_sep(b, ind, d + 1, i == 0); {self.jenc(t.elem, item, 'd + 1')}\n    }}\n"
-                    f"    if ({n}) sip_je_close(b, ind, d, ']'); else sip_sb_putc(b, ']');")
+                    f"        f_std__rt__je_sep(b, ind, d + 1, i == 0); {self.jenc(t.elem, item, 'd + 1')}\n    }}\n"
+                    f"    if ({n}) f_std__rt__je_close(b, ind, d, ']'); else sip_sb_putc(b, ']');")
         if isinstance(t, TupleT):
             lines = ["    sip_sb_putc(b, '[');"]
             for i, it in enumerate(t.items):
-                lines.append(f"    sip_je_sep(b, ind, d + 1, {'true' if i == 0 else 'false'}); "
+                lines.append(f"    f_std__rt__je_sep(b, ind, d + 1, {'true' if i == 0 else 'false'}); "
                              + self.jenc(it, f"v.f{i}", "d + 1"))
-            lines.append("    sip_je_close(b, ind, d, ']');" if t.items else "    sip_sb_putc(b, ']');")
+            lines.append("    f_std__rt__je_close(b, ind, d, ']');" if t.items else "    sip_sb_putc(b, ']');")
             return "\n".join(lines)
         if isinstance(t, DictT):
             kt = deep(t.key)
-            keyw = {STR: "sip_je_str(b, v->e[i].k);",
+            keyw = {STR: "f_std__rt__je_str(b, v->e[i].k);",
                     INT: "sip_sb_putc(b, '\"'); str_int(b, v->e[i].k); sip_sb_putc(b, '\"');",
-                    FLOAT: "sip_sb_putc(b, '\"'); sip_je_float(b, v->e[i].k); sip_sb_putc(b, '\"');",
-                    BOOL: "sip_sb_putc(b, '\"'); sip_je_bool(b, v->e[i].k); sip_sb_putc(b, '\"');"}.get(kt)
+                    FLOAT: "sip_sb_putc(b, '\"'); f_std__rt__je_float(b, v->e[i].k); sip_sb_putc(b, '\"');",
+                    BOOL: "sip_sb_putc(b, '\"'); f_std__rt__je_bool(b, v->e[i].k); sip_sb_putc(b, '\"');"}.get(kt)
             if keyw is None:
                 raise JsonTypeError(f"{show_t(t)} cannot be converted to JSON: keys must be str, int, float or bool")
             return (f"    sip_sb_putc(b, '{{');\n    for (int64_t i = 0; i < v->n; i++) {{\n"
-                    f"        sip_je_sep(b, ind, d + 1, i == 0); {keyw} sip_sb_put(b, \": \", 2); "
+                    f"        f_std__rt__je_sep(b, ind, d + 1, i == 0); {keyw} sip_sb_put(b, \": \", 2); "
                     f"{self.jenc(t.val, 'v->e[i].v', 'd + 1')}\n    }}\n"
-                    f"    if (v->n) sip_je_close(b, ind, d, '}}'); else sip_sb_putc(b, '}}');")
+                    f"    if (v->n) f_std__rt__je_close(b, ind, d, '}}'); else sip_sb_putc(b, '}}');")
         if isinstance(t, OptT):
             return (f"    if (!{opt_has(t, 'v')}) {{ sip_sb_put(b, \"null\", 4); return; }}\n"
                     f"    {self.jenc(t.inner, opt_val(t, 'v'), 'd')}")

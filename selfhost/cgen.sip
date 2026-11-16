@@ -278,7 +278,8 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
             if v.mod in mods
                 globals.append("{if v.mod != root_file then storage else 'static '}{.ct(v.ty)} {v.cname};")
                 defined.add(v.cname)
-        externs = if split then .externs(defined, "\n".join(.statics + .fn_code + [main])) else []
+        jimpls = .reg.json_impls()
+        externs = if split then .externs(defined, "\n".join(.statics + jimpls + .fn_code + [main])) else []
         src: [str] = []
         for i, fp in enumerate(.ld.files)
             off, p = fp
@@ -298,7 +299,7 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
                 src.append("    {{{off}, {c_bytes(p)}, &SIP_NSRC_{i}, SIP_SRC_{i}, {if .c.is_std(p) then 1 else 0}}},")
             src.append("}};")
             src.append("const int SIP_NFILES = {len(.ld.files)};")
-        [.reg.code(), "/* ---- программа ---- */"] + globals + externs + .statics + src + .protos + .fn_code + [main]
+        [.reg.code(), "/* ---- программа ---- */"] + globals + externs + .statics + src + .protos + jimpls + .fn_code + [main]
 
     # объявления функций и переменных из других единиц, которые упоминаются в code
     fn externs(defined {str}, code str) [str]
@@ -2119,6 +2120,8 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         "{f}({', '.join(xs)})"
 
     fn json_fn(kind str, t Ty, e N, name str) str
+        if (kind == "jparse" or kind == "csvread") and not .in_std_line(e.line)
+            .emit("sip_std_line = {e.line};")  # ошибки разбора из rt.sip — на строке пользователя
         try
             if kind == "jparse" then return .reg.jparse(t)
             if kind == "jdump" then return .reg.jdump(t)

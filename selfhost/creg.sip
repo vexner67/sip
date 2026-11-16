@@ -276,9 +276,11 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
             protos.extend(g.ps)
             impls.append(g.im)
         jp = [.jprotos[n] for n in .jnames]
-        ji = [.jimpls[n] for n in .jnames]
         "\n".join(["/* ---- типы ---- */"] + fwd + tuples + bodies + ["/* ---- вспомогательные функции ---- */"] +
-                  protos + impls + jp + ji)
+                  protos + impls + jp)
+
+    # тела функций JSON и CSV: они вызывают рантайм на Sip, поэтому идут после объявлений программы
+    fn json_impls() [str] = [.jimpls[n] for n in .jnames if .jimpls[n] != ""]
 
     fn gen(k str, t Ty) Gen
         tk = t.k
@@ -303,8 +305,8 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
         if name not in .jprotos
             ct = ctype(t)
             sig = "static {ct} {name}(sip_str s, int line)"
-            .jset(name, sig + ";", sig + " {{ sip_jp jp = sip_jp_new(s, line); sip_jp *p = &jp; " +
-                  "{ct} v = {dec}; sip_jp_end(p); return v; }}")
+            .jset(name, sig + ";", sig + " {{ R_std__rt__Jp p = f_std__rt__jp_new(s); " +
+                  "{ct} v = {dec}; f_std__rt__jp_end(p); return v; }}")
         name
 
     # имя функции C: (значение, отступ или -1) -> строка JSON
@@ -462,20 +464,20 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
                   "return {k}_new(r.status, r.status >= 200 && r.status < 300, r.body, r.url, h); }}")
         name
 
-    # выражение C, которое читает значение типа t из sip_jp *p
+    # выражение C, которое читает значение типа t из R_std__rt__Jp p
     fn jdec(t0 Ty) str
         t = deep(t0)
-        if t.id == INT.id then return "sip_jp_int(p)"
-        if t.id == FLOAT.id then return "sip_jp_float(p)"
-        if t.id == BOOL.id then return "sip_jp_bool(p)"
-        if t.id == STR.id then return "sip_jp_str(p)"
+        if t.id == INT.id then return "f_std__rt__jp_int(p)"
+        if t.id == FLOAT.id then return "f_std__rt__jp_float(p)"
+        if t.id == BOOL.id then return "f_std__rt__jp_bool(p)"
+        if t.id == STR.id then return "f_std__rt__jp_str(p)"
         if t.k == "prim" or t.k == "fn" then fail JsonTypeError("{show(t)} cannot be read from JSON")
         k = .need(t)
         name = "jdec_{k}"
         if name not in .jprotos
             ct = ctype(t)
-            .jset(name, "static {ct} {name}(sip_jp *p);", "")
-            .jset(name, "static {ct} {name}(sip_jp *p);", "static {ct} {name}(sip_jp *p) {{\n{.jdec_body(k, t)}\n}}")
+            .jset(name, "static {ct} {name}(R_std__rt__Jp p);", "")
+            .jset(name, "static {ct} {name}(R_std__rt__Jp p);", "static {ct} {name}(R_std__rt__Jp p) {{\n{.jdec_body(k, t)}\n}}")
         "{name}(p)"
 
     # чтение полей объекта: (строки кода, имена переменных)
@@ -485,14 +487,14 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
             fname, ft, _ = f
             lines.append("    {ctype(ft)} jf_{fname} = ({ctype(ft)}){{0}}; bool js_{fname} = false;")
         lines.append("    sip_str k;")
-        lines.append("    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {{")
-        lines.append("        int64_t m = sip_jp_path_key(p, k);")
+        lines.append("    for (int64_t i = 0; f_std__rt__jp_obj_next(p, i) && (k = p->f_key, true); i++) {{")
+        lines.append("        f_std__rt__jp_key(p, k);")
         for i, f in enumerate(fields)
             fname, ft, _ = f
             lines.append("        {if i > 0 then 'else ' else ''}if (sip_str_is(k, {clit(fname)})) " +
                          "{{ jf_{fname} = {.jdec(ft)}; js_{fname} = true; }}")
-        lines.append("        {if fields then 'else ' else ''}sip_jp_skip(p);")
-        lines.append("        p->path.n = m;")
+        lines.append("        {if fields then 'else ' else ''}f_std__rt__jp_skip(p);")
+        lines.append("        f_std__rt__jp_up(p);")
         lines.append("    }}")
         for f in fields
             fname, ft, dflt = f
@@ -502,46 +504,46 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
                 lines.append("    if (!js_{fname}) {.cc(d, 'jf_' + fname)}")
             else
                 msg = "missing field '{fname}'".replace("\"", "\\\"")
-                lines.append("    if (!js_{fname}) sip_jp_fail(p, \"{msg}\");")
+                lines.append("    if (!js_{fname}) f_std__rt__jp_fail(p, SIP_LIT(\"{msg}\"));")
         (lines, ", ".join(["jf_{f[0]}" for f in fields]))
 
     fn jdec_body(k str, t Ty) str
         if t.k == "list"
-            return ("    sip_jp_want(p, '[', \"list\");\n    {k} l = {k}_new(0);\n" +
-                   "    for (int64_t i = 0; sip_jp_arr_next(p, i); i++) {{\n" +
-                   "        int64_t m = sip_jp_path_idx(p, i);\n        {k}_push(l, {.jdec(t.a[0])});\n" +
-                   "        p->path.n = m;\n    }}\n    return l;")
+            return ("    f_std__rt__jp_want(p, '[', SIP_LIT(\"list\"));\n    {k} l = {k}_new(0);\n" +
+                   "    for (int64_t i = 0; f_std__rt__jp_arr_next(p, i); i++) {{\n" +
+                   "        f_std__rt__jp_idx(p, i);\n        {k}_push(l, {.jdec(t.a[0])});\n" +
+                   "        f_std__rt__jp_up(p);\n    }}\n    return l;")
         if t.k == "set"
             d = ctype(t)
-            return ("    sip_jp_want(p, '[', \"list\");\n    {d} s = {d}_new();\n" +
-                   "    for (int64_t i = 0; sip_jp_arr_next(p, i); i++) {{\n" +
-                   "        int64_t m = sip_jp_path_idx(p, i);\n        {d}_set(s, {.jdec(t.a[0])}, true);\n" +
-                   "        p->path.n = m;\n    }}\n    return s;")
+            return ("    f_std__rt__jp_want(p, '[', SIP_LIT(\"list\"));\n    {d} s = {d}_new();\n" +
+                   "    for (int64_t i = 0; f_std__rt__jp_arr_next(p, i); i++) {{\n" +
+                   "        f_std__rt__jp_idx(p, i);\n        {d}_set(s, {.jdec(t.a[0])}, true);\n" +
+                   "        f_std__rt__jp_up(p);\n    }}\n    return s;")
         if t.k == "dict"
             kt = deep(t.a[0])
             kc = ""
             if kt.id == STR.id
                 kc = "k"
             elif kt.id == INT.id
-                kc = "sip_jp_key_int(p, k)"
+                kc = "f_std__rt__jp_key_int(p, k)"
             else
                 fail JsonTypeError("{show(t)} cannot be read from JSON: keys must be str or int")
-            return ("    sip_jp_want(p, '{{', \"dict\");\n    {k} d = {k}_new();\n    sip_str k;\n" +
-                   "    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {{\n" +
-                   "        int64_t m = sip_jp_path_key(p, k);\n        {ctype(kt)} key = {kc};\n" +
+            return ("    f_std__rt__jp_want(p, '{{', SIP_LIT(\"dict\"));\n    {k} d = {k}_new();\n    sip_str k;\n" +
+                   "    for (int64_t i = 0; f_std__rt__jp_obj_next(p, i) && (k = p->f_key, true); i++) {{\n" +
+                   "        f_std__rt__jp_key(p, k);\n        {ctype(kt)} key = {kc};\n" +
                    "        {k}_set(d, key, {.jdec(t.a[1])});\n" +
-                   "        p->path.n = m;\n    }}\n    return d;")
+                   "        f_std__rt__jp_up(p);\n    }}\n    return d;")
         if t.k == "opt"
             inner = .jdec(t.a[0])
-            if is_ref(t.a[0]) then return "    if (sip_jp_null(p)) return NULL;\n    return {inner};"
-            return "    if (sip_jp_null(p)) return ({k}){{0}};\n    return ({k}){{true, {inner}}};"
+            if is_ref(t.a[0]) then return "    if (f_std__rt__jp_null(p)) return NULL;\n    return {inner};"
+            return "    if (f_std__rt__jp_null(p)) return ({k}){{0}};\n    return ({k}){{true, {inner}}};"
         if t.k == "tuple"
             n = len(t.a)
-            lines = ["    sip_jp_want(p, '[', \"list\");", "    {k} r;", "    int64_t m;"]
+            lines = ["    f_std__rt__jp_want(p, '[', SIP_LIT(\"list\"));", "    {k} r;"]
             for i, it in enumerate(t.a)
-                lines.append("    if (!sip_jp_arr_next(p, {i})) sip_jp_fail(p, \"expected a list of {n} items\");")
-                lines.append("    m = sip_jp_path_idx(p, {i}); r.f{i} = {.jdec(it)}; p->path.n = m;")
-            lines.append("    if (sip_jp_arr_next(p, {n})) sip_jp_fail(p, \"expected a list of {n} items\");")
+                lines.append("    if (!f_std__rt__jp_arr_next(p, {i})) f_std__rt__jp_fail(p, SIP_LIT(\"expected a list of {n} items\"));")
+                lines.append("    f_std__rt__jp_idx(p, {i}); r.f{i} = {.jdec(it)}; f_std__rt__jp_up(p);")
+            lines.append("    if (f_std__rt__jp_arr_next(p, {n})) f_std__rt__jp_fail(p, SIP_LIT(\"expected a list of {n} items\"));")
             lines.append("    return r;")
             return "\n".join(lines)
         if t.k == "record"
@@ -551,9 +553,9 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
             for fname in fs
                 fl.append((fname, fs[fname], defs.get(fname)))
             lines, args = .jdec_fields(fl)
-            return "\n".join(["    sip_jp_want(p, '{{', \"object\");"] + lines + ["    return {k}_new({args});"])
+            return "\n".join(["    f_std__rt__jp_want(p, '{{', SIP_LIT(\"object\"));"] + lines + ["    return {k}_new({args});"])
         if t.k == "sum"
-            lines = ["    sip_str tag = sip_jp_tag(p);"]
+            lines = ["    sip_str tag = f_std__rt__jp_tag(p);"]
             vs = variants_of(t)
             for vname in vs
                 dn = vdisp(t, vname)
@@ -562,11 +564,11 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
                     fl.append((f.name, f.ty, nil))
                 body, args = .jdec_fields(fl)
                 lines.append("    if (sip_str_is(tag, {clit(dn)})) {{")
-                lines.append("        sip_jp_want(p, '{{', \"object\");")
+                lines.append("        f_std__rt__jp_want(p, '{{', SIP_LIT(\"object\"));")
                 lines.extend(["    " + x for x in body])
                 lines.append("        return {k}_new_{vname}({args});")
                 lines.append("    }}")
-            lines.append("    sip_jp_fail(p, \"unknown \\\"type\\\"\");")
+            lines.append("    f_std__rt__jp_fail(p, SIP_LIT(\"unknown \\\"type\\\"\"));")
             return "\n".join(lines)
         fail JsonTypeError("{show(t)} cannot be read from JSON")
 
@@ -574,9 +576,9 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
     fn jenc(t0 Ty, v str, d str) str
         t = deep(t0)
         if t.id == INT.id then return "str_int(b, {v});"
-        if t.id == FLOAT.id then return "sip_je_float(b, {v});"
-        if t.id == BOOL.id then return "sip_je_bool(b, {v});"
-        if t.id == STR.id then return "sip_je_str(b, {v});"
+        if t.id == FLOAT.id then return "f_std__rt__je_float(b, {v});"
+        if t.id == BOOL.id then return "f_std__rt__je_bool(b, {v});"
+        if t.id == STR.id then return "f_std__rt__je_str(b, {v});"
         if t.k == "prim" or t.k == "fn" then fail JsonTypeError("{show(t)} cannot be converted to JSON")
         k = .need(t)
         name = "jenc_{k}"
@@ -593,16 +595,16 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
         first = "true"
         if tag != nil
             tg: str = tag
-            lines.append("    sip_je_sep(b, ind, d + 1, true); sip_sb_put(b, {clit('\"type\": ')});" +
-                         " sip_je_str(b, (sip_str){{{clit(tg)}}});")
+            lines.append("    f_std__rt__je_sep(b, ind, d + 1, true); sip_sb_put(b, {clit('\"type\": ')});" +
+                         " f_std__rt__je_str(b, (sip_str){{{clit(tg)}}});")
             first = "false"
         for it in items
             fname, ft, ex = it
-            lines.append("    sip_je_sep(b, ind, d + 1, {first}); " +
+            lines.append("    f_std__rt__je_sep(b, ind, d + 1, {first}); " +
                          "sip_sb_put(b, {clit(json_key(fname) + ': ')}); {.jenc(ft, ex, 'd + 1')}")
             first = "false"
         if items or tag != nil
-            lines.append("    sip_je_close(b, ind, d, '}}');")
+            lines.append("    f_std__rt__je_close(b, ind, d, '}}');")
         else
             lines.append("    sip_sb_putc(b, '}}');")
         lines
@@ -612,32 +614,32 @@ type Registry(cc fn(N, str) str, types {str: Ty} = {}, order [str] = [], jnames 
             n = "v->n"
             item = if t.k == "list" then "v->d[i]" else "v->e[i].k"
             return ("    sip_sb_putc(b, '[');\n    for (int64_t i = 0; i < {n}; i++) {{\n" +
-                   "        sip_je_sep(b, ind, d + 1, i == 0); {.jenc(t.a[0], item, 'd + 1')}\n    }}\n" +
-                   "    if ({n}) sip_je_close(b, ind, d, ']'); else sip_sb_putc(b, ']');")
+                   "        f_std__rt__je_sep(b, ind, d + 1, i == 0); {.jenc(t.a[0], item, 'd + 1')}\n    }}\n" +
+                   "    if ({n}) f_std__rt__je_close(b, ind, d, ']'); else sip_sb_putc(b, ']');")
         if t.k == "tuple"
             lines = ["    sip_sb_putc(b, '[');"]
             for i, it in enumerate(t.a)
-                lines.append("    sip_je_sep(b, ind, d + 1, {if i == 0 then 'true' else 'false'}); " +
+                lines.append("    f_std__rt__je_sep(b, ind, d + 1, {if i == 0 then 'true' else 'false'}); " +
                              .jenc(it, "v.f{i}", "d + 1"))
-            lines.append(if t.a then "    sip_je_close(b, ind, d, ']');" else "    sip_sb_putc(b, ']');")
+            lines.append(if t.a then "    f_std__rt__je_close(b, ind, d, ']');" else "    sip_sb_putc(b, ']');")
             return "\n".join(lines)
         if t.k == "dict"
             kt = deep(t.a[0])
             keyw = ""
             if kt.id == STR.id
-                keyw = "sip_je_str(b, v->e[i].k);"
+                keyw = "f_std__rt__je_str(b, v->e[i].k);"
             elif kt.id == INT.id
                 keyw = "sip_sb_putc(b, '\"'); str_int(b, v->e[i].k); sip_sb_putc(b, '\"');"
             elif kt.id == FLOAT.id
-                keyw = "sip_sb_putc(b, '\"'); sip_je_float(b, v->e[i].k); sip_sb_putc(b, '\"');"
+                keyw = "sip_sb_putc(b, '\"'); f_std__rt__je_float(b, v->e[i].k); sip_sb_putc(b, '\"');"
             elif kt.id == BOOL.id
-                keyw = "sip_sb_putc(b, '\"'); sip_je_bool(b, v->e[i].k); sip_sb_putc(b, '\"');"
+                keyw = "sip_sb_putc(b, '\"'); f_std__rt__je_bool(b, v->e[i].k); sip_sb_putc(b, '\"');"
             else
                 fail JsonTypeError("{show(t)} cannot be converted to JSON: keys must be str, int, float or bool")
             return ("    sip_sb_putc(b, '{{');\n    for (int64_t i = 0; i < v->n; i++) {{\n" +
-                   "        sip_je_sep(b, ind, d + 1, i == 0); {keyw} sip_sb_put(b, \": \", 2); " +
+                   "        f_std__rt__je_sep(b, ind, d + 1, i == 0); {keyw} sip_sb_put(b, \": \", 2); " +
                    "{.jenc(t.a[1], 'v->e[i].v', 'd + 1')}\n    }}\n" +
-                   "    if (v->n) sip_je_close(b, ind, d, '}}'); else sip_sb_putc(b, '}}');")
+                   "    if (v->n) f_std__rt__je_close(b, ind, d, '}}'); else sip_sb_putc(b, '}}');")
         if t.k == "opt"
             return ("    if (!{opt_has(t, 'v')}) {{ sip_sb_put(b, \"null\", 4); return; }}\n" +
                    "    {.jenc(t.a[0], opt_val(t, 'v'), 'd')}")

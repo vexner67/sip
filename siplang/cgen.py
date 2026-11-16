@@ -172,7 +172,8 @@ class CGen:
             if v.mod in mods:
                 globals_.append(f"{storage if v.mod != root_file else 'static '}{self.c(v.ty)} {v.cname};")
                 defined.add(v.cname)
-        externs = self.externs(defined, "\n".join(self.statics + self.fn_code + [main])) if split else []
+        jimpls = self.reg.jimpls()
+        externs = self.externs(defined, "\n".join(self.statics + jimpls + self.fn_code + [main])) if split else []
         files = self.srcmap.files
         src = []
         for i, (off, path, lines) in enumerate(files):
@@ -192,7 +193,7 @@ class CGen:
             src.append("};")
             src.append(f"const int SIP_NFILES = {len(files)};")
         return [self.reg.code(), "/* ---- программа ---- */", *globals_, *externs, *self.statics, *src,
-                *self.protos, *self.fn_code, main]
+                *self.protos, *jimpls, *self.fn_code, main]
 
     def externs(self, defined: set, code: str) -> list:
         """Объявления функций и переменных из других единиц, которые упоминаются в code."""
@@ -1963,6 +1964,8 @@ class CGen:
         return f"sip_sleep((double)({self.ex(e.args[0])}))"
 
     def json_fn(self, kind, t, e):
+        if kind in ("jparse", "csvread") and not self.in_std_line(e.line):
+            self.emit(f"sip_std_line = {e.line};")  # ошибки разбора из rt.sip — на строке пользователя
         try:
             return getattr(self.reg, kind)(t)
         except JsonTypeError as ex:
