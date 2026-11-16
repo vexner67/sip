@@ -1088,6 +1088,19 @@ static inline void sip_rt_put(void *b, sip_str s) { sip_sb_str((sip_sb *)b, s); 
 static inline void sip_rt_putc(void *b, int64_t c) { sip_sb_putc((sip_sb *)b, (char)c); }
 static inline sip_str sip_rt_done(void *b) { return sip_sb_done((sip_sb *)b); }
 static inline void sip_rt_putf(void *b, double x) { str_float((sip_sb *)b, x); }
+/* float из строки целиком (как strtod); если это не число — sip_rt_fbad = true */
+SIP_GV(_Thread_local bool sip_rt_fbad);
+static double sip_rt_tofloat(sip_str s) {
+    char buf[128], *end;
+    sip_rt_fbad = true;
+    if (s.n == 0 || s.n >= (int64_t)sizeof buf) return 0;
+    memcpy(buf, s.p, (size_t)s.n);
+    buf[s.n] = 0;
+    double v = strtod(buf, &end);
+    sip_rt_fbad = *end != 0;
+    return v;
+}
+static inline bool sip_rt_fbad_get(void) { return sip_rt_fbad; }
 /* число из правильного токена (его уже проверил разбор на Sip); strtod понимает и nan, inf, -inf */
 static double sip_rt_atof(sip_str s) {
     char buf[64], *t = s.n < (int64_t)sizeof buf ? buf : malloc((size_t)s.n + 1);
@@ -1338,156 +1351,7 @@ static inline bool sip_str_is(sip_str s, const char *lit, int64_t n) {
 }
 
 /* ---------- CSV ----------
- * Диалект Python по умолчанию: поля в кавычках с "" внутри, строки \n, \r\n или \r,
- * при записи кавычки ставятся только там, где нужны, строки кончаются \r\n. */
-
-typedef struct {
-    const char *s; int64_t n, i;
-    char d; int line;
-    int64_t row_line, next_line;  /* номер строки файла: для ошибок */
-    sip_str *f; int64_t nf, cap;
-} sip_csv;
-
-static char sip_csv_delim(sip_str d, int line) {
-    if (d.n != 1) sip_raise(SIP_E_ValueError, SIP_LIT("delimiter must be a 1-character string"), line);
-    return d.p[0];
-}
-
-static sip_csv sip_csv_new(sip_str text, sip_str delim, int line) {
-    sip_csv c = {text.p, text.n, 0, sip_csv_delim(delim, line), line, 1, 1, NULL, 0, 0};
-    return c;
-}
-
-static inline void sip_csv_push(sip_csv *c, sip_str f) {
-    if (c->nf == c->cap) {
-        c->cap = c->cap ? c->cap * 2 : 16;
-        c->f = sip_realloc(c->f, (size_t)c->cap * sizeof(sip_str));
-    }
-    c->f[c->nf++] = f;
-}
-
-/* следующая запись файла: поля в c->f[0..nf); false — данных больше нет */
-static bool sip_csv_row(sip_csv *c) {
-    const char *s = c->s;
-    int64_t n = c->n;
-    if (c->i >= n) return false;
-    c->nf = 0;
-    c->row_line = c->next_line;
-    if (s[c->i] == '\n' || s[c->i] == '\r') {  /* пустая строка — запись без полей */
-        if (s[c->i] == '\r' && c->i + 1 < n && s[c->i + 1] == '\n') c->i++;
-        c->i++;
-        c->next_line++;
-        return true;
-    }
-    for (;;) {
-        if (c->i < n && s[c->i] == '"') {
-            sip_sb b = sip_sb_new();
-            c->i++;
-            for (;;) {
-                if (c->i >= n) break;
-                char ch = s[c->i];
-                if (ch == '"') {
-                    if (c->i + 1 < n && s[c->i + 1] == '"') { sip_sb_putc(&b, '"'); c->i += 2; continue; }
-                    c->i++;
-                    break;
-                }
-                if (ch == '\n') c->next_line++;
-                sip_sb_putc(&b, ch);
-                c->i++;
-            }
-            /* после закрывающей кавычки — как в Python: всё до разделителя дописывается в поле */
-            while (c->i < n && s[c->i] != c->d && s[c->i] != '\n' && s[c->i] != '\r') sip_sb_putc(&b, s[c->i++]);
-            sip_csv_push(c, sip_sb_done(&b));
-        } else {
-            int64_t start = c->i;
-            while (c->i < n && s[c->i] != c->d && s[c->i] != '\n' && s[c->i] != '\r') c->i++;
-            sip_csv_push(c, (sip_str){s + start, c->i - start});
-        }
-        if (c->i >= n) return true;
-        char ch = s[c->i];
-        if (ch == c->d) {
-            c->i++;
-            if (c->i >= n) { sip_csv_push(c, (sip_str){"", 0}); return true; }
-            continue;
-        }
-        if (ch == '\r' && c->i + 1 < n && s[c->i + 1] == '\n') c->i++;
-        c->i++;
-        c->next_line++;
-        return true;
-    }
-}
-
-static inline sip_str sip_csv_cell(sip_csv *c, int64_t i) {
-    return (i >= 0 && i < c->nf) ? c->f[i] : (sip_str){"", 0};
-}
-
-static int64_t sip_csv_col(sip_str *hdr, int64_t nh, sip_str name) {
-    for (int64_t i = 0; i < nh; i++) if (hdr[i].n == name.n && !memcmp(hdr[i].p, name.p, (size_t)name.n)) return i;
-    return -1;
-}
-
-static sip_str *sip_csv_header(sip_csv *c) {
-    sip_str *h = sip_alloc((size_t)(c->nf ? c->nf : 1) * sizeof(sip_str));
-    memcpy(h, c->f, (size_t)c->nf * sizeof(sip_str));
-    return h;
-}
-
-__attribute__((noreturn, cold)) static void sip_csv_bad(sip_csv *c, int64_t i, sip_str col, const char *what) {
-    sip_str v = sip_csv_cell(c, i);
-    if (col.n)
-        sip_raisef(SIP_E_ParseError, c->line, "CSV line %lld, column '%.*s': invalid %s: '%.*s'",
-                   (long long)c->row_line, (int)col.n, col.p, what, (int)(v.n > 40 ? 40 : v.n), v.p);
-    sip_raisef(SIP_E_ParseError, c->line, "CSV line %lld, column %lld: invalid %s: '%.*s'",
-               (long long)c->row_line, (long long)i + 1, what, (int)(v.n > 40 ? 40 : v.n), v.p);
-}
-
-static int64_t sip_csv_int(sip_csv *c, int64_t i, sip_str col) {
-    sip_str t = sip_str_strip(sip_csv_cell(c, i), 1, 1);
-    char buf[64];
-    if (t.n == 0 || t.n >= (int64_t)sizeof buf) sip_csv_bad(c, i, col, "int");
-    int64_t j = 0;
-    for (int64_t k = 0; k < t.n; k++) if (t.p[k] != '_') buf[j++] = t.p[k];
-    buf[j] = 0;
-    char *end;
-    errno = 0;
-    long long v = strtoll(buf, &end, 10);
-    if (*end || errno) sip_csv_bad(c, i, col, "int");
-    return v;
-}
-
-static double sip_csv_float(sip_csv *c, int64_t i, sip_str col) {
-    sip_str t = sip_str_strip(sip_csv_cell(c, i), 1, 1);
-    char buf[128];
-    if (t.n == 0 || t.n >= (int64_t)sizeof buf) sip_csv_bad(c, i, col, "float");
-    memcpy(buf, t.p, (size_t)t.n);
-    buf[t.n] = 0;
-    char *end;
-    double v = strtod(buf, &end);
-    if (*end) sip_csv_bad(c, i, col, "float");
-    return v;
-}
-
-static bool sip_csv_bool(sip_csv *c, int64_t i, sip_str col) {
-    sip_str t = sip_str_strip(sip_csv_cell(c, i), 1, 1);
-    if (sip_str_is(t, "true", 4) || sip_str_is(t, "True", 4) || sip_str_is(t, "1", 1) || sip_str_is(t, "yes", 3))
-        return true;
-    if (sip_str_is(t, "false", 5) || sip_str_is(t, "False", 5) || sip_str_is(t, "0", 1) || sip_str_is(t, "no", 2) ||
-        t.n == 0)
-        return false;
-    sip_csv_bad(c, i, col, "bool");
-}
-
-static void sip_csv_put(sip_sb *b, sip_str s, char d) {
-    bool q = false;
-    for (int64_t i = 0; i < s.n && !q; i++) q = s.p[i] == d || s.p[i] == '"' || s.p[i] == '\n' || s.p[i] == '\r';
-    if (!q) { sip_sb_str(b, s); return; }
-    sip_sb_putc(b, '"');
-    for (int64_t i = 0; i < s.n; i++) {
-        if (s.p[i] == '"') sip_sb_putc(b, '"');
-        sip_sb_putc(b, s.p[i]);
-    }
-    sip_sb_putc(b, '"');
-}
+ * Чтение и запись написаны на Sip (std/rt.sip, функции csv_*); код под каждый тип генерирует компилятор. */
 
 /* ---------- HTTP (libcurl; подключается, только если программа пользуется http) ---------- */
 #ifdef SIP_USE_HTTP

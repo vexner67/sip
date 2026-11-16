@@ -20,6 +20,8 @@ extern "sip" fn _putc(b ptr, c int) = sip_rt_putc
 extern "sip" fn _putf(b ptr, x float) = sip_rt_putf
 extern "sip" fn _done(b ptr) str = sip_rt_done
 extern "sip" fn _atof(s str) float = sip_rt_atof
+extern "sip" fn _tofloat(s str) float = sip_rt_tofloat  # потом _fbad(): не число ли
+extern "sip" fn _fbad() bool = sip_rt_fbad_get
 
 fn _space(c int) bool = c == 32 or (c >= 9 and c <= 13)
 
@@ -613,3 +615,156 @@ fn je_float(b ptr, x float)
 
 fn je_bool(b ptr, x bool)
     _put(b, if x then "true" else "false")
+
+# ---------- CSV ----------
+# Диалект Python по умолчанию: поля в кавычках с "" внутри, строки \n, \r\n или \r; при записи кавычки
+# только там, где нужны, строки кончаются \r\n. Как и для JSON, код под каждый тип генерирует компилятор.
+# csv_row кладёт поля записи в f (список один на весь разбор), row_line — её строка в файле, для ошибок.
+
+type Csv(s str, i int, d int, row_line int, next_line int, f [str])
+
+fn csv_delim(d str) int
+    if len(d) != 1 then fail ValueError("delimiter must be a 1-character string")
+    _byte(d, 0)
+
+fn csv_new(text str, delim str) Csv = Csv(text, 0, csv_delim(delim), 1, 1, [])
+
+# конец поля без кавычек: разделитель или конец строки
+fn _csv_end(s str, i int, d int) int
+    n = len(s)
+    j = i
+    while j < n
+        ch = _byte(s, j)
+        if ch == d or ch == 10 or ch == 13 then break
+        j += 1
+    j
+
+# следующая запись; false — данных больше нет
+fn csv_row(c Csv) bool
+    s = c.s
+    n = len(s)
+    i = c.i
+    if i >= n then return false
+    f = c.f
+    f.clear()
+    c.row_line = c.next_line
+    ch = _byte(s, i)
+    if ch == 10 or ch == 13  # пустая строка — запись без полей
+        if ch == 13 and i + 1 < n and _byte(s, i + 1) == 10 then i += 1
+        c.i = i + 1
+        c.next_line += 1
+        return true
+    while true
+        if i < n and _byte(s, i) == 34
+            b = _sb()
+            i += 1
+            while i < n
+                q = _find(s, "\"", i)
+                if q < 0 then q = n
+                c.next_line += sum(1 for k in i..q - 1 if _byte(s, k) == 10)
+                _put(b, _sub(s, i, q))
+                i = q
+                if i >= n then break
+                if i + 1 < n and _byte(s, i + 1) == 34
+                    _putc(b, 34)
+                    i += 2
+                    continue
+                i += 1
+                break
+            j = _csv_end(s, i, c.d)  # после закрывающей кавычки — как в Python: всё до разделителя в поле
+            _put(b, _sub(s, i, j))
+            i = j
+            f.append(_done(b))
+        else
+            j = _csv_end(s, i, c.d)
+            f.append(_sub(s, i, j))
+            i = j
+        if i >= n
+            c.i = i
+            return true
+        ch = _byte(s, i)
+        if ch == c.d
+            i += 1
+            if i >= n
+                f.append("")
+                c.i = i
+                return true
+            continue
+        if ch == 13 and i + 1 < n and _byte(s, i + 1) == 10 then i += 1
+        c.i = i + 1
+        c.next_line += 1
+        return true
+    false
+
+fn csv_cell(c Csv, i int) str = if i >= 0 and i < len(c.f) then c.f[i] else ""
+
+fn csv_header(c Csv) [str] = c.f.copy()
+
+fn csv_col(h [str], name str) int
+    for i in 0..len(h) - 1
+        if h[i] == name then return i
+    -1
+
+fn _csv_bad(c Csv, i int, col str, what str) str
+    v = _head(csv_cell(c, i))
+    if len(col) > 0 then return "CSV line {c.row_line}, column '{col}': invalid {what}: '{v}'"
+    "CSV line {c.row_line}, column {i + 1}: invalid {what}: '{v}'"
+
+# как strtoll после удаления "_": пробелы, знак, цифры
+fn csv_int(c Csv, i int, col str) int
+    t = csv_cell(c, i).strip()
+    n = len(t)
+    bad = n == 0 or n >= 64
+    k = 0
+    while k < n and (_byte(t, k) == 95 or _space(_byte(t, k)))
+        k += 1
+    neg = false
+    if k < n and (_byte(t, k) == 45 or _byte(t, k) == 43)
+        neg = _byte(t, k) == 45
+        k += 1
+    v = 0
+    digits = 0
+    while not bad and k < n
+        ch = _byte(t, k)
+        k += 1
+        if ch == 95 then continue
+        d = ch - 48
+        if not _digit(ch) or v < -922337203685477580 or (v == -922337203685477580 and d > 8)
+            bad = true
+        else
+            v = v * 10 - d
+            digits += 1
+    if bad or digits == 0 or (not neg and v == -9223372036854775807 - 1) then fail ParseError(_csv_bad(c, i, col, "int"))
+    if neg then v else -v
+
+fn csv_float(c Csv, i int, col str) float
+    v = _tofloat(csv_cell(c, i).strip())
+    if _fbad() then fail ParseError(_csv_bad(c, i, col, "float"))
+    v
+
+fn csv_bool(c Csv, i int, col str) bool
+    t = csv_cell(c, i).strip()
+    if t == "true" or t == "True" or t == "1" or t == "yes" then return true
+    if t == "false" or t == "False" or t == "0" or t == "no" or t == "" then return false
+    fail ParseError(_csv_bad(c, i, col, "bool"))
+
+fn csv_put(b ptr, s str, d int)
+    q = false
+    for i in 0..len(s) - 1
+        ch = _byte(s, i)
+        if ch == d or ch == 34 or ch == 10 or ch == 13
+            q = true
+            break
+    if not q
+        _put(b, s)
+        return
+    _putc(b, 34)
+    start = 0
+    j = _find(s, "\"", 0)
+    while j >= 0
+        _put(b, _sub(s, start, j + 1))
+        _putc(b, 34)
+        start = j + 1
+        j = _find(s, "\"", start)
+    _put(b, _sub(s, start, len(s)))
+    _putc(b, 34)

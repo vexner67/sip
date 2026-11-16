@@ -2120,7 +2120,7 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         "{f}({', '.join(xs)})"
 
     fn json_fn(kind str, t Ty, e N, name str) str
-        if (kind == "jparse" or kind == "csvread") and not .in_std_line(e.line)
+        if kind != "jdump" and not .in_std_line(e.line)
             .emit("sip_std_line = {e.line};")  # ошибки разбора из rt.sip — на строке пользователя
         try
             if kind == "jparse" then return .reg.jparse(t)

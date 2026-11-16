@@ -1964,7 +1964,7 @@ class CGen:
         return f"sip_sleep((double)({self.ex(e.args[0])}))"
 
     def json_fn(self, kind, t, e):
-        if kind in ("jparse", "csvread") and not self.in_std_line(e.line):
+        if kind in ("jparse", "csvread", "csvdump") and not self.in_std_line(e.line):
             self.emit(f"sip_std_line = {e.line};")  # ошибки разбора из rt.sip — на строке пользователя
         try:
             return getattr(self.reg, kind)(t)

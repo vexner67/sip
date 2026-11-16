@@ -239,21 +239,21 @@ class Registry:
     def csv_cell(self, t, target: str, i: str, col: str, dflt=None) -> str:
         """Оператор C: target = ячейка i, переведённая в t (col — имя колонки для ошибок)."""
         t = deep(t)
-        conv = {STR: "sip_csv_cell(c, {i})", INT: "sip_csv_int(c, {i}, {col})", FLOAT: "sip_csv_float(c, {i}, {col})",
-                BOOL: "sip_csv_bool(c, {i}, {col})"}
+        conv = {STR: "f_std__rt__csv_cell(c, {i})", INT: "f_std__rt__csv_int(c, {i}, {col})", FLOAT: "f_std__rt__csv_float(c, {i}, {col})",
+                BOOL: "f_std__rt__csv_bool(c, {i}, {col})"}
         if isinstance(t, OptT):
             inner = deep(t.inner)
             if inner not in conv:
                 raise JsonTypeError(f"CSV cells cannot hold {show_t(t)}")
             self.need(t)
             got = conv[inner].format(i=i, col=col)
-            return (f"if (sip_csv_cell(c, {i}).n == 0) {target} = ({key(t)}){{0}}; "
+            return (f"if (f_std__rt__csv_cell(c, {i}).n == 0) {target} = ({key(t)}){{0}}; "
                     f"else {target} = ({key(t)}){{true, {got}}};")
         if t not in conv:
             raise JsonTypeError(f"CSV cells cannot hold {show_t(t)}")
         code = f"{target} = {conv[t].format(i=i, col=col)};"
         if dflt is not None and t is not STR:
-            return f"if (sip_csv_cell(c, {i}).n == 0) {self.const_code(dflt, target)} else {code}"
+            return f"if (f_std__rt__csv_cell(c, {i}).n == 0) {self.const_code(dflt, target)} else {code}"
         return code
 
     def csvread(self, t) -> str:
@@ -267,35 +267,35 @@ class Registry:
             return name
         row = deep(t.elem)
         rk = self.need(row)
-        head = [f"    sip_csv cv = sip_csv_new(text, delim, line); sip_csv *c = &cv;", f"    {k} out = {k}_new(0);"]
+        head = [f"    R_std__rt__Csv c = f_std__rt__csv_new(text, delim);", f"    {k} out = {k}_new(0);"]
         if isinstance(row, ListT):
             ce = ctype(row.elem)
-            body = head + ["    while (sip_csv_row(c)) {", f"        {rk} r = {rk}_new(c->nf);",
-                           "        for (int64_t j = 0; j < c->nf; j++) {", f"            {ce} v;",
+            body = head + ["    while (f_std__rt__csv_row(c)) {", f"        {rk} r = {rk}_new(c->f_f->n);",
+                           "        for (int64_t j = 0; j < c->f_f->n; j++) {", f"            {ce} v;",
                            "            " + self.csv_cell(row.elem, "v", "j", "(sip_str){\"\", 0}"),
                            f"            {rk}_push(r, v);", "        }", f"        {k}_push(out, r);", "    }"]
         elif isinstance(row, DictT):
             if deep(row.key) is not STR:
                 raise JsonTypeError(f"CSV rows as dicts need str keys, not {show_t(row)}")
             cv = ctype(row.val)
-            body = head + ["    if (!sip_csv_row(c)) return out;",
-                           "    sip_str *hdr = sip_csv_header(c); int64_t nh = c->nf;",
-                           "    while (sip_csv_row(c)) {", "        if (c->nf == 0) continue;",
+            body = head + ["    if (!f_std__rt__csv_row(c)) return out;",
+                           "    L_str hdr = f_std__rt__csv_header(c); int64_t nh = hdr->n;",
+                           "    while (f_std__rt__csv_row(c)) {", "        if (c->f_f->n == 0) continue;",
                            f"        {rk} r = {rk}_new();",
                            "        for (int64_t j = 0; j < nh; j++) {", f"            {cv} v;",
-                           "            " + self.csv_cell(row.val, "v", "j", "hdr[j]"),
-                           f"            {rk}_set(r, hdr[j], v);", "        }", f"        {k}_push(out, r);", "    }"]
+                           "            " + self.csv_cell(row.val, "v", "j", "hdr->d[j]"),
+                           f"            {rk}_set(r, hdr->d[j], v);", "        }", f"        {k}_push(out, r);", "    }"]
         elif isinstance(row, RecordT):
             dn = getattr(row, "display", row.name)
             defaults = getattr(row, "cdefaults", {})
-            body = head + ["    if (!sip_csv_row(c)) return out;",
-                           "    sip_str *hdr = sip_csv_header(c); int64_t nh = c->nf;"]
+            body = head + ["    if (!f_std__rt__csv_row(c)) return out;",
+                           "    L_str hdr = f_std__rt__csv_header(c); int64_t nh = hdr->n;"]
             for fn, ft in row.fields.items():
-                body.append(f"    int64_t ix_{fn} = sip_csv_col(hdr, nh, (sip_str){{{_clit(fn)}}});")
+                body.append(f"    int64_t ix_{fn} = f_std__rt__csv_col(hdr, (sip_str){{{_clit(fn)}}});")
                 if not isinstance(deep(ft), OptT) and fn not in defaults:
                     msg = f"CSV has no column '{fn}' (needed for {dn})".replace('"', '\\"')
                     body.append(f'    if (ix_{fn} < 0) sip_raise(SIP_E_ParseError, SIP_LIT("{msg}"), line);')
-            body += ["    while (sip_csv_row(c)) {", "        if (c->nf == 0) continue;"]
+            body += ["    while (f_std__rt__csv_row(c)) {", "        if (c->f_f->n == 0) continue;"]
             for fn, ft in row.fields.items():
                 body.append(f"        {ctype(ft)} jf_{fn};")
                 cell = self.csv_cell(ft, f"jf_{fn}", f"ix_{fn}", f"(sip_str){{{_clit(fn)}}}", defaults.get(fn))
@@ -317,11 +317,11 @@ class Registry:
         if isinstance(t, OptT):
             return f"if ({opt_has(t, val)}) {{ {self.csv_put(t.inner, opt_val(t, val))} }}"
         if t is STR:
-            return f"sip_csv_put(b, {val}, dch);"
+            return f"f_std__rt__csv_put(b, {val}, dch);"
         if isinstance(t, FnT):
             raise JsonTypeError(f"CSV cells cannot hold {show_t(t)}")
         self.need(t)
-        return f"{{ sip_sb tb = sip_sb_new(); {fmt_call(t, '&tb', val)} sip_csv_put(b, sip_sb_done(&tb), dch); }}"
+        return f"{{ sip_sb tb = sip_sb_new(); {fmt_call(t, '&tb', val)} f_std__rt__csv_put(b, sip_sb_done(&tb), dch); }}"
 
     def csvdump(self, t) -> str:
         """Имя функции C: (строки, разделитель, строка) -> текст CSV."""
@@ -334,7 +334,7 @@ class Registry:
             return name
         row = deep(t.elem)
         rk = self.need(row)
-        body = ["    char dch = sip_csv_delim(delim, line);", "    sip_sb sb = sip_sb_new(); sip_sb *b = &sb;"]
+        body = ["    int64_t dch = f_std__rt__csv_delim(delim);", "    sip_sb sb = sip_sb_new(); sip_sb *b = &sb;"]
         sep = "if (j) sip_sb_putc(b, dch);"
         if isinstance(row, ListT):
             body += ["    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
@@ -346,7 +346,7 @@ class Registry:
                      f"        {cells}", '        sip_sb_put(b, "\\r\\n", 2);', "    }"]
         elif isinstance(row, RecordT):
             names = list(row.fields)
-            hdr = " sip_sb_putc(b, dch); ".join(f"sip_csv_put(b, (sip_str){{{_clit(fn)}}}, dch);" for fn in names)
+            hdr = " sip_sb_putc(b, dch); ".join(f"f_std__rt__csv_put(b, (sip_str){{{_clit(fn)}}}, dch);" for fn in names)
             cells = " sip_sb_putc(b, dch); ".join(self.csv_put(ft, f"r->f_{fn}") for fn, ft in row.fields.items())
             body += [f"    {hdr}", '    sip_sb_put(b, "\\r\\n", 2);',
                      "    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
@@ -355,7 +355,7 @@ class Registry:
             if deep(row.key) is not STR:
                 raise JsonTypeError(f"CSV rows as dicts need str keys, not {show_t(row)}")
             body += ["    if (rows->n == 0) return sip_sb_done(b);", f"    {rk} h = rows->d[0];",
-                     f"    for (int64_t j = 0; j < h->n; j++) {{ {sep} sip_csv_put(b, h->e[j].k, dch); }}",
+                     f"    for (int64_t j = 0; j < h->n; j++) {{ {sep} f_std__rt__csv_put(b, h->e[j].k, dch); }}",
                      '    sip_sb_put(b, "\\r\\n", 2);',
                      "    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
                      f"        for (int64_t j = 0; j < h->n; j++) {{ {sep} "
