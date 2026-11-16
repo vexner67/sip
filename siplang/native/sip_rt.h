@@ -985,30 +985,14 @@ bad:
     sip_raisef(SIP_E_ParseError, line, "invalid float: '%.*s'", (int)(s.n > 40 ? 40 : s.n), s.p);
 }
 
-/* Печать float как в Python: кратчайшее число цифр, которое читается обратно.
- * Экспонента используется, если порядок < -4 или >= 16. */
-static void str_float(sip_sb *b, double x) {
-    char buf[48];
-    if (isnan(x)) { sip_sb_put(b, "nan", 3); return; }
-    if (isinf(x)) { if (x < 0) sip_sb_put(b, "-inf", 4); else sip_sb_put(b, "inf", 3); return; }
-    int prec = 1;
-    for (; prec < 17; prec++) {
-        snprintf(buf, sizeof buf, "%.*e", prec - 1, x);
-        if (strtod(buf, NULL) == x) break;
-    }
-    snprintf(buf, sizeof buf, "%.*e", prec - 1, x);
-    int exp = atoi(strchr(buf, 'e') + 1);
-    int n;
-    if (exp < -4 || exp >= 16) {
-        n = (int)strlen(buf);
-    } else {
-        int decimals = prec - 1 - exp;
-        if (decimals < 1) decimals = 0;
-        n = snprintf(buf, sizeof buf, "%.*f", decimals, x);
-        if (decimals == 0) { buf[n++] = '.'; buf[n++] = '0'; buf[n] = 0; }
-    }
-    sip_sb_put(b, buf, n);
-}
+/* Печать float как в Python (кратчайшая запись, которая читается обратно) написана на Sip: fmt_float
+ * в std/rt.sip. Здесь — только объявление: rt.sip подключается к каждой программе. */
+#ifdef SIP_SPLIT
+void f_std__rt__fmt_float(void *b, double x);
+#else
+static void f_std__rt__fmt_float(void *b, double x);
+#endif
+static inline void str_float(sip_sb *b, double x) { f_std__rt__fmt_float(b, x); }
 
 static inline void str_int(sip_sb *b, int64_t x) {
     char buf[24];
@@ -1087,7 +1071,15 @@ static inline void *sip_rt_sb(void) { sip_sb *b = sip_alloc(sizeof *b); *b = sip
 static inline void sip_rt_put(void *b, sip_str s) { sip_sb_str((sip_sb *)b, s); }
 static inline void sip_rt_putc(void *b, int64_t c) { sip_sb_putc((sip_sb *)b, (char)c); }
 static inline sip_str sip_rt_done(void *b) { return sip_sb_done((sip_sb *)b); }
-static inline void sip_rt_putf(void *b, double x) { str_float((sip_sb *)b, x); }
+/* printf("%.*e") и printf("%.*f") для fmt_float */
+static sip_str sip_rt_fmt(double x, int64_t prec, bool exp) {
+    char buf[400];
+    int n = snprintf(buf, sizeof buf, exp ? "%.*e" : "%.*f", (int)prec, x);
+    if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
+    char *p = sip_alloc_atomic((size_t)n + 1);
+    memcpy(p, buf, (size_t)n);
+    return (sip_str){p, n};
+}
 /* float из строки целиком (как strtod); если это не число — sip_rt_fbad = true */
 SIP_GV(_Thread_local bool sip_rt_fbad);
 static double sip_rt_tofloat(sip_str s) {

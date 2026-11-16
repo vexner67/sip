@@ -17,7 +17,7 @@ extern "sip" fn _str(p ptr, n int) str = sip_rt_str
 extern "sip" fn _sb() ptr = sip_rt_sb
 extern "sip" fn _put(b ptr, s str) = sip_rt_put
 extern "sip" fn _putc(b ptr, c int) = sip_rt_putc
-extern "sip" fn _putf(b ptr, x float) = sip_rt_putf
+extern "sip" fn _fmt(x float, prec int, exp bool) str = sip_rt_fmt
 extern "sip" fn _done(b ptr) str = sip_rt_done
 extern "sip" fn _atof(s str) float = sip_rt_atof
 extern "sip" fn _tofloat(s str) float = sip_rt_tofloat  # потом _fbad(): не число ли
@@ -195,6 +195,66 @@ fn parse_int(s str) int
     if digits == 0 then fail ParseError("invalid int: '{_head(s)}'")
     if big or (not neg and v == -9223372036854775807 - 1) then fail OverflowError("int out of range: '{_head(s)}'")
     if neg then v else -v
+
+# ---------- числа ----------
+
+# float как в Python: кратчайшая запись, которая читается обратно; экспонента, если порядок < -4 или >= 16.
+# Если 15 значащих цифр читаются обратно, кратчайшая запись — они же без нулей в конце (более короткая
+# запись D, читаемая обратно, отличается от x меньше чем на 2**-53 и при округлении до 15 цифр даёт D);
+# иначе хватает 16 или 17 цифр (у субнормальных чисел точность ниже — для них перебор). Так нужно 1-3 вызова printf вместо перебора всех точностей.
+fn fmt_float(b ptr, x float)
+    if x != x
+        _put(b, "nan")
+        return
+    if x > 1.7976931348623157e308 or x < -1.7976931348623157e308
+        _put(b, if x > 0.0 then "inf" else "-inf")
+        return
+    e = _fmt(x, 14, true)
+    if x < 2.2250738585072014e-308 and x > -2.2250738585072014e-308  # субнормальные: точность ниже, перебор
+        p = 0
+        e = _fmt(x, 0, true)
+        while p < 16 and _atof(e) != x
+            p += 1
+            e = _fmt(x, p, true)
+    elif _atof(e) != x
+        e = _fmt(x, 15, true)
+        if _atof(e) != x then e = _fmt(x, 16, true)
+    ep = _find(e, "e", 0)
+    m = ep  # мантисса без нулей в конце: e[:m]
+    if _find(e, ".", 0) >= 0
+        while _byte(e, m - 1) == 48
+            m -= 1
+        if _byte(e, m - 1) == 46 then m -= 1
+    mant = _sub(e, 0, m)
+    exp = parse_int(_sub(e, ep + 1, len(e)))
+    if exp < -4 or exp >= 16
+        _put(b, mant)
+        _put(b, _sub(e, ep, len(e)))
+        return
+    # без экспоненты: те же цифры, точка на своём месте (округление на той же позиции даёт те же цифры)
+    neg = _byte(e, 0) == 45
+    if neg then _putc(b, 45)
+    d = _sb()  # цифры мантиссы без знака и точки
+    for k in (if neg then 1 else 0)..m - 1
+        if _byte(e, k) != 46 then _putc(d, _byte(e, k))
+    ds = _done(d)
+    n = len(ds)
+    if exp < 0
+        _put(b, "0.")
+        _fill_put(b, 48, -exp - 1)
+        _put(b, ds)
+    elif n <= exp + 1
+        _put(b, ds)
+        _fill_put(b, 48, exp + 1 - n)
+        _put(b, ".0")
+    else
+        _put(b, _sub(ds, 0, exp + 1))
+        _putc(b, 46)
+        _put(b, _sub(ds, exp + 1, n))
+
+fn _fill_put(b ptr, c int, n int)
+    for k in 0..n - 1
+        _putc(b, c)
 
 # ---------- JSON ----------
 # Для каждого типа компилятор генерирует на C функцию разбора (jdec_K) и вывода (jenc_K); они читают
@@ -611,7 +671,7 @@ fn je_float(b ptr, x float)
     elif x < -1.7976931348623157e308
         _put(b, "-Infinity")
     else
-        _putf(b, x)
+        fmt_float(b, x)
 
 fn je_bool(b ptr, x bool)
     _put(b, if x then "true" else "false")
