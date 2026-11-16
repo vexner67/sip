@@ -1813,6 +1813,23 @@ class SelfhostTest(unittest.TestCase):
             bad = parity.main([])
         self.assertEqual(bad, 0, buf.getvalue())
 
+    def test_bootstrap(self):
+        """sipc, собранный Python, собирает сам себя; новое поколение выдаёт тот же C."""
+        from siplang.compiler import build_cached
+        sipc = build_cached(str(ROOT / "selfhost" / "sipc.sip"))
+        src = str(ROOT / "selfhost" / "sipc.sip")
+        with tempfile.TemporaryDirectory() as tmp:
+            gen2 = os.path.join(tmp, "sipc2")
+            r = subprocess.run([sipc, "build", src, "-o", gen2], capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            a = subprocess.run([sipc, "c", src], capture_output=True, text=True, cwd=ROOT).stdout
+            b = subprocess.run([gen2, "c", src], capture_output=True, text=True, cwd=ROOT).stdout
+            self.assertTrue(a.startswith("// ---- sipc.c ----"))
+            self.assertEqual(a, b)
+            out = subprocess.run([gen2, "run", str(ROOT / "examples" / "greet.sip"), "Ann"],
+                                 capture_output=True, text=True, cwd=ROOT).stdout
+            self.assertEqual(out, "Hello, Ann!\n")
+
 
 if __name__ == "__main__":
     unittest.main()

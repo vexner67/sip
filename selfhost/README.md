@@ -1,8 +1,8 @@
 # Sip на Sip
 
-Компилятор Sip постепенно переписывается на самом Sip. Каждая часть должна
-выдавать ровно то же, что эталон на Python в `siplang/`: это проверяет
-`python3 selfhost/parity.py` (и тест `SelfhostTest`).
+Компилятор Sip переписан на самом Sip и собирает сам себя без Python: нужен
+только clang. Каждая часть выдаёт ровно то же, что эталон на Python в
+`siplang/`: это проверяет `python3 selfhost/parity.py` (и тест `SelfhostTest`).
 
 | Часть | Python | Sip | Статус |
 |---|---|---|---|
@@ -10,15 +10,43 @@
 | Парсер | `siplang/parser.py` | `parser.sip` | готов: дерево и ошибки совпадают |
 | Загрузчик модулей | `siplang/modules.py` | `modules.sip` | готов: `import`, `from ... import`, пакеты с `sip.toml` (зависимости-папки), std; git-зависимостей ещё нет |
 | Проверка типов | `siplang/checker.py`, `siplang/types.py` | `checker.sip` | готова: типы всех выражений и ошибки совпадают |
-| Генерация C | `siplang/cgen.py` | — | ещё на Python |
+| Типы в C | `siplang/cregistry.py` | `creg.sip` | готов: списки, словари, кортежи, записи, JSON, CSV |
+| Генерация C | `siplang/cgen.py` | `cgen.sip` | готова: единицы C совпадают байт в байт |
+| Сборка | `siplang/compiler.py` | `sipc.sip` | готова: кэш объектных файлов, clang параллельно, компоновка |
+
+## Сборка без Python
+
+Python нужен один раз, чтобы получить первый `sipc`. Дальше `sipc` собирает
+сам себя, и C у нового поколения совпадает с C предыдущего:
+
+```bash
+python3 -m siplang build selfhost/sipc.sip -o sipc   # первый раз, через Python
+./sipc build selfhost/sipc.sip -o sipc               # дальше сам
+./sipc run examples/greet.sip Ann
+./sipc build examples/word_freq.sip -o wf
+./sipc c examples/fib.sip                            # сгенерированный C
+```
+
+Стандартную библиотеку и рантайм `sipc` ищет в `--std DIR`, `$SIP_STD` или в
+`siplang/std` в текущей папке, папке исходника или их родителях. Объектные
+файлы лежат в `~/.cache/sip/obj` (или `$SIP_CACHE`), clang запускается
+параллельно по единице на модуль, повторная сборка без правок не вызывает
+clang. `sipc run` передаёт программе только позиционные аргументы; для флагов
+`--name` соберите бинарник через `sipc build`.
+
+Фронтенд на Sip быстрее Python: исходники самого компилятора (8.5 тысячи строк
+и модули std) он проверяет и переводит в C за 0.13 с, Python за 0.71 с (×5.5);
+маленькую программу — за 2 мс против 96 мс. Графики: [bench/charts.html](../bench/charts.html).
 
 ```bash
 sip run selfhost/lexer.sip FILE.sip    # токены построчно
 sip run selfhost/parser.sip FILE.sip   # дерево, узел на строку
 sip run selfhost/checker.sip FILE.sip  # дерево с типом каждого выражения или первая ошибка
+sip run selfhost/cgen.sip FILE.sip     # единицы C, как их выдаёт siplang/cgen.py
 python3 selfhost/parity.py             # сравнение с Python на всех .sip репозитория
 python3 selfhost/parity.py --corpus    # собрать программы из набора тестов (~/.cache/sip/selfhost-corpus)
 python3 selfhost/parity.py --only checker
+python3 selfhost/parity.py --only cgen
 ```
 
 Проверку типов (вместе с загрузкой модулей) сравнивает тот же `parity.py`: обе

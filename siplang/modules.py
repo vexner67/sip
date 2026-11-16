@@ -76,7 +76,7 @@ def _top_names(body) -> list:
 def _fn_locals(fn: FnDef) -> set:
     from .checker import Checker
     names = {p.name for p in fn.params}
-    names |= set(Checker().assigned(fn.body))
+    names |= set(Checker().assigned(fn.body, []))  # x += 1 без x = ...: глобальная модуля
     return names
 
 
@@ -404,7 +404,7 @@ class Renamer:
             inner = local | set(node.params)
             if node.block is not None:
                 from .checker import Checker
-                inner = inner | set(Checker().assigned(node.block))
+                inner = inner | set(Checker().assigned(node.block, []))
                 node.block = self.rn(node.block, inner)
             else:
                 node.body = self.rn(node.body, inner)

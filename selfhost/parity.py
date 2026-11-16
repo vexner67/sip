@@ -115,6 +115,16 @@ def py_check(src: str, name: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def py_cgen(src: str, name: str) -> str:
+    from siplang.cgen import generate_units
+    try:
+        mod, srcmap = load_program(name, src)
+        prog = check_program(mod, name, srcmap)
+        return "".join(f"=== {n} ===\n{t}" for n, t in generate_units(prog, name, srcmap))
+    except SipError as e:
+        return str(e) + "\n"
+
+
 # программы из нескольких файлов: {путь: текст}, корень — main.sip
 PROJECTS = [
     {"main.sip": "import utils\nfrom utils import twice as tw, Point\nimport utils as u\n"
@@ -298,6 +308,9 @@ def main(argv):
         bad += compare(build_cached(os.path.join(ROOT, "selfhost", "parser.sip")), par_in, py_ast, "parser")
     if only in (None, "checker"):
         bad += compare(build_cached(os.path.join(ROOT, "selfhost", "checker.sip")), chk_in, py_check, "checker",
+                       ["--std", STD_DIR])
+    if only in (None, "cgen"):
+        bad += compare(build_cached(os.path.join(ROOT, "selfhost", "cgen.sip")), chk_in, py_cgen, "cgen",
                        ["--std", STD_DIR])
     return 1 if bad else 0
 

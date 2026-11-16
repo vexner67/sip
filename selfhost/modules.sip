@@ -102,6 +102,13 @@ fn assigned(stmts [N], kinds {str}) [str]
     walk_assigned(stmts, names, augs, false, kinds)
     names
 
+# локальные функции: x += 1 без x = ... может менять глобальную переменную модуля
+fn fn_assigned(stmts [N]) [str]
+    names: [str] = []
+    augs: [str] = []
+    walk_assigned(stmts, names, augs, true, set())
+    names
+
 fn target_names(t N) {str}
     out: {str} = set()
     if t.kind == "Name"
@@ -158,7 +165,7 @@ fn is_ident(s str) bool
 # ---------- пакеты: sip.toml ----------
 
 # папка с sip.toml: имя пакета и его зависимости {имя: папка}
-type Package(root str, name str, deps {str: str}, toml str)
+type Package(root str, name str, deps {str: str}, toml str, cflags [str] = [])
 
 fn unquote(v str) str
     t = v.strip()
@@ -172,6 +179,7 @@ fn read_package(root str) Package
     name = ""
     dnames: [str] = []
     dspecs: [{str: str}] = []
+    flags: [str] = []
     for raw in read(toml).splitlines()
         line = raw.strip()
         if line == "" or line.startswith("#") then continue
@@ -196,6 +204,12 @@ fn read_package(root str) Package
                 spec["?"] = val
             dnames.append(key)
             dspecs.append(spec)
+        elif section == "c" and key == "flags"
+            if not (val.startswith("[") and val.endswith("]"))
+                fail SipErr("[c] flags must be a list of strings, e.g. flags = [\"-I/opt/include\", \"-L/opt/lib\"]",
+                            toml, 0, 0)
+            for part in val[1:len(val) - 1].split(",")
+                if part.strip() != "" then flags.append(unquote(part))
     if name == "" then name = path.basename(abspath(root))
     if not is_ident(name) then fail SipErr("package name '{name}' must be a valid identifier", toml, 0, 0)
     deps: {str: str} = {}
@@ -215,7 +229,11 @@ fn read_package(root str) Package
                         toml, 0, 0)
         else
             fail SipErr("dependency '{dname}' needs path or git", toml, 0, 0)
-    Package(abspath(root), name, deps, toml)
+    aroot = abspath(root)
+    for i, f in enumerate(flags)  # -Iinclude и -Llib — от папки пакета
+        if (f[:2] == "-I" or f[:2] == "-L") and len(f) > 2 and not f[2:].startswith("/")
+            flags[i] = f[:2] + join_parts(aroot, [f[2:]])
+    Package(aroot, name, deps, toml, flags)
 
 # ближайший sip.toml в папке файла или выше
 fn find_package(start str) Package?
@@ -322,7 +340,7 @@ type Renamer(names {str: str}, mods {str: {str: str}}, natives {str: str}, file 
             n.kids[7] = .rn(n.kids[7], local)
             local = local | {tp.kids[0].s for tp in n.kids[7].kids}
             inner = local | {p.kids[0].s for p in n.kids[1].kids}
-            for a in assigned(n.kids[3].kids, set())
+            for a in fn_assigned(n.kids[3].kids)
                 inner.add(a)
             if flag(n.kids[6]) then inner.add("self")
             for p in n.kids[1].kids
@@ -334,7 +352,7 @@ type Renamer(names {str: str}, mods {str: {str: str}}, natives {str: str}, file 
             n.kids[2] = .rn(n.kids[2], local)
             inner = local | {p.s for p in n.kids[0].kids}
             if not isn(n.kids[3])
-                for a in assigned(n.kids[3].kids, set())
+                for a in fn_assigned(n.kids[3].kids)
                     inner.add(a)
                 n.kids[3] = .rn(n.kids[3], inner)
             else
@@ -359,7 +377,7 @@ type Renamer(names {str: str}, mods {str: {str: str}}, natives {str: str}, file 
 
 # ---------- загрузчик ----------
 
-type Loader(std str, files [(int, str)] = [], modules {str: {str: str}} = {}, loading {str: bool} = {},
+type Loader(std str, files [(int, str)] = [], srcs [[str]] = [], extra [str] = [], modules {str: {str: str}} = {}, loading {str: bool} = {},
             bodies [N] = [], pkg_seen {str: bool} = {}, pkgs {str: Package} = {}, base str = ".")
 
     fn package_of(p str) Package?
@@ -370,9 +388,11 @@ type Loader(std str, files [(int, str)] = [], modules {str: {str: str}} = {}, lo
             if pkg != nil then .pkgs[d] = pkg
         .pkgs.get(d)
 
-    fn add(p str) int
+    fn add(p str, src str) int
         offset = len(.files) * BAND
         .files.append((offset, p))
+        lines = py_lines(src)
+        .srcs.append(if lines then lines else [""])
         offset
 
     fn parse_file(src str, p str) [N]
@@ -387,7 +407,7 @@ type Loader(std str, files [(int, str)] = [], modules {str: {str: str}} = {}, lo
 
     fn load_root(p str, src str) [N]
         body = .parse_file(src, p)
-        offset = .add(p)
+        offset = .add(p, src)
         pkg = .package_of(p)
         .base = if pkg != nil then pkg.root else path.dirname(abspath(p))
         .loading[abspath(p)] = true  # import самого себя — циклический импорт
@@ -432,7 +452,7 @@ type Loader(std str, files [(int, str)] = [], modules {str: {str: str}} = {}, lo
         src = read(p)
         .loading[p] = true
         body = .parse_file(src, p)
-        offset = .add(p)
+        offset = .add(p, src)
         exports: {str: str} = {}
         for n in top_names(body)
             exports[n] = pre + n
@@ -484,5 +504,21 @@ type Loader(std str, files [(int, str)] = [], modules {str: {str: str}} = {}, lo
             if line > offset then return (f, line - offset)
             i -= 1
         (if .files then .files[0][1] else "<input>", line)
+
+# как str.splitlines в Python: концом строки считаются и \r, \r\n, \v, \f, \x1c-\x1e
+fn py_lines(src str) [str]
+    out: [str] = []
+    start = 0
+    i = 0
+    n = len(src)
+    while i < n
+        b = ord(src[i])
+        if b == 10 or b == 13 or b == 11 or b == 12 or (b >= 28 and b <= 30)
+            out.append(src[start:i])
+            if b == 13 and i + 1 < n and src[i + 1] == "\n" then i += 1
+            start = i + 1
+        i += 1
+    if start < n then out.append(src[start:])
+    out
 
 fn NONE_MOD() N = mk("Module", 1, [L([])])

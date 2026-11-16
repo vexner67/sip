@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sip: бенчмарки</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: #e9e8e2;
+  --wash: rgba(42, 120, 214, 0.07);
+  --sip: #2a78d6;
+  --py: #eb6834;
+  --go: #1baf7a;
+  --c: #eda100;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: #2a2a28;
+    --wash: rgba(57, 135, 229, 0.10);
+    --sip: #3987e5;
+    --py: #d95926;
+    --go: #199e70;
+    --c: #c98500;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: #2a2a28;
+  --wash: rgba(57, 135, 229, 0.10);
+  --sip: #3987e5;
+  --py: #d95926;
+  --go: #199e70;
+  --c: #c98500;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--text-primary);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+.wrap { max-width: 1180px; margin: 0 auto; padding: 32px 20px 64px; }
+header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.01em; }
+.lead { color: var(--text-secondary); margin: 0; max-width: 720px; }
+nav { display: flex; gap: 6px; flex-wrap: wrap; margin: 22px 0 8px; position: sticky; top: 0; padding: 10px 0;
+      background: var(--page); z-index: 5; border-bottom: 1px solid var(--border); }
+nav a { color: var(--text-secondary); text-decoration: none; padding: 5px 12px; border-radius: 999px;
+        border: 1px solid var(--border); font-size: 13px; }
+nav a:hover { color: var(--text-primary); border-color: var(--axis); }
+button.ctl { font: inherit; font-size: 13px; color: var(--text-secondary); background: var(--surface-1);
+             border: 1px solid var(--border); border-radius: 8px; padding: 5px 11px; cursor: pointer; }
+button.ctl:hover { color: var(--text-primary); border-color: var(--axis); }
+button.ctl[aria-pressed="true"] { color: var(--text-primary); border-color: var(--text-secondary); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 22px 0 8px; }
+.tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+.tile .label { color: var(--text-secondary); font-size: 13px; }
+.tile .value { font-size: 30px; font-weight: 600; margin: 2px 0; }
+.tile .note { color: var(--text-muted); font-size: 12px; }
+section { margin-top: 36px; scroll-margin-top: 64px; }
+h2 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--text-secondary); margin: 0 0 14px; font-size: 14px; }
+.filters { display: flex; gap: 8px; align-items: center; margin: 0 0 12px; flex-wrap: wrap; color: var(--text-secondary); font-size: 13px; }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 14px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 16px 16px 12px; min-width: 0; }
+.card-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.card h3 { font-size: 15px; margin: 0; }
+.card .hint { color: var(--text-muted); font-size: 12px; margin: 2px 0 6px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); margin: 4px 0 2px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.legend i.line { width: 14px; height: 0; border-top: 2px solid var(--text-muted); border-radius: 0; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+svg text { fill: var(--text-secondary); font-size: 12px; }
+svg .muted { fill: var(--text-muted); font-size: 11px; }
+svg .val { fill: var(--text-primary); font-size: 12px; font-weight: 600; }
+svg .gridl { stroke: var(--grid); stroke-width: 1; }
+svg .axisl { stroke: var(--axis); stroke-width: 1; }
+svg .hit { fill: transparent; cursor: default; }
+svg .mark { transition: opacity .12s; }
+svg.hovering .mark:not(.on) { opacity: .35; }
+.foot { color: var(--text-muted); font-size: 12px; margin-top: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 8px; }
+th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text-secondary); font-weight: 500; }
+.tbl[hidden] { display: none; }
+#tip { position: fixed; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+       border: 1px solid var(--axis); border-radius: 8px; padding: 7px 10px; font-size: 12px;
+       box-shadow: 0 4px 16px rgba(0,0,0,.12); opacity: 0; transition: opacity .1s; z-index: 10; max-width: 280px; }
+#tip b { font-weight: 600; }
+#tip .k { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; }
+.method { color: var(--text-secondary); font-size: 13px; }
+.method li { margin: 4px 0; }
+code { font-size: 12.5px; background: var(--wash); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Sip: скорость, токены и компилятор</h1>
+      <p class="lead">Сравнение Sip с C, Go и Python по нескольким критериям: время работы программ, во сколько раз Sip быстрее Python, сколько токенов занимает код и как быстро работает сам компилятор, переписанный на Sip.</p>
+    </div>
+    <button class="ctl" id="theme" type="button">Тема: авто</button>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <nav>
+    <a href="#runtime">Время работы</a>
+    <a href="#speedup">Ускорение</a>
+    <a href="#frontier">Скорость и токены</a>
+    <a href="#tokens">Токены</a>
+    <a href="#compiler">Компилятор</a>
+    <a href="#method">Как мерили</a>
+  </nav>
+
+  <section id="runtime">
+    <h2>Время работы программ</h2>
+    <p class="sub">Секунды, лучшее из 3 запусков. Меньше — лучше. C и Go написаны так же, как Sip; для частот слов и сортировки версии на C нет.</p>
+    <div class="filters">Python:
+      <button class="ctl" id="py-on" type="button" aria-pressed="true">показать</button>
+      <button class="ctl" id="py-off" type="button" aria-pressed="false">скрыть</button>
+      <span>без Python видна разница между Sip, C и Go</span>
+    </div>
+    <div class="grid2" id="runtime-grid"></div>
+  </section>
+
+  <section id="speedup">
+    <h2>Во сколько раз быстрее Python</h2>
+    <p class="sub">Время Python, делённое на время языка. Больше — лучше.</p>
+    <div class="grid2">
+      <div class="card" id="speedup-geo"></div>
+      <div class="card" id="speedup-tests"></div>
+    </div>
+  </section>
+
+  <section id="frontier">
+    <h2>Скорость и токены</h2>
+    <p class="sub">Чем выше и левее, тем лучше: программа быстрее, а её код короче. Python в точке (1, 1).</p>
+    <div class="card" id="scatter"></div>
+  </section>
+
+  <section id="tokens">
+    <h2>Сколько токенов занимает код</h2>
+    <p class="sub">12 типичных задач, токенизатор o200k_base. Меньше — лучше: модель читает и пишет меньше.</p>
+    <div class="grid2">
+      <div class="card" id="tok-total"></div>
+      <div class="card" id="tok-tasks"></div>
+    </div>
+  </section>
+
+  <section id="compiler">
+    <h2>Компилятор на Sip против компилятора на Python</h2>
+    <p class="sub">Проверка типов и генерация C (без clang), миллисекунды, лучшее из 7 запусков. Меньше — лучше. Оба выдают одинаковый C байт в байт.</p>
+    <div class="grid2">
+      <div class="card" id="cc-time"></div>
+      <div class="card" id="cc-ratio"></div>
+    </div>
+  </section>
+
+  <section id="method">
+    <h2>Как мерили</h2>
+    <ul class="method">
+      <li>Программы: <code>bench/speed</code>, запуск <code>./run.sh</code>. Apple M-серия, clang 21 <code>-O3</code>, Go 1.27, Python 3.12. Вывод Sip совпадает с Python байт в байт.</li>
+      <li>Sip проверяет переполнение <code>int</code> и границы списков, C в этой таблице нет. Сильнее всего это видно в fib.</li>
+      <li>Токены: <code>bench/count_tokens.py</code>, задачи и варианты синтаксиса в <code>bench/samples</code>. Sip здесь — выбранный вариант E (гибрид). Код на C не считали.</li>
+      <li>Компилятор: <code>selfhost/sipc.sip</code> (собран сам собой) против <code>siplang</code> на Python; время Python включает запуск интерпретатора, потому что его платит каждый вызов. Сверка C на 300 программах: <code>python3 selfhost/parity.py --only cgen</code>.</li>
+      <li>Все числа есть в таблицах: кнопка «Таблица» на каждом графике.</li>
+    </ul>
+  </section>
+</div>
+<div id="tip" role="tooltip"></div>
+
+<script>
+const LANG = {
+  sip: { name: "Sip", v: "--sip" },
+  c:   { name: "C", v: "--c" },
+  go:  { name: "Go", v: "--go" },
+  py:  { name: "Python", v: "--py" },
+};
+const ORDER = ["sip", "c", "go", "py"];
+
+const SPEED = [
+  { name: "fib(35)", what: "рекурсия", t: { sip: 0.034, c: 0.028, go: 0.036, py: 0.629 } },
+  { name: "Решето до 20 млн", what: "циклы и массивы", t: { sip: 0.057, c: 0.038, go: 0.061, py: 3.475 } },
+  { name: "Частоты 2 млн слов", what: "строки и словарь", t: { sip: 0.103, go: 0.140, py: 0.538 } },
+  { name: "Сортировка 3 млн float", what: "список и сортировка", t: { sip: 0.212, go: 0.256, py: 1.133 } },
+];
+
+const TOKENS = [
+  ["fizzbuzz", 49, 63, 88], ["sum_even_squares", 28, 32, 47], ["user_class", 38, 65, 64],
+  ["word_freq", 29, 54, 178], ["http_json", 46, 78, 152], ["shapes_match", 70, 118, 103],
+  ["csv_groupby", 47, 80, 250], ["fib_memo", 31, 43, 63], ["parse_config", 59, 96, 157],
+  ["concurrent_fetch", 30, 81, 120], ["binary_search", 81, 91, 99], ["cli_greet", 28, 74, 72],
+].map(([task, sip, py, go]) => ({ task, sip, py, go }));
+
+const COMPILER = [
+  { name: "sipc.sip — сам компилятор", note: "8.5 тыс. строк с модулями", sip: 131, py: 714 },
+  { name: "checker.sip", note: "2 695 строк", sip: 56, py: 427 },
+  { name: "word_freq.sip", note: "6 строк", sip: 2.0, py: 96 },
+  { name: "shapes.sip", note: "9 строк", sip: 2.1, py: 98 },
+];
+
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function txt(parent, x, y, s, cls = "", anchor = "start", extra = {}) {
+  const t = el("text", { x, y, "text-anchor": anchor, class: cls, ...extra }, parent);
+  t.textContent = s;
+  return t;
+}
+const fmtS = (x) => x < 1 ? x.toFixed(3) : x.toFixed(2);
+const fmtX = (x) => "×" + (x >= 10 ? x.toFixed(0) : x.toFixed(1));
+const fmtMs = (x) => x < 10 ? x.toFixed(1) : Math.round(x).toLocaleString("ru-RU");
+const geo = (xs) => Math.exp(xs.reduce((a, x) => a + Math.log(x), 0) / xs.length);
+function niceMax(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+function ticks(max, n = 4) {
+  const raw = max / n, p = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * p).find((m) => m >= raw && Number.isInteger(m / p * 2)) || raw;
+  const out = [];
+  for (let v = 0; v <= max + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+}
+function fmtTick(v) { return Number.isInteger(v) ? v.toLocaleString("ru-RU") : (+v.toFixed(3)).toString(); }
+
+// подсказка
+const tip = document.getElementById("tip");
+function showTip(ev, html) {
+  tip.innerHTML = html;
+  tip.style.opacity = 1;
+  const r = tip.getBoundingClientRect();
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function hideTip() { tip.style.opacity = 0; }
+function key(lang) { return `<span class="k" style="background:var(${LANG[lang].v})"></span>`; }
+function hover(svg, hit, mark, html) {
+  hit.addEventListener("mousemove", (ev) => { svg.classList.add("hovering"); mark.classList.add("on"); showTip(ev, html); });
+  hit.addEventListener("mouseleave", () => { svg.classList.remove("hovering"); mark.classList.remove("on"); hideTip(); });
+}
+
+// столбик с закруглённым концом (4px) и прямым основанием
+function barPath(x, y, w, h, horizontal) {
+  const r = Math.min(4, horizontal ? w / 2 : h / 2, horizontal ? h / 2 : w / 2);
+  if (h <= 0 || w <= 0) return "";
+  if (!horizontal) return `M${x},${y + h}V${y + r}Q${x},${y} ${x + r},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h}Z`;
+  return `M${x},${y}H${x + w - r}Q${x + w},${y} ${x + w},${y + r}V${y + h - r}Q${x + w},${y + h} ${x + w - r},${y + h}H${x}Z`;
+}
+
+// карточка: заголовок, подпись, кнопка таблицы, svg, таблица
+function card(root, title, hint, rows, header) {
+  root.innerHTML = "";
+  const head = document.createElement("div"); head.className = "card-head";
+  const h = document.createElement("div");
+  h.innerHTML = `<h3>${title}</h3><div class="hint">${hint}</div>`;
+  const b = document.createElement("button"); b.className = "ctl"; b.type = "button"; b.textContent = "Таблица";
+  b.setAttribute("aria-pressed", "false");
+  head.append(h, b); root.appendChild(head);
+  const holder = document.createElement("div"); root.appendChild(holder);
+  const tbl = document.createElement("div"); tbl.className = "tbl"; tbl.hidden = true;
+  tbl.innerHTML = `<table><thead><tr>${header.map((x) => `<th>${x}</th>`).join("")}</tr></thead><tbody>${
+    rows.map((r) => `<tr>${r.map((x) => `<td>${x}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  root.appendChild(tbl);
+  b.onclick = () => { tbl.hidden = !tbl.hidden; b.setAttribute("aria-pressed", String(!tbl.hidden)); };
+  return holder;
+}
+function legend(holder, langs, extra = "") {
+  const d = document.createElement("div"); d.className = "legend";
+  d.innerHTML = langs.map((l) => `<span><i style="background:var(${LANG[l].v})"></i>${LANG[l].name}</span>`).join("") + extra;
+  holder.appendChild(d);
+}
+
+// вертикальные столбцы: по одному на язык
+function columns(holder, items, opts) {
+  const W = 460, H = 230, ml = 44, mr = 8, mt = 22, mb = 34;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.aria }, holder);
+  const max = niceMax(Math.max(...items.map((d) => d.v)) * 1.08);
+  const y = (v) => mt + (H - mt - mb) * (1 - v / max);
+  for (const t of ticks(max)) {
+    el("line", { x1: ml, x2: W - mr, y1: y(t), y2: y(t), class: t === 0 ? "axisl" : "gridl" }, svg);
+    txt(svg, ml - 6, y(t) + 4, fmtTick(t), "muted", "end");
+  }
+  const band = (W - ml - mr) / items.length, bw = Math.min(48, band * 0.5);
+  items.forEach((d, i) => {
+    const cx = ml + band * i + band / 2, top = y(d.v);
+    const g = el("g", { class: "mark" }, svg);
+    el("path", { d: barPath(cx - bw / 2, top, bw, y(0) - top, false), fill: `var(${LANG[d.lang].v})` }, g);
+    txt(g, cx, top - 6, opts.fmt(d.v), "val", "middle");
+    txt(svg, cx, H - mb + 18, LANG[d.lang].name, d.lang === "sip" ? "val" : "", "middle");
+    const hit = el("rect", { x: cx - band / 2, y: mt, width: band, height: H - mt - mb, class: "hit" }, svg);
+    hover(svg, hit, g, opts.tip(d));
+  });
+  return svg;
+}
+
+// горизонтальные столбцы
+function hbars(holder, items, opts) {
+  const W = 460, rowH = 34, ml = opts.ml || 96, mr = 56, mt = 6;
+  const H = mt + rowH * items.length + 24;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.aria }, holder);
+  const max = opts.max || niceMax(Math.max(...items.map((d) => d.v)) * 1.05);
+  const x = (v) => ml + (W - ml - mr) * v / max;
+  const bottom = mt + rowH * items.length;
+  for (const t of ticks(max)) {
+    el("line", { x1: x(t), x2: x(t), y1: mt, y2: bottom, class: t === 0 ? "axisl" : "gridl" }, svg);
+    txt(svg, x(t), bottom + 16, opts.tick ? opts.tick(t) : fmtTick(t), "muted", "middle");
+  }
+  if (opts.ref != null) {
+    el("line", { x1: x(opts.ref), x2: x(opts.ref), y1: mt - 2, y2: bottom, stroke: "var(--text-muted)", "stroke-width": 1.5 }, svg);
+  }
+  items.forEach((d, i) => {
+    const yc = mt + rowH * i + rowH / 2, bh = 20;
+    const g = el("g", { class: "mark" }, svg);
+    el("path", { d: barPath(x(0), yc - bh / 2, x(d.v) - x(0), bh, true), fill: `var(${LANG[d.lang].v})` }, g);
+    txt(g, x(d.v) + 6, yc + 4, opts.fmt(d.v), "val");
+    txt(svg, ml - 8, yc + 4, d.label || LANG[d.lang].name, d.lang === "sip" ? "val" : "", "end");
+    const hit = el("rect", { x: 0, y: yc - rowH / 2, width: W, height: rowH, class: "hit" }, svg);
+    hover(svg, hit, g, opts.tip(d));
+  });
+  return svg;
+}
+
+// ---------- данные для графиков ----------
+// all: по всем тестам, где есть язык; common: только fib и решето, где есть все четыре языка
+const speedups = {}, common = {};
+const both = SPEED.filter((t) => t.t.c);
+for (const l of ["sip", "c", "go"]) {
+  const xs = SPEED.filter((t) => t.t[l]).map((t) => t.t.py / t.t[l]);
+  speedups[l] = { geo: geo(xs), n: xs.length };
+  common[l] = geo(both.map((t) => t.t.py / t.t[l]));
+}
+const tokTotal = { sip: 0, py: 0, go: 0 };
+for (const t of TOKENS) for (const l of ["sip", "py", "go"]) tokTotal[l] += t[l];
+
+function drawTiles() {
+  const best = Math.max(...SPEED.map((t) => t.t.py / t.t.sip));
+  const tiles = [
+    ["Быстрее Python, в среднем", fmtX(speedups.sip.geo), "среднее геометрическое по 4 тестам"],
+    ["Лучший тест", fmtX(best), "решето до 20 млн против Python"],
+    ["Токенов меньше, чем у Python", Math.round((1 - tokTotal.sip / tokTotal.py) * 100) + "%", `${tokTotal.sip} против ${tokTotal.py} на 12 задачах`],
+    ["Компилятор на Sip быстрее", fmtX(COMPILER[0].py / COMPILER[0].sip), "на исходниках самого компилятора"],
+    ["Совпадение C с эталоном", "300 из 300", "программ, байт в байт"],
+  ];
+  document.getElementById("tiles").innerHTML = tiles.map(([l, v, n]) =>
+    `<div class="tile"><div class="label">${l}</div><div class="value">${v}</div><div class="note">${n}</div></div>`).join("");
+}
+
+let showPy = true;
+function drawRuntime() {
+  const grid = document.getElementById("runtime-grid");
+  grid.innerHTML = "";
+  for (const t of SPEED) {
+    const c = document.createElement("div"); c.className = "card"; grid.appendChild(c);
+    const langs = ORDER.filter((l) => t.t[l] != null && (showPy || l !== "py"));
+    const rows = ORDER.map((l) => [LANG[l].name, t.t[l] != null ? fmtS(t.t[l]) : "—",
+      t.t[l] != null ? fmtX(t.t.py / t.t[l]) : "—"]);
+    const holder = card(c, t.name, `${t.what} · секунды, меньше — лучше`, rows, ["язык", "секунды", "к Python"]);
+    columns(holder, langs.map((l) => ({ lang: l, v: t.t[l] })), {
+      aria: `${t.name}: время работы`, fmt: fmtS,
+      tip: (d) => `${key(d.lang)}<b>${LANG[d.lang].name}</b><br>${t.name}: ${fmtS(d.v)} с<br>${d.lang === "py" ? "эталон" : fmtX(t.t.py / d.v) + " быстрее Python"}`,
+    });
+  }
+}
+
+function drawSpeedup() {
+  const items = ["sip", "c", "go"].map((l) => ({ lang: l, v: common[l] }));
+  items.push({ lang: "py", v: 1 });
+  const rows = ["sip", "c", "go"].map((l) => [LANG[l].name, fmtX(common[l]), fmtX(speedups[l].geo) + ` (${speedups[l].n})`]);
+  rows.push(["Python", "×1.0", "×1.0 (4)"]);
+  const h1 = card(document.getElementById("speedup-geo"), "Среднее ускорение: fib и решето",
+    "среднее геометрическое по двум тестам, где есть все четыре языка. По всем четырём тестам: Sip " +
+    fmtX(speedups.sip.geo) + ", Go " + fmtX(speedups.go.geo), rows, ["язык", "fib и решето", "все тесты (сколько)"]);
+  hbars(h1, items, {
+    aria: "Среднее ускорение относительно Python", fmt: fmtX, tick: (t) => "×" + fmtTick(t),
+    tip: (d) => `${key(d.lang)}<b>${LANG[d.lang].name}</b><br>${fmtX(d.v)} к Python на fib и решете`,
+  });
+
+  // по тестам: точки на логарифмической шкале
+  const host = document.getElementById("speedup-tests");
+  const rows2 = SPEED.map((t) => [t.name, ...["sip", "c", "go"].map((l) => t.t[l] ? fmtX(t.t.py / t.t[l]) : "—")]);
+  const h2 = card(host, "Ускорение по тестам", "логарифмическая шкала; больше — лучше", rows2, ["тест", "Sip", "C", "Go"]);
+  legend(h2, ["sip", "c", "go"]);
+  const W = 460, ml = 150, mr = 16, mt = 8, rowH = 40, H = mt + rowH * SPEED.length + 26;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Ускорение по тестам" }, h2);
+  const lo = Math.log(1), hi = Math.log(100);
+  const x = (v) => ml + (W - ml - mr) * (Math.log(v) - lo) / (hi - lo);
+  const bottom = mt + rowH * SPEED.length;
+  for (const t of [1, 2, 5, 10, 20, 50, 100]) {
+    el("line", { x1: x(t), x2: x(t), y1: mt, y2: bottom, class: t === 1 ? "axisl" : "gridl" }, svg);
+    txt(svg, x(t), bottom + 16, "×" + t, "muted", "middle");
+  }
+  SPEED.forEach((t, i) => {
+    const yc = mt + rowH * i + rowH / 2;
+    txt(svg, ml - 10, yc + 4, t.name, "", "end");
+    const langs = ["c", "go", "sip"].filter((l) => t.t[l]);
+    const vals = langs.map((l) => t.t.py / t.t[l]);
+    el("line", { x1: x(Math.min(...vals)), x2: x(Math.max(...vals)), y1: yc, y2: yc, class: "gridl", "stroke-width": 2 }, svg);
+    for (const l of langs) {
+      const v = t.t.py / t.t[l];
+      const g = el("g", { class: "mark" }, svg);
+      el("circle", { cx: x(v), cy: yc, r: 6, fill: `var(${LANG[l].v})`, stroke: "var(--surface-1)", "stroke-width": 2 }, g);
+      const hit = el("circle", { cx: x(v), cy: yc, r: 11, class: "hit" }, svg);
+      hover(svg, hit, g, `${key(l)}<b>${LANG[l].name}</b> · ${t.name}<br>${fmtX(v)} быстрее Python (${fmtS(t.t[l])} с против ${fmtS(t.t.py)} с)`);
+    }
+    if (t.t.sip) txt(svg, x(t.t.py / t.t.sip), yc - 11, fmtX(t.t.py / t.t.sip), "val", "middle");
+  });
+}
+
+function drawScatter() {
+  const pts = [
+    { lang: "sip", x: tokTotal.sip / tokTotal.py, y: speedups.sip.geo },
+    { lang: "go", x: tokTotal.go / tokTotal.py, y: speedups.go.geo },
+    { lang: "py", x: 1, y: 1 },
+  ];
+  const rows = pts.map((p) => [LANG[p.lang].name, p.x.toFixed(2), fmtX(p.y)]);
+  const h = card(document.getElementById("scatter"), "Ускорение к Python и объём кода к Python",
+    "по горизонтали — токены относительно Python (меньше — лучше), по вертикали — ускорение, логарифмическая шкала (больше — лучше). C не показан: токены для него не считали",
+    rows, ["язык", "токены к Python", "ускорение"]);
+  legend(h, ["sip", "go", "py"]);
+  const W = 940, H = 340, ml = 56, mr = 24, mt = 16, mb = 40;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Ускорение и токены" }, h);
+  const x = (v) => ml + (W - ml - mr) * (v - 0.4) / (1.8 - 0.4);
+  const ly = (v) => Math.log(v);
+  const y = (v) => mt + (H - mt - mb) * (1 - (ly(v) - ly(0.7)) / (ly(50) - ly(0.7)));
+  // зона «короче и быстрее Python»
+  el("rect", { x: x(0.4), y: y(50), width: x(1) - x(0.4), height: y(1) - y(50), fill: "var(--wash)" }, svg);
+  txt(svg, x(0.42), y(50) + 16, "короче и быстрее Python", "muted");
+  for (const t of [1, 2, 5, 10, 20, 50]) {
+    el("line", { x1: ml, x2: W - mr, y1: y(t), y2: y(t), class: t === 1 ? "axisl" : "gridl" }, svg);
+    txt(svg, ml - 8, y(t) + 4, "×" + t, "muted", "end");
+  }
+  for (let t = 0.4; t <= 1.81; t += 0.2) {
+    const tv = +t.toFixed(1);
+    el("line", { x1: x(tv), x2: x(tv), y1: mt, y2: H - mb, class: tv === 1 ? "axisl" : "gridl" }, svg);
+    txt(svg, x(tv), H - mb + 18, tv.toFixed(1).replace(".", ","), "muted", "middle");
+  }
+  txt(svg, (ml + W - mr) / 2, H - 4, "токены относительно Python", "muted", "middle");
+  for (const p of pts) {
+    const g = el("g", { class: "mark" }, svg);
+    el("circle", { cx: x(p.x), cy: y(p.y), r: 8, fill: `var(${LANG[p.lang].v})`, stroke: "var(--surface-1)", "stroke-width": 2 }, g);
+    txt(g, x(p.x) + 13, y(p.y) + 4, `${LANG[p.lang].name} · ${fmtX(p.y)}, ${Math.round(p.x * 100)}% токенов`, "val");
+    const hit = el("circle", { cx: x(p.x), cy: y(p.y), r: 16, class: "hit" }, svg);
+    hover(svg, hit, g, `${key(p.lang)}<b>${LANG[p.lang].name}</b><br>токены: ${Math.round(p.x * 100)}% от Python<br>ускорение: ${fmtX(p.y)}`);
+  }
+}
+
+function drawTokens() {
+  const items = ["sip", "py", "go"].map((l) => ({ lang: l, v: tokTotal[l] }));
+  const rows = items.map((d) => [LANG[d.lang].name, d.v, (d.v / tokTotal.py).toFixed(2)]);
+  const h1 = card(document.getElementById("tok-total"), "Всего токенов на 12 задачах", "меньше — лучше", rows, ["язык", "токены", "к Python"]);
+  hbars(h1, items, {
+    aria: "Токены на 12 задачах", fmt: (v) => v.toLocaleString("ru-RU"),
+    tip: (d) => `${key(d.lang)}<b>${LANG[d.lang].name}</b><br>${d.v} токенов, ${(d.v / tokTotal.py).toFixed(2)} от Python`,
+  });
+
+  const rows2 = TOKENS.map((t) => [t.task, t.sip, t.py, t.go]);
+  const h2 = card(document.getElementById("tok-tasks"), "По задачам, доля от Python",
+    "вертикальная линия — Python (1,0); меньше — лучше", rows2, ["задача", "Sip", "Python", "Go"]);
+  legend(h2, ["sip", "go"], `<span><i class="line"></i>Python</span>`);
+  const W = 460, ml = 128, mr = 14, mt = 6, rowH = 24, H = mt + rowH * TOKENS.length + 24;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Токены по задачам" }, h2);
+  const x = (v) => ml + (W - ml - mr) * v / 3.5;
+  const bottom = mt + rowH * TOKENS.length;
+  for (const t of [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5]) {
+    el("line", { x1: x(t), x2: x(t), y1: mt, y2: bottom, class: t === 0 ? "axisl" : "gridl" }, svg);
+    txt(svg, x(t), bottom + 16, String(t).replace(".", ","), "muted", "middle");
+  }
+  el("line", { x1: x(1), x2: x(1), y1: mt, y2: bottom, stroke: "var(--text-muted)", "stroke-width": 1.5 }, svg);
+  TOKENS.forEach((t, i) => {
+    const yc = mt + rowH * i + rowH / 2;
+    txt(svg, ml - 8, yc + 4, t.task, "", "end");
+    for (const l of ["go", "sip"]) {
+      const v = t[l] / t.py;
+      const g = el("g", { class: "mark" }, svg);
+      el("circle", { cx: x(v), cy: yc, r: 5, fill: `var(${LANG[l].v})`, stroke: "var(--surface-1)", "stroke-width": 2 }, g);
+      const hit = el("circle", { cx: x(v), cy: yc, r: 10, class: "hit" }, svg);
+      hover(svg, hit, g, `${key(l)}<b>${LANG[l].name}</b> · ${t.task}<br>${t[l]} токенов против ${t.py} у Python (${v.toFixed(2)})`);
+    }
+  });
+}
+
+function drawCompiler() {
+  const host = document.getElementById("cc-time");
+  const rows = COMPILER.map((c) => [c.name, fmtMs(c.sip), fmtMs(c.py), fmtX(c.py / c.sip)]);
+  const h = card(host, "Время компилятора", "миллисекунды, меньше — лучше", rows, ["программа", "Sip, мс", "Python, мс", "к Python"]);
+  legend(h, ["sip", "py"]);
+  const W = 460, ml = 150, mr = 50, mt = 6, groupH = 58, H = mt + groupH * COMPILER.length + 22;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Время компилятора" }, h);
+  const max = 800, x = (v) => ml + (W - ml - mr) * v / max;
+  const bottom = mt + groupH * COMPILER.length;
+  for (const t of ticks(max)) {
+    el("line", { x1: x(t), x2: x(t), y1: mt, y2: bottom, class: t === 0 ? "axisl" : "gridl" }, svg);
+    txt(svg, x(t), bottom + 16, fmtTick(t), "muted", "middle");
+  }
+  COMPILER.forEach((c, i) => {
+    const y0 = mt + groupH * i + 8, bh = 18;
+    txt(svg, ml - 8, y0 + 15, c.name.split(" — ")[0], "", "end");
+    txt(svg, ml - 8, y0 + 31, c.note, "muted", "end");
+    ["sip", "py"].forEach((l, j) => {
+      const yy = y0 + j * (bh + 2);
+      const g = el("g", { class: "mark" }, svg);
+      el("path", { d: barPath(x(0), yy, Math.max(x(c[l]) - x(0), 1.5), bh, true), fill: `var(${LANG[l].v})` }, g);
+      txt(g, x(c[l]) + 6, yy + 13, fmtMs(c[l]) + " мс", "val");
+      const hit = el("rect", { x: 0, y: yy, width: W, height: bh + 2, class: "hit" }, svg);
+      hover(svg, hit, g, `${key(l)}<b>${LANG[l].name === "Sip" ? "sipc (на Sip)" : "siplang (на Python)"}</b><br>${c.name}<br>${fmtMs(c[l])} мс`);
+    });
+  });
+
+  const items = COMPILER.map((c) => ({ lang: "sip", v: c.py / c.sip, label: c.name.split(" — ")[0] }));
+  const h2 = card(document.getElementById("cc-ratio"), "Во сколько раз компилятор на Sip быстрее",
+    "больше — лучше; на маленьких файлах Python тратит время в основном на свой запуск",
+    COMPILER.map((c) => [c.name, fmtX(c.py / c.sip)]), ["программа", "ускорение"]);
+  hbars(h2, items, {
+    ml: 120, aria: "Ускорение компилятора", fmt: fmtX, tick: (t) => "×" + fmtTick(t),
+    tip: (d) => `${key("sip")}<b>${d.label}</b><br>${fmtX(d.v)} быстрее Python`,
+  });
+}
+
+function drawAll() { drawTiles(); drawRuntime(); drawSpeedup(); drawScatter(); drawTokens(); drawCompiler(); }
+
+document.getElementById("py-on").onclick = () => { showPy = true; setPy(); };
+document.getElementById("py-off").onclick = () => { showPy = false; setPy(); };
+function setPy() {
+  document.getElementById("py-on").setAttribute("aria-pressed", String(showPy));
+  document.getElementById("py-off").setAttribute("aria-pressed", String(!showPy));
+  drawRuntime();
+}
+const themes = ["auto", "light", "dark"], names = { auto: "авто", light: "светлая", dark: "тёмная" };
+let ti = 0;
+document.getElementById("theme").onclick = (e) => {
+  ti = (ti + 1) % 3;
+  if (themes[ti] === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", themes[ti]);
+  e.target.textContent = "Тема: " + names[themes[ti]];
+};
+drawAll();
+</script>
+</body>
+</html>

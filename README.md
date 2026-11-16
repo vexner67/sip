@@ -23,7 +23,7 @@ fn main(path str, n = 3)
 | частоты 2 млн слов | 0.103 с | — | 0.140 с | 0.538 с |
 | сортировка 3 млн float | 0.212 с | — | 0.256 с | 1.133 с |
 
-Подробности и программы: [bench/speed](bench/speed/results.md).
+Подробности и программы: [bench/speed](bench/speed/results.md). Графики по скорости, токенам и компилятору: [bench/charts.html](bench/charts.html).
 
 Откуда скорость:
 
@@ -36,7 +36,7 @@ fn main(path str, n = 3)
 
 ## Запуск
 
-Нужны Python 3.12+ (сам компилятор) и clang или gcc.
+Нужны Python 3.12+ (сам компилятор) и clang или gcc. Компилятор на самом Sip, `selfhost/sipc.sip`, работает без Python и собирает сам себя (см. [selfhost](selfhost/README.md)).
 
 ```bash
 python3 -m siplang run examples/greet.sip Ann --times 2
@@ -97,7 +97,7 @@ async fn main()
 | [siplang/std/](siplang/std/) | стандартная библиотека на Sip: `os`, `path`, `re` |
 | [siplang/compiler.py](siplang/compiler.py) | вызов clang, раздельная компиляция, кэш объектных файлов и бинарников |
 | [siplang/cli.py](siplang/cli.py) | команда `sip` |
-| [selfhost/](selfhost/) | компилятор на самом Sip: лексер, парсер, загрузчик модулей и проверка типов совпадают с Python; генерация C пока на Python |
+| [selfhost/](selfhost/) | компилятор на самом Sip: лексер, парсер, загрузчик модулей, проверка типов и генерация C совпадают с Python байт в байт; `sipc` собирает сам себя без Python |
 
 ## Документация
 

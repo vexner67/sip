@@ -28,7 +28,23 @@ type Sig(params [Field], ret Ty)
 
 type PInfo(name str, ty Ty, default N?)
 
-type Var(name str, ty Ty, kind str)
+type Var(name str, ty Ty, kind str, cname str = "", mod str = "")
+
+# Пометки для генератора C (у Python-версии это атрибуты узлов): N.an — номер в Checker.ans.
+# f: вызываемая функция (Call), функция-значение (Name) или вложенная функция (FnDef).
+# name: bname/mname у Call, const у Name, имя варианта. kind: index_kind, iter_kind, kind у Await и Fail.
+# t: запись (ctor), тип-сумма варианта, err_type, typed у Fail; t2: sort_key_ty. i: tuple_index, номер варианта
+# в образце, tag обработчика (-1 — нет). n: recv у bmethod, msg у Fail; n2: sort_key, minmax_key, binop у
+# AugAssign; n3: as_assign.
+type WithInfo(ct Ty, enter Fn?, exit_fn Fn?, var Var?)
+
+type Ann(var Var? = nil, f Fn? = nil, cty Ty? = nil, ckind str = "", name str = "", kind str = "",
+         t Ty? = nil, t2 Ty? = nil, i int = -1, n N? = nil, n2 N? = nil, n3 N? = nil, targs [Ty] = [],
+         bound [N] = [], has_bound bool = false, flags [bool] = [], logic_bool bool = false, opt_or bool = false,
+         stringify bool = false, minmax_seq bool = false, has_try bool = false, unwrap bool = false,
+         is_nil bool = false, gather str = "", res Ty? = nil, withs [WithInfo] = [], lid str = "",
+         captures {str: Var} = {}, extra [Var] = [], pvars [Var] = [], locals [Var] = [],
+         ret Ty? = nil, depth int = 0, strs [str] = [], strs2 [str] = [], want Ty? = nil, has_sort_key bool = false)
 
 # Один вид для всех типов. k: prim, list, dict, tuple, opt, set, fn, task, tvar, tparam, record, sum, iface.
 # a — составные части: элемент, ключ и значение, элементы кортежа, параметры функции и её результат
@@ -36,12 +52,14 @@ type Var(name str, ty Ty, kind str)
 # У экземпляра Box[int] base — Box; поля, варианты и методы хранит base.
 type Ty(k str, id int, name str = "", a [Ty] = [], ref Ty? = nil, base Ty? = nil, params [Ty] = [],
         fields {str: Ty} = {}, defaults {str: N} = {}, variants {str: [Field]} = {}, methods {str: Fn} = {},
-        imethods {str: Sig} = {}, bound Ty? = nil, needs {str: bool} = {}, display str = "", mod str = "")
+        imethods {str: Sig} = {}, bound Ty? = nil, needs {str: bool} = {}, display str = "", mod str = "",
+        vdisplay {str: str} = {}, cdefaults {str: N} = {})
 
 type Fn(node N, name str, ret Ty, owner Ty? = nil, params [PInfo] = [], locals {str: Var} = {}, body [N] = [],
         state str = "new", cache bool = false, tparams [Ty] = [], allparams [Ty] = [], tscope {str: Ty} = {},
         stars {str: int} = {}, is_async bool = false, parent Fn? = nil, parent_scopes [{str: Var}] = [],
-        recvar Var? = nil, is_top bool = false)
+        recvar Var? = nil, is_top bool = false, cname str = "", mod str = "", std bool = false, extra [Var] = [],
+        has_try bool = false, captures {str: Var} = {}, nfresh int = 0, cname0 str = "")
 
 fn prim(name str) Ty = Ty("prim", nid(), name)
 
@@ -115,10 +133,18 @@ fn instantiate(base Ty, args [Ty]) Ty
     if not base.params then return base
     Ty(base.k, nid(), base.name, a=args, base=base, display=base.display)
 
+# параметр типа -> тип, пока генерируется экземпляр обобщённой функции
+SUBST: {int: Ty} = {}
+
 fn prune(t Ty) Ty
     cur = t
-    while cur.k == "tvar" and cur.ref != nil
-        cur = cur.ref
+    while true
+        if cur.k == "tvar" and cur.ref != nil
+            cur = cur.ref
+        elif cur.k == "tparam" and len(SUBST) > 0 and cur.id in SUBST
+            cur = SUBST[cur.id]
+        else
+            return cur
     cur
 
 fn is_p(t Ty, p Ty) bool = prune(t).id == p.id
@@ -257,7 +283,8 @@ NATIVE_SIGS["time.time"] = NSig([], FLOAT)
 NATIVE_SIGS["time.perf_counter"] = NSig([], FLOAT)
 NATIVE_SIGS["time.sleep"] = NSig([NUM], UNIT)
 
-NATIVE_CONSTS = {"math.pi", "math.e", "math.tau", "math.inf", "math.nan"}
+NATIVE_CONSTS = {"math.pi": "SIP_PI", "math.e": "2.718281828459045", "math.tau": "6.283185307179586",
+                 "math.inf": "(1.0 / 0.0)", "math.nan": "(0.0 / 0.0)"}
 
 BUILTINS = {"random.choice", "json.parse", "json.read", "json.stringify", "json.write", "csv.read", "csv.parse",
             "csv.write", "http.get", "http.post", "http.response_json", "random.shuffle", "print", "len", "str",
@@ -341,7 +368,7 @@ fn literal_default(e N) bool
 
 # ---------- проверка ----------
 
-type Lam(block bool, ret Ty)
+type Lam(block bool, ret Ty, a Ann)
 
 type Typed(node N, ty Ty, name str)
 
@@ -351,7 +378,8 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
              variants {str: Ty} = {}, ifaces {str: Ty} = {}, fns {str: Fn} = {}, methods [Fn] = [],
              globals {str: Var} = {}, tops [Fn] = [], cur Fn? = nil, scopes [{str: Var}] = [], lams [Lam] = [],
              typed [Typed] = [], nils [N] = [], tscope {str: Ty} = {}, inst_checks [Inst] = [],
-             all_tparams [Ty] = [])
+             all_tparams [Ty] = [], ans [Ann] = [], uid int = 0, nested [Fn] = [], mainfn Fn? = nil,
+             mod_index {str: int} = {}, tests [(str, Fn)] = [], has_tests bool = false)
 
     # ---------- общее ----------
 
@@ -386,6 +414,30 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         pass
 
     fn ty_of(n N) Ty = .tys[n.ty]
+
+    # пометки узла для генератора C (создаются при первом обращении)
+    fn A(n N) Ann
+        if n.an == 0
+            if not .ans then .ans.append(Ann())
+            .ans.append(Ann())
+            n.an = len(.ans) - 1
+        .ans[n.an]
+
+    # новое имя C; номер считается внутри текущей функции, поэтому имена в модуле
+    # не меняются, когда меняются другие модули
+    fn fresh(prefix str) str
+        if .cur == nil
+            .uid += 1
+            return "{prefix}{.uid}"
+        fi: Fn = .cur
+        fi.nfresh += 1
+        "{prefix}{fi.cname}_{fi.nfresh}"
+
+    # переменная из внешней области видимости, использованная в лямбде, копируется в её окружение
+    fn capture(v Var, level int)
+        for lam in .lams
+            if level < lam.a.depth and v.cname not in lam.a.captures then lam.a.captures[v.cname] = v
+        pass
 
     fn kinds() {str}
         out: {str} = set()
@@ -431,11 +483,15 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         if .to_iface(pw, pg, node, what, src) then return
         if src != nil and pw.k == "opt" and pg.k != "opt" and pg.k != "tvar" and pg.id != UNIT.id
             if not .to_iface(prune(pw.a[0]), pg, node, what, src) then .expect(pw.a[0], got, node, what)
+            sn: N = src
+            .A(sn).cty = want
             return
         if pg.k == "opt" and pw.k != "opt" and pw.k != "tvar"
             if src == nil or is_nil_opt(src)
                 .err("{what}: {show(want)} cannot be nil (use {show(want)}? for an optional value)", node)
             .expect(want, pg.a[0], node, what)
+            sn: N = src
+            .A(sn).cty = want
             return
         if not .unify(want, got)
             hint = if pw.id == INT.id and pg.id == FLOAT.id then " (write 0.0 for a float)" else ""
@@ -451,6 +507,8 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             .err("{what}: expected {show(pw)}, got {show(pg)}; convert it where the value is created, " +
                  "e.g. `x: {show(pw)} = ...`", node)
         if pg.k == "iface" then .err("{what}: converting {show(pg)} to {show(pw)} {UNSUPPORTED}", node)
+        sn: N = src
+        .A(sn).cty = pw
         true
 
     fn unite(items [(N, Ty)], what str) Ty
@@ -569,6 +627,8 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             elif k == "SumType"
                 st = Ty("sum", nid(), nm(s), display=dname(s), mod=.mod_of(s))
                 .type_params(st, s)
+                for v in s.kids[1].kids
+                    st.vdisplay[nm(v)] = dname(v)
                 .sums[nm(s)] = st
                 for v in s.kids[1].kids
                     if nm(v) in .variants or nm(v) in .records then .err("variant '{nm(v)}' is already defined", v)
@@ -621,8 +681,9 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                         .cur = nil
                         .expect(rt.fields[fname], .expr(node, true), node, "field '{fname}'", node)
                         .cur = saved
+                        rt.cdefaults[fname] = node
                 for m in s.kids[2].kids
-                    fi = Fn(m, nm(m), tv(), owner=rt)
+                    fi = Fn(m, nm(m), tv(), owner=rt, cname="m_{nm(s)}_{nm(m)}")
                     rt.methods[nm(m)] = fi
                     .methods.append(fi)
             elif s.kind == "SumType"
@@ -635,7 +696,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                         fs.append(Field(nm(f), .to_type(f.kids[1])))
                     st.variants[nm(v)] = fs
                 for m in s.kids[2].kids
-                    fi = Fn(m, nm(m), tv(), owner=st)
+                    fi = Fn(m, nm(m), tv(), owner=st, cname="m_{nm(s)}_{nm(m)}")
                     st.methods[nm(m)] = fi
                     .methods.append(fi)
             .tscope = {}
@@ -644,10 +705,14 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             name = nm(f)
             if name in .fns then .err("function '{name}' is already defined", f)
             if name in .records or name in .variants or name in .ifaces then .err("'{name}' is already a type", f)
-            .fns[name] = Fn(f, name, tv())
+            .fns[name] = Fn(f, name, tv(), cname="f_{name}")
         all = [fi for fi in .fns.values()] + .methods
         for fi in all
+            fi.mod = .mod_of(fi.node)
+            fi.std = .is_std(fi.mod)
             .signature(fi)
+        for i, fp in enumerate(.loader.files)
+            .mod_index[fp[1]] = i
 
         # верхний уровень: присвоенные там имена — глобальные переменные
         # у каждого модуля своя функция верхнего уровня, в порядке тел: зависимости раньше
@@ -664,9 +729,10 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             stmts = if mf in groups then groups[mf] else []
             topnode = mk("FnDef", 1, [S("<top>"), L([]), NONE(), L(stmts), parser.B(false), L([]), parser.B(false),
                                       L([])])
-            top = Fn(topnode, "<top>", UNIT, body=stmts, is_top=true)
+            idx = .mod_index.get(mf, 0)
+            top = Fn(topnode, "<top>", UNIT, body=stmts, is_top=true, cname="sip_top_{idx}", mod=mf)
             for name in assigned(stmts, .kinds())
-                .globals[name] = Var(name, tv(), "global")
+                .globals[name] = Var(name, tv(), "global", cname="g_{name}", mod=mf)
             top.locals = .globals
             .tops.append(top)
         for top in .tops
@@ -695,6 +761,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 if pt.k == "opt" and p.default != nil then pt = prune(pt.a[0])
                 if not (pt.id == INT.id or pt.id == FLOAT.id or pt.id == STR.id or pt.id == BOOL.id)
                     .err("main parameter '{p.name}' must be int, float, str or bool (or T? = nil)", mainf.node)
+            .mainfn = mainf
         pass
 
     fn type_params(base Ty, node N)
@@ -802,6 +869,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         .bind_args(e, params, what, fi.stars)
         .ensure(fi)
         targs = [m[P.id] for P in fi.allparams]
+        .A(e).targs = targs
         if fi.allparams then .inst_checks.append(Inst(fi.allparams, targs, e, what))
         subst(.call_ret(fi), m)
 
@@ -955,9 +1023,9 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         .scopes = []
         .lams = []
         .tscope = fi.tscope
-        if fi.owner != nil then fi.locals["self"] = Var("self", fi.owner, "param")
+        if fi.owner != nil then fi.locals["self"] = Var("self", fi.owner, "param", cname="self")
         for p in fi.params
-            fi.locals[p.name] = Var(p.name, p.ty, "param")
+            fi.locals[p.name] = Var(p.name, p.ty, "param", cname="v_{p.name}")
         if fi.parent != nil then fi.locals[fi.name] = fi.recvar  # рекурсивный вызов самой себя
         fi.body = tail(fi.node.kids[3].kids)
         names: [str] = []
@@ -971,7 +1039,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         more = [n for n in augs if n not in names and n not in .globals]
         names.extend(more)
         for name in names
-            if name not in fi.locals then fi.locals[name] = Var(name, tv(), "local")
+            if name not in fi.locals then fi.locals[name] = Var(name, tv(), "local", cname="v_{name}")
         start = len(.nils)
         tstart = len(.typed)
         .block(fi.body)
@@ -990,24 +1058,44 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
     fn lookup(name str) Var?
         i = len(.scopes) - 1
         while i >= 0
-            if name in .scopes[i] then return .scopes[i][name]
+            if name in .scopes[i]
+                sv = .scopes[i][name]
+                .capture(sv, i)
+                return sv
             i -= 1
         if .cur != nil
-            if name in .cur.locals then return .cur.locals[name]
-            v = .outer_var(.cur, name)
-            if v != nil then return v
+            if name in .cur.locals
+                lv = .cur.locals[name]
+                if lv.kind != "global" then .capture(lv, -1)
+                return lv
+            v = .outer_var(.cur, name, true)
+            if v != nil
+                .capture(v, -1)
+                return v
         .globals.get(name)
 
     # переменная из функции, внутри которой объявлена вложенная функция fi
-    fn outer_var(fi0 Fn, name str) Var?
+    # record: записать её в окружения (captures) всех функций по пути
+    fn outer_var(fi0 Fn, name str, record = false) Var?
         fi = fi0
+        chain: [Fn] = []
         while fi.parent != nil
+            chain.append(fi)
             par = fi.parent
+            found: Var? = nil
             i = len(fi.parent_scopes) - 1
             while i >= 0
-                if name in fi.parent_scopes[i] then return fi.parent_scopes[i][name]
+                if name in fi.parent_scopes[i]
+                    found = fi.parent_scopes[i][name]
+                    break
                 i -= 1
-            if name in par.locals and par.locals[name].kind != "global" then return par.locals[name]
+            if found == nil and name in par.locals and par.locals[name].kind != "global" then found = par.locals[name]
+            if found != nil
+                fv: Var = found
+                if record
+                    for f in chain
+                        if fv.cname not in f.captures then f.captures[fv.cname] = fv
+                return fv
             fi = par
         nil
 
@@ -1036,7 +1124,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             .cond(s.kids[0])
             .block(s.kids[1].kids)
         elif k == "For"
-            elem = .iter_elem(s.kids[1], s.kids[0])
+            elem = .iter_elem(s, s.kids[1], s.kids[0])
             .assign_to(s.kids[0], elem, s)
             .block(s.kids[2].kids)
         elif k == "Return"
@@ -1072,6 +1160,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             var = .lookup(nm(t))
             if var == nil then .err("cannot assign to '{nm(t)}'", t)
             v = .lookup(nm(t))
+            .A(t).var = v
             .set_ty(t, v.ty)
             .expect(v.ty, vt, node, "assignment to '{nm(t)}'", src)
         elif t.kind == "TupleLit"
@@ -1112,7 +1201,9 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         op = s.kids[1].s
         binop = mk("BinOp", s.line, [S(op[:len(op) - 1]), s.kids[0], s.kids[2]])
         t = .expr(binop)
+        .A(s).n2 = binop
         if prune(tt).k == "opt"
+            .A(s).n3 = mk("Assign", s.line, [L([s.kids[0]]), binop])
             .expect(tt, t, s, "'{op}'", binop)  # x += 1 для x: int? — это x = x + 1 с проверкой на nil
             return
         .expect(tt, t, s, "'{op}'")
@@ -1122,14 +1213,24 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         if not truthy_ok(t) then .err("a condition must be bool, number, str, list or dict, not {show(t)}", e)
         pass
 
-    fn iter_elem(it_node N, target N) Ty
+    fn iter_elem(holder N, it_node N, target N) Ty
         t = prune(.expr(it_node))
-        if t.id == RANGE.id then return INT
-        if t.k == "list" or t.k == "set" then return t.a[0]
-        if t.k == "dict"
-            if target.kind == "TupleLit" and len(target.kids[0].kids) == 2 then return tuple_t([t.a[0], t.a[1]])
+        a = .A(holder)
+        if t.id == RANGE.id
+            a.kind = "range"
+            return INT
+        if t.k == "list" or t.k == "set"
+            a.kind = t.k
             return t.a[0]
-        if t.id == STR.id then return STR
+        if t.k == "dict"
+            if target.kind == "TupleLit" and len(target.kids[0].kids) == 2
+                a.kind = "dict_items"
+                return tuple_t([t.a[0], t.a[1]])
+            a.kind = "dict_keys"
+            return t.a[0]
+        if t.id == STR.id
+            a.kind = "str"
+            return STR
         if t.k == "tvar" then .err("cannot iterate over a value of unknown type" + .typed_hint(t), it_node)
         .err("cannot iterate over {show(t)}", it_node)
         UNIT
@@ -1159,14 +1260,20 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 # fail ValueError("bad input") — встроенный вид с сообщением
                 args = v.kids[1].kids
                 if v.kids[2].kids or len(args) > 1 then .err("{fid}() takes one message argument", v)
+                .A(s).kind = fid
+                if args then .A(s).n = args[0]
                 if args
                     if is_p(.expr(args[0]), UNIT) then .err("the error message needs a value", args[0])
                 return
         t = prune(.expr(v))
         if t.id == UNIT.id then .err("fail needs a value", s)
+        if is_gen(t) then .A(s).t = t  # ошибка-значение: ловится через catch ИмяТипа e
 
     # catch Kind: встроенный вид, запись, тип-сумма или один её вариант
     fn handler_kind(h N) Ty
+        ha = .A(h)
+        ha.t = nil
+        ha.i = -1
         if isn(h.kids[0]) then return STR
         kind = h.kids[0].s
         if kind == "Exception" then return STR
@@ -1176,15 +1283,31 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         elif kind in .sums
             t = .sums[kind]
         elif kind in .variants
-            t = .variants[kind]
+            vt: Ty = .variants[kind]
+            t = vt
+            ha.i = [v for v in vt.variants].index(kind)
         if t == nil
             if kind in ERROR_KINDS then return STR
             .err("unknown error kind '{kind}'; catch a record or sum type, or one of: " +
                  "{', '.join(ERROR_KINDS)}", h)
         if t.params then .err("catch on a generic type {UNSUPPORTED}", h)
+        ha.t = t
         t
 
+    fn mark_try()
+        .cur.has_try = true
+        if .block_lambda() then .lams[len(.lams) - 1].a.has_try = true
+        pass
+
+    # переменные генераторов и catch: в лямбде — её, иначе текущей функции
+    fn add_extra(v Var)
+        if .lams then .lams[len(.lams) - 1].a.extra.append(v) else .cur.extra.append(v)
+        pass
+
     fn s_With(s N)
+        .mark_try()
+        sa = .A(s)
+        sa.withs = []
         for item in s.kids[0].kids
             ex = item.kids[0]
             t = prune(.expr(ex))
@@ -1199,21 +1322,28 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 if fi.params then .err("{show(t)}.{mname}() must take no arguments", ex)
                 if fi.is_async then .err("{show(t)}.{mname}() cannot be async", ex)
                 .ensure(fi)
+            wvar: Var? = nil
             if not isn(item.kids[1])
                 name = item.kids[1].s
                 var = .lookup(name)
                 vt = if "enter" in ms then ms["enter"].ret else t
                 .expect(var.ty, vt, ex, "with ... as {name}")
+                wvar = var
+            sa.withs.append(WithInfo(t, ms.get("enter"), ms.get("exit"), wvar))
         .block(s.kids[1].kids)
 
     fn s_Try(s N)
+        .mark_try()
         .block(s.kids[0].kids)
         for h in s.kids[1].kids
             vt = .handler_kind(h)
             if not isn(h.kids[1]) and vt.id != STR.id
                 name = h.kids[1].s
                 hscope: {str: Var} = {}
-                hscope[name] = Var(name, vt, "comp")
+                hv = Var(name, vt, "comp", cname=.fresh("c_{name}_"))
+                .add_extra(hv)
+                .A(h).var = hv
+                hscope[name] = hv
                 .scopes.append(hscope)
                 .block(h.kids[2].kids)
                 .scopes.pop()
@@ -1222,6 +1352,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 name = h.kids[1].s
                 var = .lookup(name)
                 .expect(var.ty, STR, h, "catch variable '{name}' (it holds the message)")
+                .A(h).var = var
             .block(h.kids[2].kids)
 
     fn pattern(p N, t0 Ty, node N, in_or bool)
@@ -1231,14 +1362,17 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         if t.k == "opt" and k != "PCapture" and k != "POr"
             if k == "PLit" and is_nil(p.kids[0])
                 .expr(p.kids[0], true)
+                .A(p).is_nil = true
                 .set_ty(p, t)
                 return
+            .A(p).unwrap = true
             .pattern(p, t.a[0], node, in_or)  # остальные образцы сначала проверяют, что значение не nil
             return
         if k == "PLit" and is_nil(p.kids[0]) then .err("pattern nil cannot match {show(t)}, which is never nil", p)
         if k == "PCapture" or k == "PStar"
             if in_or then .err("names cannot be bound inside '|' patterns", p)
             var = .lookup(nm(p))
+            .A(p).var = var
             if k == "PStar" then return  # тип проверяет PList
             .expect(var.ty, t, p, "pattern variable '{nm(p)}'")
             return
@@ -1255,21 +1389,28 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 vs = variants_of(t)
                 if pname not in vs then .err("'{pname}' is not a variant of {t.name}", p)
                 fields = vs[pname]
+                .A(p).i = [v for v in vs].index(pname)
             elif t.k == "record" and pname == t.name
                 fs = fields_of(t)
                 fields = [Field(n, fs[n]) for n in fs]
+                .A(p).i = -1
             else
                 .err("pattern {pname}(...) cannot match {show(t)}", p)
             args = p.kids[1].kids
             if len(args) > len(fields) then .err("{pname} has {len(fields)} field(s), pattern gives {len(args)}", p)
+            pa = .A(p)
+            pa.strs = []
             for fd, sub in zip(fields, args)
                 if sub.kind != "PWild" then .private(t, fd.name, p, "field")
+                pa.strs.append(fd.name)
                 .pattern(sub, fd.ty, node, in_or)
+            pa.strs2 = []
             names = [f.name for f in fields]
             for kv in p.kids[2].kids
                 kname = kv.kids[0].s
                 if kname not in names then .err("{pname} has no field '{kname}'", p)
                 .private(t, kname, p, "field")
+                pa.strs2.append(kname)
                 ft = UNIT
                 for f in fields
                     if f.name == kname then ft = f.ty
@@ -1306,12 +1447,16 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         if .lams then .err("a named fn cannot be declared inside a lambda; declare it before the lambda", s)
         if s.kids[5].kids then .err("decorators on nested functions {UNSUPPORTED}", s)
         if flag(s.kids[4]) then .err("nested async functions {UNSUPPORTED}", s)
-        fi = Fn(s, nm(s), tv(), parent=.cur, parent_scopes=.scopes[:])
+        fi = Fn(s, nm(s), tv(), parent=.cur, parent_scopes=.scopes[:], cname=.fresh("nf_{nm(s)}_"))
         .signature(fi)
         ft = fn_t([p.ty for p in fi.params], fi.ret)
-        fi.recvar = Var(nm(s), ft, "rec")
+        fi.recvar = Var(nm(s), ft, "rec", cname="rec_{fi.cname}")
         var = .lookup(nm(s))
         .expect(var.ty, ft, s, "function '{nm(s)}'")
+        sa = .A(s)
+        sa.f = fi
+        sa.var = var
+        .nested.append(fi)
         .check_fn(fi)
 
     # ---------- выражения ----------
@@ -1334,6 +1479,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         pt = prune(t)
         if not opt and pt.k == "opt"
             if is_nil(e) then .err("nil cannot be used here", e)
+            .A(e).cty = pt.a[0]
             return pt.a[0]
         t
 
@@ -1380,9 +1526,18 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
     fn e_Name(e N) Ty
         id = nm(e)
         var = .lookup(id)
-        if var != nil then return var.ty
-        if id == "True" or id == "False" then return BOOL  # привычка из Python
-        if id == "pi" or id in NATIVE_CONSTS then return FLOAT
+        if var != nil
+            .A(e).var = var
+            return var.ty
+        if id == "True" or id == "False"  # привычка из Python
+            .A(e).name = id.lower()
+            return BOOL
+        if id == "pi"
+            .A(e).name = "SIP_PI"
+            return FLOAT
+        if id in NATIVE_CONSTS
+            .A(e).name = NATIVE_CONSTS[id]
+            return FLOAT
         if id in BUILTINS and id.find(".") >= 0 then .err("'{id}' is a function; call it: {id}(...)", e)
         if id in .variants
             st = .variants[id]
@@ -1390,6 +1545,10 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             if st.params
                 st = instantiate(st, [tv() for _ in st.params])
                 .nils.append(e)  # print Empty: тип без контекста станет Opt[int]
+            ea = .A(e)
+            ea.t = st
+            ea.kind = "variant"
+            ea.name = id
             return st
         if id in .fns
             fi = .fns[id]
@@ -1397,6 +1556,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 ps = ", ".join([p.name for p in fi.params])
                 .err("generic function '{id}' cannot be used as a value; wrap it: fn({ps}) = {id}({ps})", e)
             .ensure(fi)
+            .A(e).f = fi
             return fn_t([p.ty for p in fi.params], .call_ret(fi))
         if id in BUILTINS then .err("built-in '{id}' cannot be used as a value; wrap it: fn(x) = {id}(x)", e)
         .err("unknown name '{id}'", e)
@@ -1461,6 +1621,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             if i < 0 then i += len(t.a)
             if i < 0 or i >= len(t.a) then .err("tuple index out of range", idx)
             e.s = "tuple"
+            .A(e).i = i
             return t.a[i]
         if t.k == "tvar" then .err("cannot index a value of unknown type" + .typed_hint(t), e)
         .err("cannot index {show(t)}", e)
@@ -1521,6 +1682,12 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             b: N = bound[i]
             at = .expr(b, true, p.ty)
             .expect(p.ty, at, b, "argument '{p.name}' of {what}", b)
+        ca = .A(call)
+        ca.bound = []
+        ca.has_bound = true
+        for bi in 0..len(bound) - 1
+            bn: N = bound[bi]
+            ca.bound.append(bn)
 
     # выражение в квадратных скобках Stack[int]() как тип
     fn expr_type(n N) N
@@ -1570,6 +1737,9 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             if .lookup(name) != nil then return .call_value(e)
             if name in .fns
                 fi = .fns[name]
+                ea = .A(e)
+                ea.ckind = "fn"
+                ea.f = fi
                 dn = dname(fi.node)  # имя, как в исходнике модуля
                 if fi.tparams or has_ex
                     targs = .explicit_targs(e, fi.tparams, "{dn}()", ex, has_ex)
@@ -1605,12 +1775,25 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                         .err("{show(base_of(rt))}() outside its module takes only public fields " +
                              "({if pubs == '' then 'none' else pubs}); private fields are set by the module", e)
                     .bind_args(e, pub, "{show(base_of(rt))}()", {})
+                    given = .A(e).bound
+                    gi = 0
+                    nb: [N] = []
                     for p in params
                         if p.name.startswith("_")
                             node = copy_n(p.default)
+                            nb.append(node)
+                        else
+                            nb.append(given[gi])
+                            gi += 1
+                    .A(e).bound = nb
+                    for p, node in zip(params, nb)
+                        if p.name.startswith("_")
                             .expect(p.ty, .expr(node, true, p.ty), node, "field '{p.name}'", node)
                 else
                     .bind_args(e, params, "{show(base_of(rt))}()", {})
+                ea = .A(e)
+                ea.ckind = "ctor"
+                ea.t = rt
                 return rt
             if name in .variants
                 st = .variants[name]
@@ -1618,8 +1801,16 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 if st.params then st = instantiate(st, targs)
                 params = [PInfo(fd.name, fd.ty, nil) for fd in variants_of(st)[name]]
                 .bind_args(e, params, "{name}()", {})
+                ea = .A(e)
+                ea.ckind = "variant"
+                ea.t = st
+                ea.name = name
                 return st
-            if name in BUILTINS then return .builtin(e, name, want)
+            if name in BUILTINS
+                ea = .A(e)
+                ea.ckind = "builtin"
+                ea.name = name
+                return .builtin(e, name, want)
             .err("unknown function '{name}'", e)
         if f.kind == "Attr"
             rt = prune(.expr(f.kids[0]))
@@ -1631,6 +1822,9 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             if is_gen(rt) and fname in meths(rt)
                 .private(rt, fname, e, "method")
                 fi = meths(rt)[fname]
+                ea = .A(e)
+                ea.ckind = "method"
+                ea.f = fi
                 if fi.allparams then return .generic_call(e, fi, "{show(rt)}.{fname}()", targ_map(rt))
                 .bind_args(e, fi.params, "{rt.name}.{fname}()", fi.stars)
                 .ensure(fi)
@@ -1645,10 +1839,17 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                     .err("{show(rt)} has no method '{fname}'" + extra, e)
                 sig = it.imethods[fname]
                 .bind_args(e, [PInfo(p.name, p.ty, nil) for p in sig.params], "{show(rt)}.{fname}()", {})
+                ea = .A(e)
+                ea.ckind = "imethod"
+                ea.name = fname
                 return sig.ret
             if rt.k == "tparam"
                 .err("{rt.name} has no method '{fname}': give it a bound, e.g. [{rt.name}: Iface], " +
                      "where interface Iface declares fn {fname}(...)", e)
+            ea = .A(e)
+            ea.ckind = "bmethod"
+            ea.name = fname
+            ea.n = f.kids[0]
             return .bmethod(e, rt, fname)
         .call_value(e)
 
@@ -1663,6 +1864,10 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         if len(args) != len(ps) then .err("function takes {len(ps)} argument(s), got {len(args)}", e)
         for i, a in enumerate(args)
             .expect(ps[i], .expr(a, true, ps[i]), a, "argument {i + 1}", a)
+        ea = .A(e)
+        ea.ckind = "closure"
+        ea.bound = args[:]
+        ea.has_bound = true
         fn_ret(ft)
 
     # аргумент-функция встроенного метода: map(fn(x) = ...) и т. п.
@@ -1702,9 +1907,12 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         rev = .kwarg(e, "reverse")
         if rev != nil then .expect(BOOL, .expr(rev), rev, "reverse")
         keyf = .kwarg(e, "key")
+        ea = .A(e)
+        ea.n2 = keyf
         if keyf != nil
             kt = .fnarg(keyf, [elem], tv(), "{what} key")
             if not comparable(kt) then .err("{what} key must be comparable, not {show(kt)}", keyf)
+            ea.t2 = kt
         elif not comparable(elem)
             .err("cannot sort {show(elem)}", e)
         pass
@@ -1785,17 +1993,20 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             keyf = .kwarg(e, "key")
             if len(ts) == 1
                 elem = .seq_elem(e, ts[0], name)
+                .A(e).n2 = keyf
                 if keyf != nil
                     kt = .fnarg(keyf, [elem], tv(), "{name}() key")
                     if not comparable(kt) then .err("{name}() key must be comparable, not {show(kt)}", keyf)
                 elif not comparable(elem)
                     .err("{name}() cannot compare {show(elem)}", e)
+                .A(e).minmax_seq = true
                 return elem
             if keyf != nil then .err("{name}(..., key:) works with one list argument", e)
             t = ts[0]
             for i in 1..len(ts) - 1
                 t = .join(t, ts[i], .arg(e, i), "{name}() arguments")
             if not comparable(t) then .err("{name}() cannot compare {show(t)}", e)
+            .A(e).minmax_seq = false
             return t
         if name == "sum" or name == "avg"
             elem = .seq_elem(e, .args(e, name, 1)[0], name)
@@ -2098,8 +2309,13 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             pl = prune(lt)
             pr = prune(rt)
             if op == "or" and pl.k == "opt" and pr.k != "opt" and pr.k != "tvar" and .compatible(pl.a[0], pr)
-                return .join(pl.a[0], rt, e, "'or'")  # name or "anon": nil заменяется вторым
-            if not .compatible(lt, rt) then return BOOL  # x and x.n > 0: в условии важна только истинность
+                .A(e).opt_or = true  # name or "anon": nil заменяется вторым
+                res = .join(pl.a[0], rt, e, "'or'")
+                .A(right).cty = res
+                return res
+            if not .compatible(lt, rt)
+                .A(e).logic_bool = true  # x and x.n > 0: в условии важна только истинность
+                return BOOL
             return .unite([(left, lt), (right, rt)], "'{op}'")
         lt = .expr(left)
         rt = .expr(right)
@@ -2144,6 +2360,8 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             if o.kids[0].s not in ["==", "!=", "is", "is not"] then eqish = false
         left = .expr(e.kids[0], eqish)
         lnode = e.kids[0]
+        ea = .A(e)
+        ea.flags = []
         for o in ops
             op = o.kids[0].s
             right = o.kids[1]
@@ -2156,9 +2374,11 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                     .unify(po, opt_t(tv()))
                 elif po.k != "opt"
                     .err("{show(ot)} is never nil", e)
+                ea.flags.append(true)
                 left = rt
                 lnode = right
                 continue
+            ea.flags.append(false)
             if op == "is" or op == "is not" then .err("'{op}' works only with nil; use == or !=", e)
             if (op == "==" or op == "!=") and (prune(left).k == "opt" or prune(rt).k == "opt")
                 .unite([(lnode, left), (right, rt)], "'{op}'")
@@ -2210,6 +2430,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         # `if ... then "Fizz" else i`: ветки разных типов, одна из них str -> обе в str
         if (is_resolved(a) and is_resolved(b) and (pa.id == STR.id or pb.id == STR.id) and not same(a, b) and
                 pa.k != "opt" and pb.k != "opt")
+            .A(e).stringify = true
             return STR
         .unite([(e.kids[1], a), (e.kids[2], b)], "if-expression branches")
 
@@ -2272,7 +2493,7 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
         scope: {str: Var} = {}
         .scopes.append(scope)
         for c in e.kids[3].kids
-            elem = .iter_elem(c.kids[1], c.kids[0])
+            elem = .iter_elem(c, c.kids[1], c.kids[0])
             .bind_comp_target(c.kids[0], elem, scope, c)
             for cd in c.kids[2].kids
                 .cond(cd)
@@ -2291,7 +2512,10 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
 
     fn bind_comp_target(t N, ty Ty, scope {str: Var}, node N)
         if t.kind == "Name"
-            scope[nm(t)] = Var(nm(t), ty, "comp")
+            v = Var(nm(t), ty, "comp", cname=.fresh("c_{nm(t)}_"))
+            scope[nm(t)] = v
+            .add_extra(v)
+            .A(t).var = v
             .set_ty(t, ty)
         elif t.kind == "TupleLit"
             pt = prune(ty)
@@ -2321,12 +2545,18 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                     .err("parameter '{params[i]}' is {show(a)}, but the function gets {show(wps[i])}", e)
         for i, t in enumerate(ptypes)
             if not is_resolved(t) then .err("cannot infer the type of '{params[i]}'; write fn({params[i]} int) = ...", e)
+        ea = .A(e)
+        ea.lid = .fresh("")
+        ea.captures = {}
+        ea.extra = []
+        ea.pvars = [Var(n, ptypes[i], "lparam", cname="a{ea.lid}_{n}") for i, n in enumerate(params)]
+        ea.depth = len(.scopes)
         scope: {str: Var} = {}
-        for i, n in enumerate(params)
-            scope[n] = Var(n, ptypes[i], "lparam")
+        for v in ea.pvars
+            scope[v.name] = v
         if not isn(e.kids[3]) then return .lambda_block(e, scope, ptypes, pw, has_fn)
         .scopes.append(scope)
-        .lams.append(Lam(false, UNIT))
+        .lams.append(Lam(false, UNIT, ea))
         rt = .expr(e.kids[1], true)
         .lams.pop()
         .scopes.pop()
@@ -2350,15 +2580,19 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
             if .cur != nil
                 if not .cur.is_top and n in .cur.locals then outer = true
             if outer then .err("a lambda cannot change the outer variable '{n}'; return the new value instead", e)
+        ea = .A(e)
         locals: [Var] = []
         for n in names
             if n not in scope
-                v = Var(n, tv(), "local")
+                v = Var(n, tv(), "local", cname="a{ea.lid}_{n}")
                 scope[n] = v
                 locals.append(v)
+        ea.locals = locals
         ret = if has_fn then fn_ret(pw) else tv()
+        ea.ret = ret
+        ea.has_try = false
         .scopes.append(scope)
-        .lams.append(Lam(true, ret))
+        .lams.append(Lam(true, ret, ea))
         start = len(.nils)
         .block(body)
         .lams.pop()
@@ -2396,16 +2630,22 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
                 a.kids[0] = S("list")
                 lt = prune(.expr(a))
                 res = fn_ret(prune(lt.a[0]))
+                .A(e).gather = "fns"
             else
                 lt = prune(.expr(a))
                 if not (lt.k == "list" and prune(lt.a[0]).k == "task")
                     .err("await all() needs a list of tasks (calls of async fn) or a generator, " +
                          "not {show(lt)}", a)
                 res = prune(lt.a[0]).a[0]
+                .A(e).gather = "tasks"
+            .A(e).res = res
             return if is_p(res, UNIT) then UNIT else list_t(res)
         t = .expr(v, true)
         pt = prune(t)
-        if pt.k == "task" then return pt.a[0]
+        if pt.k == "task"
+            .A(e).kind = "task"
+            return pt.a[0]
+        .A(e).kind = "value"
         t  # await обычного значения (например, http.get) — само значение
 
 # ---------- запуск ----------
