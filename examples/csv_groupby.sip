@@ -1,12 +1,8 @@
+type Row(name str, dept str, salary float)
+
 fn avg_salary_by_dept(path str) {str: float}
-    lines = read(path).splitlines()
-    head = lines[0].split(",")
-    dept, salary = head.index("dept"), head.index("salary")
-    groups: {str: [float]} = {}
-    for line in lines[1:]
-        cols = line.split(",")
-        groups[cols[dept]] = groups.get(cols[dept], []) + [float(cols[salary])]
-    {d: avg(xs) for d, xs in groups}
+    rows: [Row] = csv.read(path)
+    {dept: avg(r.salary for r in group) for dept, group in rows.group_by(fn(r) = r.dept)}
 
 fn main(path str)
     for dept, salary in avg_salary_by_dept(path)

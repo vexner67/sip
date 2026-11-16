@@ -7,13 +7,17 @@
 
 from __future__ import annotations
 
+import copy
+
 from .errors import SipError
 from .nodes import *  # noqa: F403
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SumT, TupleT,
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SetT, SumT, TaskT,
+                    TupleT,
                     TVar, comparable, deep, hashable, is_resolved, opt, prune, same, show, truthy_ok)
 
 ERROR_KINDS = ["Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
-               "ZeroDivisionError", "AssertionError", "IOError", "NilError"]
+               "ZeroDivisionError", "AssertionError", "IOError", "NilError",
+               "HttpError"]
 CATCH_ALL = {"Exception"}
 
 UNSUPPORTED = "is not supported by the native compiler yet"
@@ -102,19 +106,26 @@ def literal_default(e) -> bool:
 
 
 class Checker:
-    def __init__(self, file: str = "<input>"):
+    def __init__(self, file: str = "<input>", srcmap=None):
         self.file = file
+        self.srcmap = srcmap
         self.p = Program()
         self.cur: FnInfo | None = None
         self.scopes: list = []
         self.uid = 0
         self.lambdas: list = []  # лямбды, тело которых проверяется сейчас (вложенные — в конце)
+        self.nested: list = []   # вложенные функции (FnInfo)
+        self.typed: list = []    # json.parse и т.п.: тип результата берётся из контекста
         self.nils: list = []     # литералы nil: тип без контекста потом станет int?
 
     # ---------- общее ----------
 
     def err(self, msg: str, node=None):
-        raise SipError(msg, getattr(node, "line", 0) or 0, 0, self.file)
+        line = getattr(node, "line", 0) or 0
+        file = self.file
+        if self.srcmap is not None and line:
+            file, line = self.srcmap.locate(line)
+        raise SipError(msg, line, 0, file)
 
     def fresh(self, prefix: str) -> str:
         self.uid += 1
@@ -140,9 +151,13 @@ class Checker:
             return len(a.items) == len(b.items) and all(self.unify(x, y) for x, y in zip(a.items, b.items))
         if isinstance(a, OptT):
             return self.unify(a.inner, b.inner)
+        if isinstance(a, SetT):
+            return self.unify(a.elem, b.elem)
         if isinstance(a, FnT):
             return (len(a.params) == len(b.params) and all(self.unify(x, y) for x, y in zip(a.params, b.params))
                     and self.unify(a.ret, b.ret))
+        if isinstance(a, TaskT):
+            return self.unify(a.ret, b.ret)
         return False  # разные Prim, разные записи
 
     def expect(self, want, got, node, what: str, src=None):
@@ -214,10 +229,14 @@ class Checker:
             simple = {"int": INT, "float": FLOAT, "bool": BOOL, "str": STR}
             if n in simple and not t.args:
                 return simple[n]
+            if n == "http.Response":
+                return RESPONSE
             if n in self.p.records:
                 return self.p.records[n]
             if n in self.p.sums:
                 return self.p.sums[n]
+            if n == "Response":
+                return RESPONSE
             if n in ("list", "dict", "tuple"):
                 self.err(f"write {'[T]' if n == 'list' else '{K: V}' if n == 'dict' else '(A, B)'} "
                          f"instead of '{n}'", t)
@@ -233,6 +252,11 @@ class Checker:
             return DictT(k, self.to_type(t.value))
         if isinstance(t, TTuple):
             return TupleT([self.to_type(i) for i in t.items])
+        if isinstance(t, TSet):
+            el = self.to_type(t.item)
+            if not hashable(el):
+                self.err(f"set items must be int, float, bool, str or a tuple of them, not {show(el)}", t)
+            return SetT(el)
         if isinstance(t, TOptional):
             return opt(self.to_type(t.inner))
         if isinstance(t, TFn):
@@ -243,6 +267,7 @@ class Checker:
 
     def check(self, mod: Module) -> Program:
         p = self.p
+        p.nested = self.nested
         top_stmts = []
         fn_nodes = []
         for s in mod.body:
@@ -250,10 +275,13 @@ class Checker:
                 if s.name in p.records or s.name in p.sums:
                     self.err(f"type '{s.name}' is already defined", s)
                 p.records[s.name] = RecordT(s.name)
+                p.records[s.name].display = getattr(s, "display", s.name)
             elif isinstance(s, SumType):
                 if s.name in p.records or s.name in p.sums:
                     self.err(f"type '{s.name}' is already defined", s)
                 st = SumT(s.name)
+                st.display = getattr(s, "display", s.name)
+                st.vdisplay = {v.name: getattr(v, "display", v.name) for v in s.variants}
                 p.sums[s.name] = st
                 for v in s.variants:
                     if v.name in p.variants or v.name in p.records:
@@ -281,6 +309,13 @@ class Checker:
                         if not literal_default(f.default):
                             self.err("default value must be a literal", f.default)
                         rt.defaults[f.name] = f.default
+                        # проверенная копия — для полей, которых нет в JSON/CSV
+                        node = copy.deepcopy(f.default)
+                        saved, self.cur = self.cur, None
+                        self.expect(rt.fields[f.name], self.expr(node, opt=True), node, f"field '{f.name}'", src=node)
+                        self.cur = saved
+                        rt.cdefaults = getattr(rt, "cdefaults", {})
+                        rt.cdefaults[f.name] = node
                 for m in s.methods:
                     fi = FnInfo(m, f"m_{s.name}_{m.name}", rt)
                     rt.methods[m.name] = fi
@@ -328,6 +363,7 @@ class Checker:
             self.check_fn(fi)
 
         self.default_nils(0)
+        self.check_typed(0)
         for name, v in p.globals.items():
             self.need_resolved(v.ty, None, f"global '{name}'")
         if "main" in p.fns:
@@ -344,8 +380,41 @@ class Checker:
     def default_nils(self, start: int):
         """nil, тип которого ничто не уточнило (print nil, (1, nil)), хранится как int?."""
         for n in self.nils[start:]:
-            if not is_resolved(n.ty):
-                self.unify(prune(n.ty).inner, INT)
+            self.default_tvars(n.ty)
+
+    def typed_result(self, e, name: str):
+        t = TVar()
+        self.typed.append((e, t, name))
+        return t
+
+    def typed_hint(self, t) -> str:
+        for _, tt, name in self.typed:
+            if prune(tt) is prune(t):
+                ex = "r.json()" if name == ".json" else f"{name}(...)"
+                return f"; {ex} needs the type from the context, e.g. `data: {{str: int}} = {ex}`"
+        return ""
+
+    def check_typed(self, start: int):
+        for e, t, name in self.typed[start:]:
+            if not is_resolved(t):
+                ex = "r.json()" if name == ".json" else f"{name}(...)"
+                self.err(f"{ex}: cannot infer the result type; give it one, e.g. "
+                         f"`users: [User] = {ex}` or a function return type", e)
+
+    def default_tvars(self, t):
+        t = prune(t)
+        if isinstance(t, TVar):
+            t.ref = INT
+        elif isinstance(t, (ListT, SetT)):
+            self.default_tvars(t.elem)
+        elif isinstance(t, DictT):
+            self.default_tvars(t.key)
+            self.default_tvars(t.val)
+        elif isinstance(t, OptT):
+            self.default_tvars(t.inner)
+        elif isinstance(t, TupleT):
+            for i in t.items:
+                self.default_tvars(i)
 
     def default_type(self, e):
         if not literal_default(e):
@@ -357,8 +426,9 @@ class Checker:
 
     def signature(self, fi: FnInfo):
         n = fi.node
-        if n.is_async:
-            self.err(f"async functions {UNSUPPORTED}", n)
+        fi.is_async = n.is_async
+        if n.is_async and n.decorators:
+            self.err("@cache cannot be used on an async fn", n)
         for d in n.decorators:
             if isinstance(d, Name) and d.id == "cache":
                 fi.cache = True
@@ -400,17 +470,24 @@ class Checker:
             fi.locals["self"] = Var("self", fi.owner, "self", "param")
         for name, t, _ in fi.params:
             fi.locals[name] = Var(name, t, f"v_{name}", "param")
+        if getattr(fi, "parent", None) is not None:
+            fi.locals[fi.name] = fi.recvar  # рекурсивный вызов самой себя
         fi.body = tail(fi.node.body)
         augs: list = []
         names = self.assigned(fi.body, augs)
+        for n in augs:
+            if n not in names and n not in fi.locals and self.outer_var(fi, n, False) is not None:
+                self.err(f"a nested function cannot change the outer variable '{n}'; "
+                         f"return the new value instead", fi.node)
         # `count += 1` без `count = ...` в функции меняет глобальную переменную
         names += [n for n in augs if n not in names and n not in self.p.globals]
         for name in names:
             if name not in fi.locals:
                 fi.locals[name] = Var(name, TVar(), f"v_{name}", "local")
-        start = len(self.nils)
+        start, tstart = len(self.nils), len(self.typed)
         self.block(fi.body)
         self.default_nils(start)
+        self.check_typed(tstart)
         if isinstance(prune(fi.ret), TVar):
             fi.ret.ref = UNIT
         for v in fi.locals.values():
@@ -455,7 +532,9 @@ class Checker:
 
         def walk(ss):
             for s in ss:
-                if isinstance(s, (Assign,)):
+                if isinstance(s, FnDef):
+                    add(s.name)  # вложенная функция — локальная переменная-замыкание
+                elif isinstance(s, (Assign,)):
                     for t in s.targets:
                         target(t)
                 elif isinstance(s, AugAssign) and augs is not None and isinstance(s.target, Name):
@@ -498,7 +577,33 @@ class Checker:
             if var.kind != "global":
                 self.capture(var, -1)
             return var
+        if self.cur is not None:
+            var = self.outer_var(self.cur, name, True)
+            if var is not None:
+                self.capture(var, -1)
+                return var
         return self.p.globals.get(name)
+
+    def outer_var(self, fi, name: str, record: bool):
+        """Переменная из функции, внутри которой объявлена вложенная функция fi."""
+        chain = []
+        while getattr(fi, "parent", None) is not None:
+            chain.append(fi)
+            par = fi.parent
+            found = None
+            for sc in reversed(fi.parent_scopes):
+                if name in sc:
+                    found = sc[name]
+                    break
+            if found is None and name in par.locals and par.locals[name].kind != "global":
+                found = par.locals[name]
+            if found is not None:
+                if record:
+                    for f in chain:
+                        f.captures.setdefault(found.cname, found)
+                return found
+            fi = par
+        return None
 
     def capture(self, var, level: int):
         """Переменная из внешней области видимости, использованная в лямбде, копируется в её окружение."""
@@ -596,6 +701,9 @@ class Checker:
         if isinstance(t, ListT):
             holder.iter_kind = "list"
             return t.elem
+        if isinstance(t, SetT):
+            holder.iter_kind = "set"
+            return t.elem
         if isinstance(t, DictT):
             if isinstance(target, TupleLit) and len(target.items) == 2:
                 holder.iter_kind = "dict_items"
@@ -606,7 +714,7 @@ class Checker:
             holder.iter_kind = "str"
             return STR
         if isinstance(t, TVar):
-            self.err("cannot iterate over a value of unknown type", it_node)
+            self.err("cannot iterate over a value of unknown type" + self.typed_hint(t), it_node)
         self.err(f"cannot iterate over {show(t)}", it_node)
 
     def s_For(self, s):
@@ -746,7 +854,23 @@ class Checker:
         self.err(f"this pattern {UNSUPPORTED}", p)
 
     def s_FnDef(self, s):
-        self.err(f"nested functions {UNSUPPORTED}", s)
+        """Вложенная функция: замыкание с телом-блоком, видит переменные снаружи."""
+        if s.decorators:
+            self.err(f"decorators on nested functions {UNSUPPORTED}", s)
+        if s.is_async:
+            self.err(f"nested async functions {UNSUPPORTED}", s)
+        fi = FnInfo(s, self.fresh(f"nf_{s.name}_"))
+        fi.parent = self.cur
+        fi.parent_scopes = list(self.scopes)
+        fi.captures = {}
+        self.signature(fi)
+        ft = FnT([t for _, t, _ in fi.params], fi.ret)
+        fi.recvar = Var(s.name, ft, f"rec_{fi.cname}", "rec")
+        var = self.lookup(s.name)
+        self.expect(var.ty, ft, s, f"function '{s.name}'")
+        s.fi, s.var = fi, var
+        self.nested.append(fi)
+        self.check_fn(fi)
 
     def s_Record(self, s):
         self.err("types must be defined at the top level", s)
@@ -763,6 +887,8 @@ class Checker:
             m = getattr(self, "e_" + type(e).__name__, None)
             if m is None:
                 self.err(f"{type(e).__name__.lower()} {UNSUPPORTED}", e)
+            if want is not None and isinstance(e, Call):
+                e.want = want  # тип из контекста: csv.read и т.п.
             t = m(e)
         e.ty = t
         pt = prune(t)
@@ -803,6 +929,11 @@ class Checker:
         if e.id == "pi":
             e.const = "SIP_PI"
             return FLOAT
+        if e.id in NATIVE_CONSTS:
+            e.const = NATIVE_CONSTS[e.id]
+            return FLOAT
+        if e.id in BUILTINS and "." in e.id:
+            self.err(f"'{e.id}' is a function; call it: {e.id}(...)", e)
         if e.id in self.p.variants:
             st = self.p.variants[e.id]
             if st.variants[e.id]:
@@ -814,14 +945,21 @@ class Checker:
             if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                 self.check_fn(fi)
             e.fnref = fi
-            return FnT([t for _, t, _ in fi.params], fi.ret)
+            return FnT([t for _, t, _ in fi.params], self.call_ret(fi))
         if e.id in BUILTINS:
             self.err(f"built-in '{e.id}' cannot be used as a value; wrap it: fn(x) = {e.id}(x)", e)
         self.err(f"unknown name '{e.id}'", e)
 
-    def e_SelfAttr(self, e):
+    def owner(self):
+        """Тип, чей метод сейчас проверяется (в том числе изнутри вложенной функции)."""
         fi = self.cur
-        if fi is None or fi.owner is None:
+        while fi is not None and fi.owner is None:
+            fi = getattr(fi, "parent", None)
+        return fi
+
+    def e_SelfAttr(self, e):
+        fi = self.owner()
+        if fi is None:
             self.err(f"'.{e.name}' used outside a method", e)
         if not isinstance(fi.owner, RecordT) or e.name not in fi.owner.fields:
             self.err(f"{show(fi.owner)} has no field '{e.name}'", e)
@@ -875,7 +1013,7 @@ class Checker:
             e.tuple_index = i
             return t.items[i]
         if isinstance(t, TVar):
-            self.err("cannot index a value of unknown type", e)
+            self.err("cannot index a value of unknown type" + self.typed_hint(t), e)
         self.err(f"cannot index {show(t)}", e)
 
     def bind_args(self, call, params, what):
@@ -903,8 +1041,7 @@ class Checker:
 
     def e_Call(self, e):
         f = e.func
-        if isinstance(f, SelfAttr) and self.cur is not None and self.cur.owner is not None \
-                and f.name in self.cur.owner.methods:
+        if isinstance(f, SelfAttr) and self.owner() is not None and f.name in self.owner().owner.methods:
             f = e.func = Attr(Name("self", line=f.line), f.name, line=f.line)  # .other() внутри метода
         if isinstance(f, Name):
             name = f.id
@@ -916,7 +1053,7 @@ class Checker:
                 e.ckind, e.fn = "fn", fi
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)  # вывести тип результата до использования
-                return fi.ret
+                return self.call_ret(fi)
             if name in self.p.records:
                 rt = self.p.records[name]
                 params = [(fn, ft, rt.defaults.get(fn)) for fn, ft in rt.fields.items()]
@@ -935,13 +1072,17 @@ class Checker:
             self.err(f"unknown function '{name}'", e)
         if isinstance(f, Attr):
             rt = prune(self.expr(f.obj))
+            if rt is RESPONSE and f.name == "json":  # r.json(): тип результата — из контекста
+                e.func = Name("http.response_json", line=f.line)
+                e.args = [f.obj, *e.args]
+                return self.e_Call(e)
             if isinstance(rt, (RecordT, SumT)) and f.name in rt.methods:
                 fi = rt.methods[f.name]
                 self.bind_args(e, fi.params, f"{rt.name}.{f.name}()")
                 e.ckind, e.fn = "method", fi
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)
-                return fi.ret
+                return self.call_ret(fi)
             if isinstance(rt, RecordT) and f.name in rt.fields:
                 return self.call_value(e)
             e.ckind, e.mname, e.recv = "bmethod", f.name, f.obj
@@ -1008,8 +1149,13 @@ class Checker:
             if spec is None:
                 self.err(f"dict has no method '{name}'", e)
             return spec(self, e, t)
+        if isinstance(t, SetT):
+            spec = SET_METHODS.get(name)
+            if spec is None:
+                self.err(f"set has no method '{name}'", e)
+            return spec(self, e, t)
         if isinstance(t, TVar):
-            self.err(f"cannot call .{name}() on a value of unknown type", e)
+            self.err(f"cannot call .{name}() on a value of unknown type" + self.typed_hint(t), e)
         self.err(f"{show(t)} has no method '{name}'", e)
 
     def e_BinOp(self, e):
@@ -1041,6 +1187,8 @@ class Checker:
             self.unify(pl, pr)
             return pl
         pl, pr = prune(lt), prune(rt)
+        if isinstance(pl, SetT) and isinstance(pr, SetT) and op in ("|", "&", "-", "^"):
+            return self.join(lt, rt, e, f"'{op}'")
         if op in ("+", "-", "*", "/", "//", "%", "**"):
             if self.numeric(pl) and self.numeric(pr):
                 return FLOAT if FLOAT in (pl, pr) else INT
@@ -1088,7 +1236,7 @@ class Checker:
                 continue
             if op in ("in", "not in"):
                 c = prune(rt)
-                if isinstance(c, ListT):
+                if isinstance(c, (ListT, SetT)):
                     self.expect(c.elem, left, e, f"'{op}'")
                 elif isinstance(c, DictT):
                     self.expect(c.key, left, e, f"'{op}'")
@@ -1103,7 +1251,7 @@ class Checker:
             else:
                 if not (self.numeric(left) and self.numeric(rt)):
                     self.join(left, rt, e, f"'{op}'")
-                if op not in ("==", "!=") and not comparable(left):
+                if op not in ("==", "!=") and not comparable(left) and not isinstance(prune(left), SetT):
                     self.err(f"cannot order {show(left)} with '{op}'", e)
             left, lnode = rt, right
         return BOOL
@@ -1145,7 +1293,10 @@ class Checker:
             if isinstance(item, Starred):
                 self.err(f"*spread {UNSUPPORTED}", item)
             items.append((item, self.expr(item, opt=True)))
-        return ListT(self.unite(items, "list items") if items else TVar())
+        if not items:
+            self.nils.append(e)  # [] без контекста (print []) станет [int]
+            return ListT(TVar())
+        return ListT(self.unite(items, "list items"))
 
     def e_TupleLit(self, e):
         return TupleT([self.expr(i, opt=True) for i in e.items])
@@ -1159,13 +1310,24 @@ class Checker:
             kt = self.join(kt, self.expr(k), k, "dict keys")
             vals.append((v, self.expr(v, opt=True)))
         vt = self.unite(vals, "dict values") if vals else TVar()
+        if not vals:
+            self.nils.append(e)
         if is_resolved(kt) and not hashable(kt):
             self.err(f"dict key type must be hashable, not {show(kt)}", e)
         return DictT(kt, vt)
 
+    def e_SetLit(self, e):
+        items = []
+        for item in e.items:
+            if isinstance(item, Starred):
+                self.err(f"*spread {UNSUPPORTED}", item)
+            items.append((item, self.expr(item)))
+        el = self.unite(items, "set items")
+        if is_resolved(el) and not hashable(el):
+            self.err(f"set items must be hashable, not {show(el)}", e)
+        return SetT(el)
+
     def e_Comp(self, e):
-        if e.kind == "set":
-            self.err(f"sets {UNSUPPORTED}", e)
         scope: dict = {}
         self.scopes.append(scope)
         for c in e.clauses:
@@ -1177,6 +1339,10 @@ class Checker:
         if prune(elt) is UNIT:
             self.err("this expression has no value", e.elt)
         result = ListT(elt)
+        if e.kind == "set":
+            if not hashable(elt):
+                self.err(f"set items must be hashable, not {show(elt)}", e.elt)
+            result = SetT(elt)
         if e.kind == "dict":
             kt = self.expr(e.key)
             result = DictT(kt, elt)
@@ -1229,19 +1395,61 @@ class Checker:
             rt = pw.ret
         return FnT(ptypes, rt)
 
+    @staticmethod
+    def call_ret(fi):
+        """Тип вызова: у async fn — задача Task[T]."""
+        return TaskT(fi.ret) if getattr(fi, "is_async", False) else fi.ret
+
     def e_Await(self, e):
-        self.err(f"await {UNSUPPORTED}", e)
+        if not getattr(e, "implicit", False):
+            node = getattr(self.cur, "node", None)
+            if self.lambdas or not getattr(node, "is_async", False):
+                where = f"'{self.cur.name}'" if isinstance(node, FnDef) and self.cur.name != "<top>" else "top-level code"
+                self.err(f"await is only allowed inside an async fn ({where} is not async; "
+                         f"write `async fn ...`, e.g. `async fn main()`)", e)
+        v = e.value
+        if isinstance(v, Call) and isinstance(v.func, Name) and v.func.id == "all" and "all" not in self.p.fns \
+                and self.lookup("all") is None:
+            if len(v.args) != 1 or v.kwargs:
+                self.err("await all() takes one argument: a list of tasks or a generator, "
+                         "e.g. await all(fetch(u) for u in urls)", e)
+            a = v.args[0]
+            if isinstance(a, Comp) and a.kind in ("gen", "list"):
+                # await all(f(x) for x in xs): каждый элемент — отдельная задача fn() = await f(x)
+                inner = Await(a.elt, line=a.elt.line)
+                inner.implicit = True
+                a.elt = Lambda([], inner, [], line=a.elt.line)
+                a.kind = "list"
+                lt = prune(self.expr(a))
+                res = prune(lt.elem).ret
+                e.gather = "fns"
+            else:
+                lt = prune(self.expr(a))
+                if not (isinstance(lt, ListT) and isinstance(prune(lt.elem), TaskT)):
+                    self.err(f"await all() needs a list of tasks (calls of async fn) or a generator, "
+                             f"not {show(lt)}", a)
+                res = prune(lt.elem).ret
+                e.gather = "tasks"
+            e.res = res
+            return UNIT if prune(res) is UNIT else ListT(res)
+        t = self.expr(v, opt=True)
+        pt = prune(t)
+        if isinstance(pt, TaskT):
+            e.kind = "task"
+            return pt.ret
+        e.kind = "value"  # await обычного значения (например, http.get) — само значение
+        return t
 
 
 # ---------- встроенные функции ----------
 
 def _seq_elem(c: Checker, e, t, what):
     t = prune(t)
-    if isinstance(t, ListT):
+    if isinstance(t, (ListT, SetT)):
         return t.elem
     if t is RANGE:
         return INT
-    c.err(f"{what}() needs a list or range, not {show(t)}", e)
+    c.err(f"{what}() needs a list, set or range, not {show(t)}", e)
 
 
 def b_print(c, e):
@@ -1256,7 +1464,7 @@ def b_print(c, e):
 def b_len(c, e):
     (t,) = c.args(e, 1)
     pt = prune(t)
-    if not (pt in (STR, RANGE) or isinstance(pt, (ListT, DictT, TupleT))):
+    if not (pt in (STR, RANGE) or isinstance(pt, (ListT, DictT, TupleT, SetT))):
         c.err(f"len() needs str, list, dict, tuple or range, not {show(t)}", e)
     return INT
 
@@ -1363,8 +1571,10 @@ def _sort_kwargs(c, e, elem, what):
 def b_sorted(c, e):
     (t,) = c.args(e, 1, kw=("reverse", "key"))
     pt = prune(t)
+    if isinstance(pt, SetT):
+        pt = ListT(pt.elem)
     if not isinstance(pt, ListT):
-        c.err(f"sorted() needs a list, not {show(t)}", e)
+        c.err(f"sorted() needs a list or set, not {show(t)}", e)
     _sort_kwargs(c, e, pt.elem, "sorted()")
     return pt
 
@@ -1380,7 +1590,24 @@ def b_list(c, e):
         return ListT(STR)
     if isinstance(pt, DictT):
         return ListT(pt.key)
+    if isinstance(pt, SetT):
+        return ListT(pt.elem)
     c.err(f"list() cannot convert {show(t)}", e)
+
+
+def b_set(c, e):
+    ts = c.args(e, 0, 1)
+    if not ts:
+        c.nils.append(e)
+        return SetT(TVar())  # set(): тип придёт из аннотации, s: {int} = set()
+    pt = prune(ts[0])
+    el = {RANGE: INT, STR: STR}.get(pt) if isinstance(pt, Prim) else \
+        pt.key if isinstance(pt, DictT) else pt.elem if isinstance(pt, (ListT, SetT)) else None
+    if el is None:
+        c.err(f"set() cannot convert {show(pt)}", e)
+    if not hashable(el):
+        c.err(f"set items must be hashable, not {show(el)}", e)
+    return SetT(el)
 
 
 def b_count(c, e):
@@ -1440,12 +1667,150 @@ def b_exit(c, e):
     return UNIT
 
 
+# ---------- встроенные модули: math, random, time ----------
+
+NATIVE_CONSTS = {"math.pi": "SIP_PI", "math.e": "2.718281828459045", "math.tau": "6.283185307179586",
+                 "math.inf": "(1.0 / 0.0)", "math.nan": "(0.0 / 0.0)"}
+NUM = "num"  # int или float
+NATIVE_SIGS = {
+    **{f"math.{n}": ([NUM], FLOAT) for n in ("sqrt", "log2", "log10", "exp", "sin", "cos", "tan", "asin",
+                                              "acos", "atan")},
+    **{f"math.{n}": ([NUM], INT) for n in ("floor", "ceil", "trunc")},
+    "math.log": ([NUM, NUM], FLOAT), "math.atan2": ([NUM, NUM], FLOAT), "math.hypot": ([NUM, NUM], FLOAT),
+    "math.pow": ([NUM, NUM], FLOAT), "math.isnan": ([NUM], BOOL), "math.isinf": ([NUM], BOOL),
+    "math.gcd": ([INT, INT], INT),
+    "random.random": ([], FLOAT), "random.randint": ([INT, INT], INT), "random.uniform": ([NUM, NUM], FLOAT),
+    "random.seed": ([INT], UNIT),
+    "time.time": ([], FLOAT), "time.perf_counter": ([], FLOAT), "time.sleep": ([NUM], UNIT),
+}
+
+
+def b_native(c, e):
+    params, ret = NATIVE_SIGS[e.bname]
+    lo = 1 if e.bname == "math.log" else len(params)
+    ts = c.args(e, lo, len(params))
+    for i, (t, want) in enumerate(zip(ts, params)):
+        if want == NUM:
+            if not c.numeric(t):
+                c.err(f"{e.bname}() needs a number, not {show(t)}", e.args[i])
+        else:
+            c.expect(want, t, e.args[i], f"{e.bname}() argument {i + 1}")
+    return ret
+
+
+def b_json_parse(c, e):
+    (t,) = c.args(e, 1)
+    c.expect(STR, t, e.args[0], f"{e.bname}() argument")
+    return c.typed_result(e, e.bname)
+
+
+def b_json_stringify(c, e):
+    c.args(e, 1, kw=("indent",), opt=True)
+    ind = c.kwarg(e, "indent")
+    if ind is not None:
+        c.expect(INT, c.expr(ind), ind, "indent")
+    return STR
+
+
+def b_json_write(c, e):
+    ts = c.args(e, 2, kw=("indent",), opt=True)
+    c.expect(STR, ts[0], e.args[0], "json.write() path", src=e.args[0])
+    ind = c.kwarg(e, "indent")
+    if ind is not None:
+        c.expect(INT, c.expr(ind), ind, "indent")
+    return UNIT
+
+
+def b_csv_read(c, e):
+    (t,) = c.args(e, 1, kw=("delimiter",))
+    c.expect(STR, t, e.args[0], f"{e.bname}() argument")
+    d = c.kwarg(e, "delimiter")
+    if d is not None:
+        c.expect(STR, c.expr(d), d, "delimiter")
+    want = getattr(e, "want", None)
+    if want is not None and not isinstance(prune(want), TVar) and isinstance(prune(want), ListT):
+        return want
+    return ListT(DictT(STR, STR))
+
+
+def b_csv_write(c, e):
+    ts = c.args(e, 2, kw=("delimiter",))
+    c.expect(STR, ts[0], e.args[0], "csv.write() path")
+    if not isinstance(prune(ts[1]), ListT):
+        c.err(f"csv.write() needs a list of rows, not {show(ts[1])}", e.args[1])
+    d = c.kwarg(e, "delimiter")
+    if d is not None:
+        c.expect(STR, c.expr(d), d, "delimiter")
+    return UNIT
+
+
+RESPONSE = RecordT("sip_Response", {"status": INT, "ok": BOOL, "text": STR, "url": STR,
+                                    "headers": DictT(STR, STR)})
+RESPONSE.display = "Response"
+
+
+def http_kw(c, e):
+    for k, v in e.kwargs:
+        if k == "timeout":
+            if not c.numeric(c.expr(v)):
+                c.err("timeout must be a number of seconds", v)
+        elif k == "headers":
+            c.expect(DictT(STR, STR), c.expr(v), v, "headers")
+        elif k == "body":
+            c.expect(STR, c.expr(v), v, "body")
+        elif k == "json":
+            c.expr(v, opt=True)
+    if c.kwarg(e, "body") is not None and c.kwarg(e, "json") is not None:
+        c.err("http.post(): give either body: or json:, not both", e)
+
+
+def b_http_get(c, e):
+    (t,) = c.args(e, 1, kw=("timeout", "headers"))
+    c.expect(STR, t, e.args[0], "http.get() url")
+    http_kw(c, e)
+    return RESPONSE
+
+
+def b_http_post(c, e):
+    (t,) = c.args(e, 1, kw=("timeout", "headers", "body", "json"))
+    c.expect(STR, t, e.args[0], "http.post() url")
+    http_kw(c, e)
+    return RESPONSE
+
+
+def b_http_response_json(c, e):
+    e.bname = "r.json"
+    ts = c.args(e, 1)
+    e.bname = "http.response_json"
+    c.expect(RESPONSE, ts[0], e.args[0], ".json()")
+    return c.typed_result(e, ".json")
+
+
+def b_random_choice(c, e):
+    (t,) = c.args(e, 1)
+    pt = prune(t)
+    if not isinstance(pt, ListT):
+        c.err(f"random.choice() needs a list, not {show(t)}", e)
+    return pt.elem
+
+
+def b_random_shuffle(c, e):
+    (t,) = c.args(e, 1)
+    if not isinstance(prune(t), ListT):
+        c.err(f"random.shuffle() needs a list, not {show(t)}", e)
+    return UNIT
+
+
 BUILTINS = {
+    **{n: b_native for n in NATIVE_SIGS}, "random.choice": b_random_choice,
+    "json.parse": b_json_parse, "json.read": b_json_parse, "json.stringify": b_json_stringify,
+    "json.write": b_json_write, "csv.read": b_csv_read, "csv.parse": b_csv_read, "csv.write": b_csv_write,
+    "http.get": b_http_get, "http.post": b_http_post, "http.response_json": b_http_response_json, "random.shuffle": b_random_shuffle,
     "print": b_print, "len": b_len, "str": b_str, "int": b_int, "float": b_float, "bool": b_bool,
     "abs": b_abs, "min": b_minmax, "max": b_minmax, "sum": b_sum, "avg": b_avg, "any": b_anyall,
     "all": b_anyall, "sorted": b_sorted, "list": b_list, "count": b_count, "read": b_read,
     "write": b_write, "input": b_input, "round": b_round, "zip": b_zip, "enumerate": b_enumerate,
-    "exit": b_exit,
+    "exit": b_exit, "set": b_set,
 }
 
 
@@ -1648,7 +2013,22 @@ def m_dict_top(c, e, t):
     return ListT(TupleT([t.key, INT]))
 
 
+def m_dict_pop(c, e, t):
+    ts = c.args(e, 1, 2, opt=True)
+    c.expect(t.key, ts[0], e, "pop() key", src=e.args[0])
+    if len(ts) == 2:
+        c.expect(t.val, ts[1], e, "pop() default", src=e.args[1])
+    return t.val
+
+
+def m_dict_update(c, e, t):
+    (x,) = c.args(e, 1)
+    c.expect(t, x, e, "update()")
+    return UNIT
+
+
 DICT_METHODS = {
+    "pop": m_dict_pop, "update": m_dict_update, "clear": lambda c, e, t: (c.args(e, 0), UNIT)[1],
     "get": m_dict_get, "keys": lambda c, e, t: (c.args(e, 0), ListT(t.key))[1],
     "values": lambda c, e, t: (c.args(e, 0), ListT(t.val))[1],
     "items": lambda c, e, t: (c.args(e, 0), ListT(TupleT([t.key, t.val])))[1],
@@ -1656,12 +2036,37 @@ DICT_METHODS = {
 }
 
 
+def m_set_elem(result):
+    def spec(c, e, t):
+        (x,) = c.args(e, 1, opt=True)
+        c.expect(t.elem, x, e, f"{e.mname}()", src=e.args[0])
+        return result
+    return spec
+
+
+def m_set_other(result):
+    def spec(c, e, t):
+        (x,) = c.args(e, 1)
+        c.expect(t, x, e, f"{e.mname}()")
+        return result(t)
+    return spec
+
+
+SET_METHODS = {
+    "add": m_set_elem(UNIT), "remove": m_set_elem(UNIT), "discard": m_set_elem(UNIT),
+    "clear": lambda c, e, t: (c.args(e, 0), UNIT)[1], "copy": lambda c, e, t: (c.args(e, 0), t)[1],
+    "update": m_set_other(lambda t: UNIT), "union": m_set_other(lambda t: t),
+    "intersection": m_set_other(lambda t: t), "difference": m_set_other(lambda t: t),
+    "issubset": m_set_other(lambda t: BOOL),
+}
+
+
 def is_nil(e) -> bool:
     return isinstance(e, Const) and e.value == "None"
 
 
-def check_program(mod: Module, file: str = "<input>") -> Program:
-    return Checker(file).check(mod)
+def check_program(mod: Module, file: str = "<input>", srcmap=None) -> Program:
+    return Checker(file, srcmap).check(mod)
 
 
 __all__ = ["check_program", "Program", "FnInfo", "Var", "ERROR_KINDS", "tail", "Prim"]

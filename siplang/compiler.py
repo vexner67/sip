@@ -23,11 +23,10 @@ def compile_source(src: str, file: str = "<input>") -> str:
     """Sip -> текст на C. Бросает SipError с позицией в исходнике."""
     from .cgen import generate_c
     from .checker import check_program
-    from .lexer import tokenize
-    from .parser import Parser
-    module = Parser(tokenize(src, file), file).parse_module()
-    prog = check_program(module, file)
-    return generate_c(prog, file, src)
+    from .modules import load_program
+    module, srcmap = load_program(file, src)
+    prog = check_program(module, file, srcmap)
+    return generate_c(prog, file, srcmap)
 
 
 def compile_file(path: str) -> str:
@@ -41,7 +40,10 @@ def cc_build(c_code: str, out: str, extra: list[str] | None = None) -> None:
     c_path = out + ".c"
     with open(c_path, "w", encoding="utf-8") as f:
         f.write(c_code)
-    cmd = [find_cc(), *CFLAGS, *(extra or []), c_path, "-o", out, "-lm"]
+    libs = ["-lcurl"] if "\n#define SIP_USE_HTTP 1\n" in c_code else []
+    if "\n#define SIP_USE_ASYNC 1\n" in c_code:
+        libs.append("-pthread")
+    cmd = [find_cc(), *CFLAGS, *(extra or []), c_path, "-o", out, "-lm", *libs]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if os.environ.get("SIP_KEEP_C") is None:
         os.remove(c_path)

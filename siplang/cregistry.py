@@ -7,8 +7,18 @@
 
 from __future__ import annotations
 
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SumT, TupleT,
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SetT, SumT, TaskT,
+                    TupleT,
                     comparable, ctype, deep, hashable, is_ref, key)
+
+
+def show_t(t) -> str:
+    from .types import show
+    return show(t)
+
+
+def json_key(name: str) -> str:
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def fmt_call(t, sb: str, val: str) -> str:
@@ -96,10 +106,23 @@ static void {name}({ce} *a, int64_t n, bool rev) {{
 """
 
 
+class JsonTypeError(Exception):
+    """Тип нельзя перевести в JSON или прочитать из JSON."""
+
+
+def _clit(s: str) -> str:
+    """Строка Python -> литерал C и его длина в байтах."""
+    raw = s.encode()
+    out = "".join(chr(b) if 32 <= b < 127 and chr(b) not in '"\\?' else f"\\{b:03o}" for b in raw)
+    return f'"{out}", {len(raw)}'
+
+
 class Registry:
     def __init__(self):
         self.types: dict = {}   # ключ -> тип
         self.order: list = []   # ключи в порядке зависимостей
+        self.jfuncs: dict = {}  # имя функции JSON -> (прототип, тело)
+        self.const_code = None  # cgen: литерал по умолчанию -> код C (или None)
 
     def need(self, t) -> str:
         t = deep(t)
@@ -129,10 +152,14 @@ class Registry:
                     self.need(ft)
         elif isinstance(t, OptT):
             self.need(t.inner)
+        elif isinstance(t, SetT):
+            self.need(DictT(t.elem, BOOL))
         elif isinstance(t, FnT):
             for pt in t.params:
                 self.need(pt)
             self.need(t.ret)
+        elif isinstance(t, TaskT):
+            self.need(FnT([], t.ret))
         self.order.append(k)
         return k
 
@@ -142,7 +169,7 @@ class Registry:
         fwd, tuples, bodies, protos, impls = [], [], [], [], []
         for k in self.order:
             t = self.types[k]
-            if isinstance(t, (ListT, DictT, RecordT, SumT)):
+            if isinstance(t, (ListT, DictT, RecordT, SumT, TaskT)):
                 fwd.append(f"typedef struct {k}_s *{k};")
         for k in self.order:
             # значения по месту: кортежи, T? для не-ссылочных T, замыкания — в порядке зависимостей
@@ -163,8 +190,359 @@ class Registry:
                 bodies.append(body)
             protos += ps
             impls.append(im)
+        jp = [v[0] for v in self.jfuncs.values()]
+        ji = [v[1] for v in self.jfuncs.values()]
         return "\n".join(["/* ---- типы ---- */", *fwd, *tuples, *bodies,
-                          "/* ---- вспомогательные функции ---- */", *protos, *impls])
+                          "/* ---- вспомогательные функции ---- */", *protos, *impls, *jp, *ji])
+
+    # ---------- JSON ----------
+
+    def jparse(self, t) -> str:
+        """Имя функции C: sip_str -> значение типа t (весь текст — одно значение JSON)."""
+        t = deep(t)
+        dec = self.jdec(t)
+        name = f"jparse_{self.need(t)}"
+        if name not in self.jfuncs:
+            ct = ctype(t)
+            sig = f"static {ct} {name}(sip_str s, int line)"
+            self.jfuncs[name] = (sig + ";", sig + f" {{ sip_jp jp = sip_jp_new(s, line); sip_jp *p = &jp; "
+                                             f"{ct} v = {dec}; sip_jp_end(p); return v; }}")
+        return name
+
+    def jdump(self, t) -> str:
+        """Имя функции C: (значение, отступ или -1) -> строка JSON."""
+        t = deep(t)
+        enc = self.jenc(t, "v", "0")
+        name = f"jdump_{self.need(t)}"
+        if name not in self.jfuncs:
+            sig = f"static sip_str {name}({ctype(t)} v, int64_t ind)"
+            self.jfuncs[name] = (sig + ";", sig + f" {{ sip_sb sb = sip_sb_new(); sip_sb *b = &sb; {enc} "
+                                             f"return sip_sb_done(b); }}")
+        return name
+
+    # ---------- CSV ----------
+
+    CSV_SCALAR = None
+
+    def csv_cell(self, t, target: str, i: str, col: str, dflt=None) -> str:
+        """Оператор C: target = ячейка i, переведённая в t (col — имя колонки для ошибок)."""
+        t = deep(t)
+        conv = {STR: "sip_csv_cell(c, {i})", INT: "sip_csv_int(c, {i}, {col})", FLOAT: "sip_csv_float(c, {i}, {col})",
+                BOOL: "sip_csv_bool(c, {i}, {col})"}
+        if isinstance(t, OptT):
+            inner = deep(t.inner)
+            if inner not in conv:
+                raise JsonTypeError(f"CSV cells cannot hold {show_t(t)}")
+            self.need(t)
+            got = conv[inner].format(i=i, col=col)
+            return (f"if (sip_csv_cell(c, {i}).n == 0) {target} = ({key(t)}){{0}}; "
+                    f"else {target} = ({key(t)}){{true, {got}}};")
+        if t not in conv:
+            raise JsonTypeError(f"CSV cells cannot hold {show_t(t)}")
+        code = f"{target} = {conv[t].format(i=i, col=col)};"
+        if dflt is not None and t is not STR:
+            return f"if (sip_csv_cell(c, {i}).n == 0) {self.const_code(dflt, target)} else {code}"
+        return code
+
+    def csvread(self, t) -> str:
+        """Имя функции C: (текст, разделитель, строка) -> значение типа t."""
+        t = deep(t)
+        if not isinstance(t, ListT):
+            raise JsonTypeError(f"CSV is read as a list of rows, not {show_t(t)}")
+        k = self.need(t)
+        name = f"csvread_{k}"
+        if name in self.jfuncs:
+            return name
+        row = deep(t.elem)
+        rk = self.need(row)
+        head = [f"    sip_csv cv = sip_csv_new(text, delim, line); sip_csv *c = &cv;", f"    {k} out = {k}_new(0);"]
+        if isinstance(row, ListT):
+            ce = ctype(row.elem)
+            body = head + ["    while (sip_csv_row(c)) {", f"        {rk} r = {rk}_new(c->nf);",
+                           "        for (int64_t j = 0; j < c->nf; j++) {", f"            {ce} v;",
+                           "            " + self.csv_cell(row.elem, "v", "j", "(sip_str){\"\", 0}"),
+                           f"            {rk}_push(r, v);", "        }", f"        {k}_push(out, r);", "    }"]
+        elif isinstance(row, DictT):
+            if deep(row.key) is not STR:
+                raise JsonTypeError(f"CSV rows as dicts need str keys, not {show_t(row)}")
+            cv = ctype(row.val)
+            body = head + ["    if (!sip_csv_row(c)) return out;",
+                           "    sip_str *hdr = sip_csv_header(c); int64_t nh = c->nf;",
+                           "    while (sip_csv_row(c)) {", "        if (c->nf == 0) continue;",
+                           f"        {rk} r = {rk}_new();",
+                           "        for (int64_t j = 0; j < nh; j++) {", f"            {cv} v;",
+                           "            " + self.csv_cell(row.val, "v", "j", "hdr[j]"),
+                           f"            {rk}_set(r, hdr[j], v);", "        }", f"        {k}_push(out, r);", "    }"]
+        elif isinstance(row, RecordT):
+            dn = getattr(row, "display", row.name)
+            defaults = getattr(row, "cdefaults", {})
+            body = head + ["    if (!sip_csv_row(c)) return out;",
+                           "    sip_str *hdr = sip_csv_header(c); int64_t nh = c->nf;"]
+            for fn, ft in row.fields.items():
+                body.append(f"    int64_t ix_{fn} = sip_csv_col(hdr, nh, (sip_str){{{_clit(fn)}}});")
+                if not isinstance(deep(ft), OptT) and fn not in defaults:
+                    msg = f"CSV has no column '{fn}' (needed for {dn})".replace('"', '\\"')
+                    body.append(f'    if (ix_{fn} < 0) sip_raise(SIP_E_ParseError, SIP_LIT("{msg}"), line);')
+            body += ["    while (sip_csv_row(c)) {", "        if (c->nf == 0) continue;"]
+            for fn, ft in row.fields.items():
+                body.append(f"        {ctype(ft)} jf_{fn};")
+                cell = self.csv_cell(ft, f"jf_{fn}", f"ix_{fn}", f"(sip_str){{{_clit(fn)}}}", defaults.get(fn))
+                if fn in defaults:
+                    body.append(f"        if (ix_{fn} < 0) {self.const_code(defaults[fn], f'jf_{fn}')} else {cell}")
+                else:
+                    body.append(f"        {cell}")
+            args = ", ".join(f"jf_{fn}" for fn in row.fields)
+            body += [f"        {k}_push(out, {rk}_new({args}));", "    }"]
+        else:
+            raise JsonTypeError(f"CSV rows are read as [str], {{str: str}} or a record, not {show_t(row)}")
+        sig = f"static {k} {name}(sip_str text, sip_str delim, int line)"
+        self.jfuncs[name] = (sig + ";", sig + " {\n" + "\n".join(body + ["    return out;"]) + "\n}")
+        return name
+
+    def csv_put(self, t, val: str) -> str:
+        """Оператор C: дописать ячейку со значением val в sip_sb *b (разделитель dch)."""
+        t = deep(t)
+        if isinstance(t, OptT):
+            return f"if ({opt_has(t, val)}) {{ {self.csv_put(t.inner, opt_val(t, val))} }}"
+        if t is STR:
+            return f"sip_csv_put(b, {val}, dch);"
+        if isinstance(t, FnT):
+            raise JsonTypeError(f"CSV cells cannot hold {show_t(t)}")
+        self.need(t)
+        return f"{{ sip_sb tb = sip_sb_new(); {fmt_call(t, '&tb', val)} sip_csv_put(b, sip_sb_done(&tb), dch); }}"
+
+    def csvdump(self, t) -> str:
+        """Имя функции C: (строки, разделитель, строка) -> текст CSV."""
+        t = deep(t)
+        if not isinstance(t, ListT):
+            raise JsonTypeError(f"CSV is written from a list of rows, not {show_t(t)}")
+        k = self.need(t)
+        name = f"csvdump_{k}"
+        if name in self.jfuncs:
+            return name
+        row = deep(t.elem)
+        rk = self.need(row)
+        body = ["    char dch = sip_csv_delim(delim, line);", "    sip_sb sb = sip_sb_new(); sip_sb *b = &sb;"]
+        sep = "if (j) sip_sb_putc(b, dch);"
+        if isinstance(row, ListT):
+            body += ["    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
+                     f"        for (int64_t j = 0; j < r->n; j++) {{ {sep} {self.csv_put(row.elem, 'r->d[j]')} }}",
+                     '        sip_sb_put(b, "\\r\\n", 2);', "    }"]
+        elif isinstance(row, TupleT):
+            cells = " sip_sb_putc(b, dch); ".join(self.csv_put(it, f"r.f{j}") for j, it in enumerate(row.items))
+            body += ["    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
+                     f"        {cells}", '        sip_sb_put(b, "\\r\\n", 2);', "    }"]
+        elif isinstance(row, RecordT):
+            names = list(row.fields)
+            hdr = " sip_sb_putc(b, dch); ".join(f"sip_csv_put(b, (sip_str){{{_clit(fn)}}}, dch);" for fn in names)
+            cells = " sip_sb_putc(b, dch); ".join(self.csv_put(ft, f"r->f_{fn}") for fn, ft in row.fields.items())
+            body += [f"    {hdr}", '    sip_sb_put(b, "\\r\\n", 2);',
+                     "    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
+                     f"        {cells}", '        sip_sb_put(b, "\\r\\n", 2);', "    }"]
+        elif isinstance(row, DictT):
+            if deep(row.key) is not STR:
+                raise JsonTypeError(f"CSV rows as dicts need str keys, not {show_t(row)}")
+            body += ["    if (rows->n == 0) return sip_sb_done(b);", f"    {rk} h = rows->d[0];",
+                     f"    for (int64_t j = 0; j < h->n; j++) {{ {sep} sip_csv_put(b, h->e[j].k, dch); }}",
+                     '    sip_sb_put(b, "\\r\\n", 2);',
+                     "    for (int64_t i = 0; i < rows->n; i++) {", f"        {rk} r = rows->d[i];",
+                     f"        for (int64_t j = 0; j < h->n; j++) {{ {sep} "
+                     f"if ({rk}_contains(r, h->e[j].k)) {{ {self.csv_put(row.val, f'{rk}_get(r, h->e[j].k, line)')} }} }}",
+                     '        sip_sb_put(b, "\\r\\n", 2);', "    }"]
+        else:
+            raise JsonTypeError(f"CSV rows are written from lists, tuples, dicts or records, not {show_t(row)}")
+        sig = f"static sip_str {name}({k} rows, sip_str delim, int line)"
+        self.jfuncs[name] = (sig + ";", sig + " {\n" + "\n".join(body + ["    return sip_sb_done(b);"]) + "\n}")
+        return name
+
+    def http_wrap(self, rt) -> str:
+        k = self.need(rt)
+        d = self.need(DictT(STR, STR))
+        name = "sip_http_wrap"
+        if name not in self.jfuncs:
+            sig = f"static {k} {name}(sip_http_resp r)"
+            self.jfuncs[name] = (sig + ";", sig + f" {{ {d} h = {d}_new(); "
+                                 f"for (int64_t i = 0; i < r.nh; i++) {d}_set(h, r.hk[i], r.hv[i]); "
+                                 f"return {k}_new(r.status, r.status >= 200 && r.status < 300, r.body, r.url, h); }}")
+        return name
+
+    def jdec(self, t) -> str:
+        """Выражение C, которое читает значение типа t из sip_jp *p."""
+        t = deep(t)
+        prim = {INT: "sip_jp_int(p)", FLOAT: "sip_jp_float(p)", BOOL: "sip_jp_bool(p)", STR: "sip_jp_str(p)"}
+        if t in prim:
+            return prim[t]
+        if isinstance(t, Prim) or isinstance(t, FnT):
+            raise JsonTypeError(f"{show_t(t)} cannot be read from JSON")
+        k = self.need(t)
+        name = f"jdec_{k}"
+        if name not in self.jfuncs:
+            ct = ctype(t)
+            self.jfuncs[name] = (f"static {ct} {name}(sip_jp *p);", "")
+            self.jfuncs[name] = (self.jfuncs[name][0], f"static {ct} {name}(sip_jp *p) {{\n{self.jdec_body(k, t)}\n}}")
+        return f"{name}(p)"
+
+    def jdec_fields(self, fields, what) -> tuple:
+        """Чтение полей объекта: (код, имена переменных)."""
+        lines = []
+        for fn, ft, _ in fields:
+            lines.append(f"    {ctype(ft)} jf_{fn} = ({ctype(ft)}){{0}}; bool js_{fn} = false;")
+        lines.append("    sip_str k;")
+        lines.append("    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {")
+        lines.append("        int64_t m = sip_jp_path_key(p, k);")
+        for i, (fn, ft, _) in enumerate(fields):
+            lines.append(f"        {'else ' if i else ''}if (sip_str_is(k, {_clit(fn)})) "
+                         f"{{ jf_{fn} = {self.jdec(ft)}; js_{fn} = true; }}")
+        lines.append(f"        {'else ' if fields else ''}sip_jp_skip(p);")
+        lines.append("        p->path.n = m;")
+        lines.append("    }")
+        for fn, ft, dflt in fields:
+            if isinstance(deep(ft), OptT):
+                continue
+            if dflt is not None:
+                lines.append(f"    if (!js_{fn}) {self.const_code(dflt, f'jf_{fn}')}")
+            else:
+                msg = f"missing field '{fn}'".replace('"', '\\"')
+                lines.append(f'    if (!js_{fn}) sip_jp_fail(p, "{msg}");')
+        return lines, ", ".join(f"jf_{fn}" for fn, _, _ in fields)
+
+    def jdec_body(self, k, t) -> str:
+        if isinstance(t, ListT):
+            return (f'    sip_jp_want(p, \'[\', "list");\n    {k} l = {k}_new(0);\n'
+                    f"    for (int64_t i = 0; sip_jp_arr_next(p, i); i++) {{\n"
+                    f"        int64_t m = sip_jp_path_idx(p, i);\n        {k}_push(l, {self.jdec(t.elem)});\n"
+                    f"        p->path.n = m;\n    }}\n    return l;")
+        if isinstance(t, SetT):
+            d = ctype(t)
+            return (f'    sip_jp_want(p, \'[\', "list");\n    {d} s = {d}_new();\n'
+                    f"    for (int64_t i = 0; sip_jp_arr_next(p, i); i++) {{\n"
+                    f"        int64_t m = sip_jp_path_idx(p, i);\n        {d}_set(s, {self.jdec(t.elem)}, true);\n"
+                    f"        p->path.n = m;\n    }}\n    return s;")
+        if isinstance(t, DictT):
+            kt = deep(t.key)
+            if kt is STR:
+                kc = "k"
+            elif kt is INT:
+                kc = "sip_jp_key_int(p, k)"
+            else:
+                raise JsonTypeError(f"{show_t(t)} cannot be read from JSON: keys must be str or int")
+            return (f'    sip_jp_want(p, \'{{\', "dict");\n    {k} d = {k}_new();\n    sip_str k;\n'
+                    f"    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {{\n"
+                    f"        int64_t m = sip_jp_path_key(p, k);\n        {ctype(kt)} key = {kc};\n"
+                    f"        {k}_set(d, key, {self.jdec(t.val)});\n"
+                    f"        p->path.n = m;\n    }}\n    return d;")
+        if isinstance(t, OptT):
+            inner = self.jdec(t.inner)
+            if is_ref(t.inner):
+                return f"    if (sip_jp_null(p)) return NULL;\n    return {inner};"
+            return f"    if (sip_jp_null(p)) return ({k}){{0}};\n    return ({k}){{true, {inner}}};"
+        if isinstance(t, TupleT):
+            n = len(t.items)
+            lines = [f'    sip_jp_want(p, \'[\', "list");', f"    {k} r;", "    int64_t m;"]
+            for i, it in enumerate(t.items):
+                lines.append(f'    if (!sip_jp_arr_next(p, {i})) sip_jp_fail(p, "expected a list of {n} items");')
+                lines.append(f"    m = sip_jp_path_idx(p, {i}); r.f{i} = {self.jdec(it)}; p->path.n = m;")
+            lines.append(f'    if (sip_jp_arr_next(p, {n})) sip_jp_fail(p, "expected a list of {n} items");')
+            lines.append("    return r;")
+            return "\n".join(lines)
+        if isinstance(t, RecordT):
+            fields = [(fn, ft, getattr(t, "cdefaults", {}).get(fn)) for fn, ft in t.fields.items()]
+            lines, args = self.jdec_fields(fields, getattr(t, "display", t.name))
+            return "\n".join([f'    sip_jp_want(p, \'{{\', "object");', *lines, f"    return {k}_new({args});"])
+        if isinstance(t, SumT):
+            lines = ["    sip_str tag = sip_jp_tag(p);"]
+            for vname, fields in t.variants.items():
+                dn = getattr(t, "vdisplay", {}).get(vname, vname)
+                fl = [(fn, ft, None) for fn, ft in fields]
+                body, args = self.jdec_fields(fl, dn)
+                lines.append(f"    if (sip_str_is(tag, {_clit(dn)})) {{")
+                lines.append(f'        sip_jp_want(p, \'{{\', "object");')
+                lines += ["    " + x for x in body]
+                lines.append(f"        return {k}_new_{vname}({args});")
+                lines.append("    }")
+            lines.append('    sip_jp_fail(p, "unknown \\"type\\"");')
+            return "\n".join(lines)
+        raise JsonTypeError(f"{show_t(t)} cannot be read from JSON")
+
+    def jenc(self, t, v: str, d: str) -> str:
+        """Оператор C: дописать JSON значения v в sip_sb *b (отступ ind, глубина d)."""
+        t = deep(t)
+        prim = {INT: "str_int", FLOAT: "sip_je_float", BOOL: "sip_je_bool", STR: "sip_je_str"}
+        if t in prim:
+            return f"{prim[t]}(b, {v});"
+        if isinstance(t, Prim) or isinstance(t, FnT):
+            raise JsonTypeError(f"{show_t(t)} cannot be converted to JSON")
+        k = self.need(t)
+        name = f"jenc_{k}"
+        if name not in self.jfuncs:
+            ct = ctype(t)
+            sig = f"static void {name}(sip_sb *b, {ct} v, int64_t ind, int64_t d)"
+            self.jfuncs[name] = (sig + ";", "")
+            self.jfuncs[name] = (sig + ";", sig + " {\n" + self.jenc_body(k, t) + "\n}")
+        return f"{name}(b, {v}, ind, {d});"
+
+    def jenc_obj(self, items, tag=None) -> list:
+        """Объект с полями [(имя, тип, выражение)]."""
+        lines = ["    sip_sb_putc(b, '{');"]
+        first = "true"
+        if tag is not None:
+            lines.append(f"    sip_je_sep(b, ind, d + 1, true); sip_sb_put(b, {_clit(chr(34) + 'type' + chr(34) + ': ')});"
+                         f" sip_je_str(b, (sip_str){{{_clit(tag)}}});")
+            first = "false"
+        for fn, ft, ex in items:
+            lines.append(f"    sip_je_sep(b, ind, d + 1, {first}); "
+                         f"sip_sb_put(b, {_clit(json_key(fn) + ': ')}); {self.jenc(ft, ex, 'd + 1')}")
+            first = "false"
+        if items or tag is not None:
+            lines.append("    sip_je_close(b, ind, d, '}');")
+        else:
+            lines.append("    sip_sb_putc(b, '}');")
+        return lines
+
+    def jenc_body(self, k, t) -> str:
+        if isinstance(t, (ListT, SetT)):
+            if isinstance(t, ListT):
+                n, item = "v->n", "v->d[i]"
+            else:
+                n, item = "v->n", "v->e[i].k"
+            return (f"    sip_sb_putc(b, '[');\n    for (int64_t i = 0; i < {n}; i++) {{\n"
+                    f"        sip_je_sep(b, ind, d + 1, i == 0); {self.jenc(t.elem, item, 'd + 1')}\n    }}\n"
+                    f"    if ({n}) sip_je_close(b, ind, d, ']'); else sip_sb_putc(b, ']');")
+        if isinstance(t, TupleT):
+            lines = ["    sip_sb_putc(b, '[');"]
+            for i, it in enumerate(t.items):
+                lines.append(f"    sip_je_sep(b, ind, d + 1, {'true' if i == 0 else 'false'}); "
+                             + self.jenc(it, f"v.f{i}", "d + 1"))
+            lines.append("    sip_je_close(b, ind, d, ']');" if t.items else "    sip_sb_putc(b, ']');")
+            return "\n".join(lines)
+        if isinstance(t, DictT):
+            kt = deep(t.key)
+            keyw = {STR: "sip_je_str(b, v->e[i].k);",
+                    INT: "sip_sb_putc(b, '\"'); str_int(b, v->e[i].k); sip_sb_putc(b, '\"');",
+                    FLOAT: "sip_sb_putc(b, '\"'); sip_je_float(b, v->e[i].k); sip_sb_putc(b, '\"');",
+                    BOOL: "sip_sb_putc(b, '\"'); sip_je_bool(b, v->e[i].k); sip_sb_putc(b, '\"');"}.get(kt)
+            if keyw is None:
+                raise JsonTypeError(f"{show_t(t)} cannot be converted to JSON: keys must be str, int, float or bool")
+            return (f"    sip_sb_putc(b, '{{');\n    for (int64_t i = 0; i < v->n; i++) {{\n"
+                    f"        sip_je_sep(b, ind, d + 1, i == 0); {keyw} sip_sb_put(b, \": \", 2); "
+                    f"{self.jenc(t.val, 'v->e[i].v', 'd + 1')}\n    }}\n"
+                    f"    if (v->n) sip_je_close(b, ind, d, '}}'); else sip_sb_putc(b, '}}');")
+        if isinstance(t, OptT):
+            return (f"    if (!{opt_has(t, 'v')}) {{ sip_sb_put(b, \"null\", 4); return; }}\n"
+                    f"    {self.jenc(t.inner, opt_val(t, 'v'), 'd')}")
+        if isinstance(t, RecordT):
+            return "\n".join(self.jenc_obj([(fn, ft, f"v->f_{fn}") for fn, ft in t.fields.items()]))
+        if isinstance(t, SumT):
+            lines = ["    switch (v->tag) {"]
+            for idx, (vname, fields) in enumerate(t.variants.items()):
+                dn = getattr(t, "vdisplay", {}).get(vname, vname)
+                body = self.jenc_obj([(fn, ft, f"v->u.{vname}.f_{fn}") for fn, ft in fields], tag=dn)
+                lines.append(f"    case {idx}: {{")
+                lines += ["    " + x for x in body]
+                lines.append("        return;\n    }")
+            lines.append("    }")
+            return "\n".join(lines)
+        raise JsonTypeError(f"{show_t(t)} cannot be converted to JSON")
 
     # ---------- кортежи ----------
 
@@ -345,6 +723,8 @@ static int cmp_{k}({k} a, {k} b) {{
             "items": f"static {lt} {k}_items({k} d)",
             "copy": f"static {k} {k}_copy({k} d)",
             "merge": f"static {k} {k}_merge({k} a, {k} b)",
+            "discard": f"static bool {k}_discard({k} d, {ck} key)",
+            "pop": f"static {cv} {k}_pop({k} d, {ck} key, int line)",
         }
         im = f"""{sigs['new']} {{ {k} d = sip_alloc(sizeof *d); memset(d, 0, sizeof *d); return d; }}
 {sigs['find']} {{
@@ -425,6 +805,26 @@ static void repr_{k}(sip_sb *b, {k} d) {{
     }}
     sip_sb_putc(b, '}}');
 }}"""
+        im += f"""
+{sigs['discard']} {{
+    int64_t j = {k}_find(d, key, {hash_fn(t.key)}(key));
+    if (j < 0) return false;
+    memmove(&d->e[j], &d->e[j + 1], (size_t)(d->n - j - 1) * sizeof({e}));
+    d->n--;
+    {k}_rehash(d, d->icap);
+    return true;
+}}
+{sigs['pop']} {{
+    int64_t j = {k}_find(d, key, {hash_fn(t.key)}(key));
+    if (SIP_UNLIKELY(j < 0)) {{
+        sip_sb b = sip_sb_new();
+        {repr_call(t.key, "&b", "key")}
+        sip_raise(SIP_E_KeyError, sip_sb_done(&b), line);
+    }}
+    {cv} v = d->e[j].v;
+    {k}_discard(d, key);
+    return v;
+}}"""
         ps = [s + ";" for s in sigs.values()] + [
             f"static bool eq_{k}({k} a, {k} b);", f"static void repr_{k}(sip_sb *b, {k} d);"]
         if deep(t.val) is INT:
@@ -443,6 +843,57 @@ static {lt} {k}_top({k} d, int64_t n, bool has_n) {{
     return r;
 }}"""
         return body, ps, im
+
+    # ---------- множества ----------
+
+    def gen_SetT(self, k, t):
+        d = key(DictT(t.elem, BOOL))
+        ce = ctype(t.elem)
+        ps = [f"static bool eq_{k}({d} a, {d} b);", f"static void repr_{k}(sip_sb *b, {d} s);",
+              f"static bool {k}_subset({d} a, {d} b);", f"static {d} {k}_union({d} a, {d} b);",
+              f"static {d} {k}_inter({d} a, {d} b);", f"static {d} {k}_diff({d} a, {d} b);",
+              f"static {d} {k}_xor({d} a, {d} b);", f"static void {k}_update({d} a, {d} b);",
+              f"static void {k}_remove({d} s, {ce} x, int line);"]
+        im = f"""static bool {k}_subset({d} a, {d} b) {{
+    if (a->n > b->n) return false;
+    for (int64_t i = 0; i < a->n; i++) if ({d}_find(b, a->e[i].k, a->e[i].h) < 0) return false;
+    return true;
+}}
+static bool eq_{k}({d} a, {d} b) {{ return a->n == b->n && {k}_subset(a, b); }}
+static void repr_{k}(sip_sb *b, {d} s) {{
+    if (!s->n) {{ sip_sb_put(b, "set()", 5); return; }}
+    sip_sb_putc(b, '{{');
+    for (int64_t i = 0; i < s->n; i++) {{
+        if (i) sip_sb_put(b, ", ", 2);
+        {repr_call(t.elem, "b", "s->e[i].k")}
+    }}
+    sip_sb_putc(b, '}}');
+}}
+static void {k}_update({d} a, {d} b) {{ for (int64_t i = 0; i < b->n; i++) {d}_set(a, b->e[i].k, true); }}
+static {d} {k}_union({d} a, {d} b) {{ {d} r = {d}_copy(a); {k}_update(r, b); return r; }}
+static {d} {k}_inter({d} a, {d} b) {{
+    {d} r = {d}_new();
+    for (int64_t i = 0; i < a->n; i++) if ({d}_find(b, a->e[i].k, a->e[i].h) >= 0) {d}_set(r, a->e[i].k, true);
+    return r;
+}}
+static {d} {k}_diff({d} a, {d} b) {{
+    {d} r = {d}_new();
+    for (int64_t i = 0; i < a->n; i++) if ({d}_find(b, a->e[i].k, a->e[i].h) < 0) {d}_set(r, a->e[i].k, true);
+    return r;
+}}
+static {d} {k}_xor({d} a, {d} b) {{
+    {d} r = {k}_diff(a, b);
+    for (int64_t i = 0; i < b->n; i++) if ({d}_find(a, b->e[i].k, b->e[i].h) < 0) {d}_set(r, b->e[i].k, true);
+    return r;
+}}
+static void {k}_remove({d} s, {ce} x, int line) {{
+    if (SIP_UNLIKELY(!{d}_discard(s, x))) {{
+        sip_sb b = sip_sb_new();
+        {repr_call(t.elem, "&b", "x")}
+        sip_raise(SIP_E_KeyError, sip_sb_done(&b), line);
+    }}
+}}"""
+        return "", ps, im
 
     # ---------- T? ----------
 
@@ -473,14 +924,38 @@ static {lt} {k}_top({k} d, int64_t n, bool has_n) {{
 
     # ---------- записи ----------
 
+    def gen_TaskT(self, k, t):
+        ft = key(FnT([], t.ret))
+        unit = deep(t.ret) is UNIT
+        rt = ctype(t.ret)
+        body = f"struct {k}_s {{ sip_task base; {ft} fn;{'' if unit else f' {rt} result;'} }};"
+        ps = [f"static {k} {k}_new({ft} fn);", f"static {rt} {k}_await({k} t, int line);",
+              f"static bool eq_{k}({k} a, {k} b);", f"static void repr_{k}(sip_sb *b, {k} t);"]
+        run = "t->fn.fn(t->fn.env);" if unit else "t->result = t->fn.fn(t->fn.env);"
+        im = (f"static void {k}_run(sip_task *b) {{ {k} t = ({k})b; {run} }}\n"
+              f"static {k} {k}_new({ft} fn) {{ {k} t = sip_alloc(sizeof *t); memset(t, 0, sizeof *t); "
+              f"t->base.run = {k}_run; t->fn = fn; return t; }}\n"
+              f"static {rt} {k}_await({k} t, int line) {{ sip_task_await(&t->base, line);"
+              f"{'' if unit else ' return t->result;'} }}\n"
+              f"static bool eq_{k}({k} a, {k} b) {{ return a == b; }}\n"
+              f'static void repr_{k}(sip_sb *b, {k} t) {{ (void)t; sip_sb_put(b, "<task>", 6); }}')
+        return body, ps, im
+
     def gen_RecordT(self, k, t):
         fields = " ".join(f"{ctype(ft)} f_{fn};" for fn, ft in t.fields.items()) or "char _unused;"
         body = f"struct {k}_s {{ {fields} }};"
         params = ", ".join(f"{ctype(ft)} f_{fn}" for fn, ft in t.fields.items()) or "void"
         assigns = " ".join(f"r->f_{fn} = f_{fn};" for fn in t.fields)
         eq = " && ".join(eq_expr(ft, f"a->f_{fn}", f"b->f_{fn}") for fn, ft in t.fields.items()) or "true"
-        rep = [f'sip_sb_put(b, "{t.name}(", {len(t.name) + 1});']
-        for i, (fn, ft) in enumerate(t.fields.items()):
+        dn = getattr(t, "display", t.name)
+        rep = [f'sip_sb_put(b, "{dn}(", {len(dn) + 1});']
+        if t.name == "sip_Response":  # <Response 200 https://...>
+            fields_ = {}
+            rep = ['sip_sb_put(b, "<Response ", 10); str_int(b, r->f_status); sip_sb_putc(b, \' \'); '
+                   'sip_sb_str(b, r->f_url); sip_sb_putc(b, \'>\'); return;']
+        else:
+            fields_ = t.fields
+        for i, (fn, ft) in enumerate(fields_.items()):
             prefix = (", " if i else "") + fn + "="
             rep.append(f'sip_sb_put(b, "{prefix}", {len(prefix)});')
             rep.append(repr_call(ft, "b", f"r->f_{fn}"))
@@ -517,7 +992,8 @@ static {lt} {k}_top({k} d, int64_t n, bool has_n) {{
             eq = " && ".join(eq_expr(ft, f"a->u.{vname}.f_{fn}", f"b->u.{vname}.f_{fn}")
                              for fn, ft in fields) or "true"
             eq_cases.append(f"case {idx}: return {eq};")
-            rep = [f'sip_sb_put(b, "{vname}(", {len(vname) + 1});']
+            dn = getattr(t, "vdisplay", {}).get(vname, vname)
+            rep = [f'sip_sb_put(b, "{dn}(", {len(dn) + 1});']
             for i, (fn, ft) in enumerate(fields):
                 prefix = (", " if i else "") + fn + "="
                 rep.append(f'sip_sb_put(b, "{prefix}", {len(prefix)});')

@@ -55,9 +55,24 @@ pip install -e .
 
 Первая сборка занимает около 0.3 с (это clang), повторный запуск из кэша около 20 мс.
 
+## Библиотека
+
+Модули `.sip` подключаются через `import`, а встроенные модули `math`, `random`, `time`, `json`, `csv`, `http` есть всегда. JSON и CSV читаются сразу в нужный тип, без промежуточных словарей:
+
+```
+type User(name str, age int, email str? = nil)
+
+users: [User] = json.read("users.json")
+async fn get(id int) User = http.get("https://api.example.com/users/{id}").json()
+
+async fn main()
+    for u in await all(get(i) for i in 1..10)    # 10 запросов одновременно
+        print u.name
+```
+
 ## Чего пока нет
 
-Нативный компилятор ещё не поддерживает вложенные блоки `fn` (лямбды `fn(x) = ...` есть), `async`, `import` (модули Python больше не доступны), множества, `json`, `csv` и `http`. Компилятор сообщает об этом явно: `... is not supported by the native compiler yet`.
+Многострочных лямбд (вместо них — вложенные `fn`), `with` и `*args`. Компилятор сообщает об этом явно: `... is not supported by the native compiler yet`.
 
 ## Устройство
 
@@ -68,15 +83,16 @@ pip install -e .
 | [siplang/types.py](siplang/types.py) | типы и их представление в C |
 | [siplang/checker.py](siplang/checker.py) | вывод и проверка типов (унификация) |
 | [siplang/cregistry.py](siplang/cregistry.py) | C-код для конкретных списков, словарей, кортежей, записей |
+| [siplang/modules.py](siplang/modules.py) | `import`: сборка программы из нескольких файлов |
 | [siplang/cgen.py](siplang/cgen.py) | AST с типами → C |
-| [siplang/native/sip_rt.h](siplang/native/sip_rt.h) | рантайм: строки, аллокатор, ошибки (setjmp), форматирование чисел как в Python |
+| [siplang/native/sip_rt.h](siplang/native/sip_rt.h) | рантайм: строки, аллокатор, ошибки (setjmp), форматирование чисел как в Python, JSON, CSV, HTTP (libcurl), задачи |
 | [siplang/compiler.py](siplang/compiler.py) | вызов clang, кэш сборок |
 | [siplang/cli.py](siplang/cli.py) | команда `sip` |
 
 ## Документация
 
 - [docs/spec.md](docs/spec.md) — справочник языка.
-- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 840 токенов.
+- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 1100 токенов.
 - [bench/](bench/) — замер токенов, по которому выбирали синтаксис ([DECISION.md](bench/DECISION.md)), и замер скорости ([speed](bench/speed/)).
 
 ## Тесты

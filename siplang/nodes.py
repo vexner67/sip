@@ -28,6 +28,11 @@ class TDict(Node):
 
 
 @dataclass
+class TSet(Node):
+    item: Node
+
+
+@dataclass
 class TTuple(Node):
     items: list
 

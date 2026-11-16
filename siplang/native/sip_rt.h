@@ -54,11 +54,12 @@ static void *sip_realloc(void *p, size_t n) {
 
 enum {
     SIP_E_Error, SIP_E_NotFound, SIP_E_ParseError, SIP_E_IndexError, SIP_E_KeyError,
-    SIP_E_ValueError, SIP_E_ZeroDivisionError, SIP_E_AssertionError, SIP_E_IOError, SIP_E_NilError
+    SIP_E_ValueError, SIP_E_ZeroDivisionError, SIP_E_AssertionError, SIP_E_IOError, SIP_E_NilError,
+    SIP_E_HttpError
 };
 static const char *const sip_err_names[] = {
     "Error", "NotFound", "ParseError", "IndexError", "KeyError",
-    "ValueError", "ZeroDivisionError", "AssertionError", "IOError", "NilError"
+    "ValueError", "ZeroDivisionError", "AssertionError", "IOError", "NilError", "HttpError"
 };
 
 typedef struct sip_try { jmp_buf jb; struct sip_try *prev; } sip_try;
@@ -70,6 +71,30 @@ static int sip_err_line;
 static inline void sip_try_push(sip_try *t) { t->prev = sip_try_top; sip_try_top = t; }
 static inline void sip_try_pop(void) { sip_try_top = sip_try_top->prev; }
 
+/* async: задачи выполняются в потоках, но код Sip в каждый момент выполняет только один поток —
+ * тот, что держит sip_gil (как GIL в Python). Блокирующие вызовы (http, sleep) отпускают его,
+ * поэтому ожидание идёт параллельно. При смене потока сохраняется его стек try. */
+#ifdef SIP_USE_ASYNC
+#include <pthread.h>
+static pthread_mutex_t sip_gil = PTHREAD_MUTEX_INITIALIZER;
+static bool sip_threaded;
+typedef struct { sip_try *try_top; } sip_tstate;
+static inline sip_tstate sip_gil_release(void) {
+    sip_tstate st = {sip_try_top};
+    if (sip_threaded) pthread_mutex_unlock(&sip_gil);
+    return st;
+}
+static inline void sip_gil_acquire(sip_tstate st) {
+    if (sip_threaded) pthread_mutex_lock(&sip_gil);
+    sip_try_top = st.try_top;
+}
+#define SIP_BLOCKING_BEGIN sip_tstate sip_st_ = sip_gil_release();
+#define SIP_BLOCKING_END sip_gil_acquire(sip_st_);
+#else
+#define SIP_BLOCKING_BEGIN
+#define SIP_BLOCKING_END
+#endif
+
 static bool sip_kind_matches(int kind, int want) {
     if (kind == want) return true;
     return want == SIP_E_ValueError && kind == SIP_E_ParseError;  /* ParseError — частный случай */
@@ -77,7 +102,9 @@ static bool sip_kind_matches(int kind, int want) {
 
 __attribute__((noreturn, cold)) static void sip_die(void) {
     fflush(stdout);
-    fprintf(stderr, "%s:%d: %s", SIP_FILE, sip_err_line, sip_err_names[sip_err_kind]);
+    int f = 0;
+    while (f + 1 < SIP_NFILES && SIP_FILES[f + 1].start < sip_err_line) f++;
+    fprintf(stderr, "%s:%d: %s", SIP_FILES[f].name, sip_err_line - SIP_FILES[f].start, sip_err_names[sip_err_kind]);
     if (sip_err_msg.n) fprintf(stderr, ": %.*s", (int)sip_err_msg.n, sip_err_msg.p);
     fputc('\n', stderr);
     if (sip_err_line > 0 && sip_err_line <= SIP_NSRC) {
@@ -607,3 +634,814 @@ static bool sip_arg_bool(const char *s, const char *name, const char *usage) {
     if (!strcmp(s, "false") || !strcmp(s, "0") || !strcmp(s, "no")) return false;
     sip_usage_error(usage, "expected true or false for ", name);
 }
+
+/* ---------- math, random, time ---------- */
+#include <time.h>
+
+static inline double sip_sqrt(double x, int line) {
+    if (SIP_UNLIKELY(x < 0)) sip_raise(SIP_E_ValueError, SIP_LIT("math domain error"), line);
+    return sqrt(x);
+}
+
+static inline double sip_log(double x, int line) {
+    if (SIP_UNLIKELY(x <= 0)) sip_raise(SIP_E_ValueError, SIP_LIT("math domain error"), line);
+    return log(x);
+}
+
+static inline int64_t sip_gcd(int64_t a, int64_t b) {
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    while (b) { int64_t t = a % b; a = b; b = t; }
+    return a;
+}
+
+static uint64_t sip_rng = 0;
+
+static inline uint64_t sip_rand_next(void) {  /* splitmix64 */
+    if (SIP_UNLIKELY(!sip_rng)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        sip_rng = (uint64_t)ts.tv_nsec ^ ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)(uintptr_t)&ts;
+        if (!sip_rng) sip_rng = 1;
+    }
+    uint64_t z = (sip_rng += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+static inline void sip_rand_seed(uint64_t s) { sip_rng = s * 0x2545F4914F6CDD1Dull + 1; }
+
+static inline double sip_rand_float(void) { return (double)(sip_rand_next() >> 11) * 0x1.0p-53; }
+
+static inline int64_t sip_rand_int(int64_t a, int64_t b, int line) {
+    if (SIP_UNLIKELY(a > b)) sip_raise(SIP_E_ValueError, SIP_LIT("empty range for randint"), line);
+    uint64_t span = (uint64_t)(b - a) + 1;
+    if (!span) return (int64_t)sip_rand_next();
+    uint64_t lim = UINT64_MAX - UINT64_MAX % span, r;
+    do r = sip_rand_next(); while (r >= lim);
+    return a + (int64_t)(r % span);
+}
+
+static inline double sip_time_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static inline double sip_perf_counter(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static inline void sip_sleep(double s) {
+    if (s <= 0) return;
+    struct timespec ts = {(time_t)s, (long)((s - (double)(time_t)s) * 1e9)};
+    SIP_BLOCKING_BEGIN
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}
+    SIP_BLOCKING_END
+}
+
+/* ---------- JSON ----------
+ * Разбор сразу в нужный тип: для каждого типа компилятор генерирует jdec_K,
+ * которая читает текст через функции ниже. Путь ($.users[0].age) — для ошибок. */
+
+typedef struct { const char *s; int64_t n, i; int line; sip_sb path; } sip_jp;
+
+static sip_jp sip_jp_new(sip_str s, int line) {
+    sip_jp p = {s.p, s.n, 0, line, sip_sb_new()};
+    sip_sb_putc(&p.path, '$');
+    return p;
+}
+
+static void sip_jp_pos(sip_jp *p, int64_t *ln, int64_t *col) {
+    *ln = 1; *col = 1;
+    for (int64_t k = 0; k < p->i && k < p->n; k++) {
+        if (p->s[k] == '\n') { (*ln)++; *col = 1; } else (*col)++;
+    }
+}
+
+__attribute__((noreturn, cold)) static void sip_jp_syntax(sip_jp *p, const char *what) {
+    int64_t ln, col;
+    sip_jp_pos(p, &ln, &col);
+    sip_raisef(SIP_E_ParseError, p->line, "invalid JSON: %s (line %lld, column %lld)", what,
+               (long long)ln, (long long)col);
+}
+
+static inline void sip_jp_ws(sip_jp *p) {
+    while (p->i < p->n) {
+        char c = p->s[p->i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+        p->i++;
+    }
+}
+
+static inline char sip_jp_peek(sip_jp *p) {
+    sip_jp_ws(p);
+    return p->i < p->n ? p->s[p->i] : 0;
+}
+
+static const char *sip_jp_kind(sip_jp *p) {
+    switch (sip_jp_peek(p)) {
+    case '"': return "string";
+    case '{': return "object";
+    case '[': return "array";
+    case 't': case 'f': return "bool";
+    case 'n': return "null";
+    case 0: return "end of input";
+    default: return (p->s[p->i] == '-' || (p->s[p->i] >= '0' && p->s[p->i] <= '9')) ? "number" : "invalid value";
+    }
+}
+
+/* «ожидали X, а пришло Y» с путём до значения */
+__attribute__((noreturn, cold)) static void sip_jp_type(sip_jp *p, const char *want) {
+    const char *got = sip_jp_kind(p);
+    if (!strcmp(got, "invalid value")) sip_jp_syntax(p, "unexpected character");
+    int64_t ln, col;
+    sip_jp_pos(p, &ln, &col);
+    sip_raisef(SIP_E_ParseError, p->line, "JSON %.*s: expected %s, got %s (line %lld, column %lld)",
+               (int)p->path.n, p->path.p, want, got, (long long)ln, (long long)col);
+}
+
+__attribute__((noreturn, cold)) static void sip_jp_fail(sip_jp *p, const char *msg) {
+    sip_raisef(SIP_E_ParseError, p->line, "JSON %.*s: %s", (int)p->path.n, p->path.p, msg);
+}
+
+static inline void sip_jp_want(sip_jp *p, char c, const char *what) {
+    if (sip_jp_peek(p) != c) sip_jp_type(p, what);
+    p->i++;
+}
+
+static inline bool sip_jp_word(sip_jp *p, const char *w, int64_t n) {
+    if (p->n - p->i >= n && !memcmp(p->s + p->i, w, (size_t)n)) { p->i += n; return true; }
+    return false;
+}
+
+static inline bool sip_jp_null(sip_jp *p) {
+    return sip_jp_peek(p) == 'n' && sip_jp_word(p, "null", 4);
+}
+
+static bool sip_jp_bool(sip_jp *p) {
+    char c = sip_jp_peek(p);
+    if (c == 't' && sip_jp_word(p, "true", 4)) return true;
+    if (c == 'f' && sip_jp_word(p, "false", 5)) return false;
+    sip_jp_type(p, "bool");
+}
+
+static void sip_utf8_put(sip_sb *b, uint32_t cp) {
+    if (cp < 0x80) sip_sb_putc(b, (char)cp);
+    else if (cp < 0x800) { sip_sb_putc(b, (char)(0xC0 | cp >> 6)); sip_sb_putc(b, (char)(0x80 | (cp & 63))); }
+    else if (cp < 0x10000) {
+        sip_sb_putc(b, (char)(0xE0 | cp >> 12)); sip_sb_putc(b, (char)(0x80 | ((cp >> 6) & 63)));
+        sip_sb_putc(b, (char)(0x80 | (cp & 63)));
+    } else {
+        sip_sb_putc(b, (char)(0xF0 | cp >> 18)); sip_sb_putc(b, (char)(0x80 | ((cp >> 12) & 63)));
+        sip_sb_putc(b, (char)(0x80 | ((cp >> 6) & 63))); sip_sb_putc(b, (char)(0x80 | (cp & 63)));
+    }
+}
+
+static int sip_jp_hex4(sip_jp *p) {
+    if (p->n - p->i < 4) sip_jp_syntax(p, "bad \\u escape");
+    int v = 0;
+    for (int k = 0; k < 4; k++) {
+        char c = p->s[p->i++];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= c - '0';
+        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+        else { p->i--; sip_jp_syntax(p, "bad \\u escape"); }
+    }
+    return v;
+}
+
+static sip_str sip_jp_str(sip_jp *p) {
+    sip_jp_want(p, '"', "string");
+    int64_t start = p->i;
+    while (p->i < p->n && p->s[p->i] != '"' && p->s[p->i] != '\\' && (unsigned char)p->s[p->i] >= 0x20) p->i++;
+    if (p->i < p->n && p->s[p->i] == '"') {  /* без экранирования — строка указывает в исходный текст */
+        sip_str r = {p->s + start, p->i - start};
+        p->i++;
+        return r;
+    }
+    sip_sb b = sip_sb_new();
+    sip_sb_put(&b, p->s + start, p->i - start);
+    for (;;) {
+        if (p->i >= p->n) sip_jp_syntax(p, "unterminated string");
+        char c = p->s[p->i++];
+        if (c == '"') break;
+        if ((unsigned char)c < 0x20) { p->i--; sip_jp_syntax(p, "control character in string"); }
+        if (c != '\\') { sip_sb_putc(&b, c); continue; }
+        if (p->i >= p->n) sip_jp_syntax(p, "unterminated string");
+        c = p->s[p->i++];
+        switch (c) {
+        case '"': case '\\': case '/': sip_sb_putc(&b, c); break;
+        case 'b': sip_sb_putc(&b, '\b'); break;
+        case 'f': sip_sb_putc(&b, '\f'); break;
+        case 'n': sip_sb_putc(&b, '\n'); break;
+        case 'r': sip_sb_putc(&b, '\r'); break;
+        case 't': sip_sb_putc(&b, '\t'); break;
+        case 'u': {
+            uint32_t cp = (uint32_t)sip_jp_hex4(p);
+            if (cp >= 0xD800 && cp < 0xDC00 && p->n - p->i >= 6 && p->s[p->i] == '\\' && p->s[p->i + 1] == 'u') {
+                int64_t save = p->i;
+                p->i += 2;
+                uint32_t lo = (uint32_t)sip_jp_hex4(p);
+                if (lo >= 0xDC00 && lo < 0xE000) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                else p->i = save;
+            }
+            sip_utf8_put(&b, cp);
+            break;
+        }
+        default: p->i--; sip_jp_syntax(p, "bad escape");
+        }
+    }
+    return sip_sb_done(&b);
+}
+
+/* число: границы токена; is_int — без дробной части и экспоненты */
+static int64_t sip_jp_num(sip_jp *p, bool *is_int) {
+    char c = sip_jp_peek(p);
+    if (c != '-' && !(c >= '0' && c <= '9')) {
+        if (c == 'N' && sip_jp_word(p, "NaN", 3)) { *is_int = false; return -1; }
+        if (c == 'I' && sip_jp_word(p, "Infinity", 8)) { *is_int = false; return -2; }
+        sip_jp_type(p, "number");
+    }
+    int64_t start = p->i;
+    if (p->s[p->i] == '-') {
+        p->i++;
+        if (sip_jp_word(p, "Infinity", 8)) { *is_int = false; return -3; }
+    }
+    if (p->i >= p->n || !(p->s[p->i] >= '0' && p->s[p->i] <= '9')) sip_jp_syntax(p, "bad number");
+    if (p->s[p->i] == '0') p->i++;
+    else while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9') p->i++;
+    *is_int = true;
+    if (p->i < p->n && p->s[p->i] == '.') {
+        *is_int = false;
+        p->i++;
+        if (p->i >= p->n || !(p->s[p->i] >= '0' && p->s[p->i] <= '9')) sip_jp_syntax(p, "bad number");
+        while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9') p->i++;
+    }
+    if (p->i < p->n && (p->s[p->i] == 'e' || p->s[p->i] == 'E')) {
+        *is_int = false;
+        p->i++;
+        if (p->i < p->n && (p->s[p->i] == '+' || p->s[p->i] == '-')) p->i++;
+        if (p->i >= p->n || !(p->s[p->i] >= '0' && p->s[p->i] <= '9')) sip_jp_syntax(p, "bad number");
+        while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9') p->i++;
+    }
+    return start;
+}
+
+static int64_t sip_jp_int(sip_jp *p) {
+    bool is_int;
+    int64_t save = p->i;
+    int64_t start = sip_jp_num(p, &is_int);
+    if (!is_int) {
+        int64_t ln, col;
+        p->i = save;
+        sip_jp_pos(p, &ln, &col);
+        sip_raisef(SIP_E_ParseError, p->line, "JSON %.*s: expected int, got float (line %lld, column %lld)",
+                   (int)p->path.n, p->path.p, (long long)ln, (long long)col);
+    }
+    char buf[32];
+    int64_t len = p->i - start;
+    errno = 0;
+    if (len >= (int64_t)sizeof buf) { p->i = save; sip_jp_fail(p, "integer out of range"); }
+    memcpy(buf, p->s + start, (size_t)len);
+    buf[len] = 0;
+    long long v = strtoll(buf, NULL, 10);
+    if (errno == ERANGE) { p->i = save; sip_jp_fail(p, "integer out of range"); }
+    return (int64_t)v;
+}
+
+static double sip_jp_float(sip_jp *p) {
+    bool is_int;
+    int64_t start = sip_jp_num(p, &is_int);
+    if (start == -1) return NAN;
+    if (start == -2) return INFINITY;
+    if (start == -3) return -INFINITY;
+    char buf[64];
+    int64_t len = p->i - start;
+    if (len < (int64_t)sizeof buf) {
+        memcpy(buf, p->s + start, (size_t)len);
+        buf[len] = 0;
+        return strtod(buf, NULL);
+    }
+    char *big = malloc((size_t)len + 1);
+    memcpy(big, p->s + start, (size_t)len);
+    big[len] = 0;
+    double v = strtod(big, NULL);
+    free(big);
+    return v;
+}
+
+static void sip_jp_skip(sip_jp *p);
+
+/* обход массива: for (i = 0; sip_jp_arr_next(p, i); i++) — после '[' */
+static inline bool sip_jp_arr_next(sip_jp *p, int64_t i) {
+    char c = sip_jp_peek(p);
+    if (c == ']') { p->i++; return false; }
+    if (i > 0) {
+        if (c != ',') sip_jp_syntax(p, "expected ',' or ']'");
+        p->i++;
+    } else if (c == 0) sip_jp_syntax(p, "expected ']'");
+    return true;
+}
+
+/* обход объекта: после '{', ключ кладётся в *key */
+static inline bool sip_jp_obj_next(sip_jp *p, int64_t i, sip_str *key) {
+    char c = sip_jp_peek(p);
+    if (c == '}') { p->i++; return false; }
+    if (i > 0) {
+        if (c != ',') sip_jp_syntax(p, "expected ',' or '}'");
+        p->i++;
+    }
+    if (sip_jp_peek(p) != '"') sip_jp_syntax(p, "expected a string key");
+    *key = sip_jp_str(p);
+    if (sip_jp_peek(p) != ':') sip_jp_syntax(p, "expected ':'");
+    p->i++;
+    return true;
+}
+
+static void sip_jp_skip(sip_jp *p) {
+    char c = sip_jp_peek(p);
+    if (c == '"') { sip_jp_str(p); return; }
+    if (c == '{') {
+        p->i++;
+        sip_str k;
+        for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) sip_jp_skip(p);
+        return;
+    }
+    if (c == '[') {
+        p->i++;
+        for (int64_t i = 0; sip_jp_arr_next(p, i); i++) sip_jp_skip(p);
+        return;
+    }
+    if (c == 't' || c == 'f') { sip_jp_bool(p); return; }
+    if (sip_jp_null(p)) return;
+    bool is_int;
+    if (c == '-' || (c >= '0' && c <= '9') || c == 'N' || c == 'I') { sip_jp_num(p, &is_int); return; }
+    sip_jp_syntax(p, c ? "unexpected character" : "unexpected end of input");
+}
+
+static inline int64_t sip_jp_path_idx(sip_jp *p, int64_t i) {
+    int64_t mark = p->path.n;
+    sip_sb_printf(&p->path, "[%lld]", (long long)i);
+    return mark;
+}
+
+static inline int64_t sip_jp_path_key(sip_jp *p, sip_str k) {
+    int64_t mark = p->path.n;
+    sip_sb_putc(&p->path, '.');
+    sip_sb_str(&p->path, k);
+    return mark;
+}
+
+static inline bool sip_str_is(sip_str s, const char *lit, int64_t n) {
+    return s.n == n && !memcmp(s.p, lit, (size_t)n);
+}
+
+static int64_t sip_jp_key_int(sip_jp *p, sip_str k) {
+    int64_t i = (k.n && k.p[0] == '-') ? 1 : 0;
+    bool ok = k.n > i && k.n < 21;
+    for (int64_t j = i; ok && j < k.n; j++) ok = k.p[j] >= '0' && k.p[j] <= '9';
+    if (!ok) sip_jp_fail(p, "object key is not an int");
+    char buf[24];
+    memcpy(buf, k.p, (size_t)k.n);
+    buf[k.n] = 0;
+    errno = 0;
+    long long v = strtoll(buf, NULL, 10);
+    if (errno == ERANGE) sip_jp_fail(p, "integer out of range");
+    return (int64_t)v;
+}
+
+static inline void sip_jp_end(sip_jp *p) {
+    if (sip_jp_peek(p) != 0) sip_jp_syntax(p, "extra data after the value");
+}
+
+/* поиск поля "type" у объекта (для типов-сумм), позиция не меняется */
+static sip_str sip_jp_tag(sip_jp *p) {
+    int64_t save = p->i;
+    sip_jp_want(p, '{', "object");
+    sip_str k, tag = {NULL, -1};
+    for (int64_t i = 0; sip_jp_obj_next(p, i, &k); i++) {
+        if (sip_str_is(k, "type", 4) && sip_jp_peek(p) == '"') tag = sip_jp_str(p);
+        else sip_jp_skip(p);
+    }
+    p->i = save;
+    if (tag.n < 0) sip_jp_fail(p, "object has no \"type\" field");
+    return tag;
+}
+
+/* вывод: ind < 0 — в одну строку, как json.dumps; иначе с отступом ind */
+static inline void sip_je_sep(sip_sb *b, int64_t ind, int64_t depth, bool first) {
+    if (!first) sip_sb_putc(b, ',');
+    if (ind < 0) { if (!first) sip_sb_putc(b, ' '); return; }
+    sip_sb_putc(b, '\n');
+    for (int64_t k = 0; k < ind * depth; k++) sip_sb_putc(b, ' ');
+}
+
+static inline void sip_je_close(sip_sb *b, int64_t ind, int64_t depth, char c) {
+    if (ind >= 0) sip_je_sep(b, ind, depth, true);
+    sip_sb_putc(b, c);
+}
+
+static void sip_je_str(sip_sb *b, sip_str s) {
+    static const char hex[] = "0123456789abcdef";
+    sip_sb_putc(b, '"');
+    for (int64_t i = 0; i < s.n; i++) {
+        unsigned char c = (unsigned char)s.p[i];
+        if (c == '"') sip_sb_put(b, "\\\"", 2);
+        else if (c == '\\') sip_sb_put(b, "\\\\", 2);
+        else if (c == '\n') sip_sb_put(b, "\\n", 2);
+        else if (c == '\r') sip_sb_put(b, "\\r", 2);
+        else if (c == '\t') sip_sb_put(b, "\\t", 2);
+        else if (c == '\b') sip_sb_put(b, "\\b", 2);
+        else if (c == '\f') sip_sb_put(b, "\\f", 2);
+        else if (c < 0x20) {
+            char e[6] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 15]};
+            sip_sb_put(b, e, 6);
+        } else sip_sb_putc(b, (char)c);
+    }
+    sip_sb_putc(b, '"');
+}
+
+static void sip_je_float(sip_sb *b, double x) {
+    if (isnan(x)) sip_sb_put(b, "NaN", 3);
+    else if (isinf(x)) { if (x < 0) sip_sb_put(b, "-Infinity", 9); else sip_sb_put(b, "Infinity", 8); }
+    else str_float(b, x);
+}
+
+static inline void sip_je_bool(sip_sb *b, bool x) {
+    if (x) sip_sb_put(b, "true", 4); else sip_sb_put(b, "false", 5);
+}
+
+/* ---------- CSV ----------
+ * Диалект Python по умолчанию: поля в кавычках с "" внутри, строки \n, \r\n или \r,
+ * при записи кавычки ставятся только там, где нужны, строки кончаются \r\n. */
+
+typedef struct {
+    const char *s; int64_t n, i;
+    char d; int line;
+    int64_t row_line, next_line;  /* номер строки файла: для ошибок */
+    sip_str *f; int64_t nf, cap;
+} sip_csv;
+
+static char sip_csv_delim(sip_str d, int line) {
+    if (d.n != 1) sip_raise(SIP_E_ValueError, SIP_LIT("delimiter must be a 1-character string"), line);
+    return d.p[0];
+}
+
+static sip_csv sip_csv_new(sip_str text, sip_str delim, int line) {
+    sip_csv c = {text.p, text.n, 0, sip_csv_delim(delim, line), line, 1, 1, NULL, 0, 0};
+    return c;
+}
+
+static inline void sip_csv_push(sip_csv *c, sip_str f) {
+    if (c->nf == c->cap) {
+        c->cap = c->cap ? c->cap * 2 : 16;
+        c->f = sip_realloc(c->f, (size_t)c->cap * sizeof(sip_str));
+    }
+    c->f[c->nf++] = f;
+}
+
+/* следующая запись файла: поля в c->f[0..nf); false — данных больше нет */
+static bool sip_csv_row(sip_csv *c) {
+    const char *s = c->s;
+    int64_t n = c->n;
+    if (c->i >= n) return false;
+    c->nf = 0;
+    c->row_line = c->next_line;
+    if (s[c->i] == '\n' || s[c->i] == '\r') {  /* пустая строка — запись без полей */
+        if (s[c->i] == '\r' && c->i + 1 < n && s[c->i + 1] == '\n') c->i++;
+        c->i++;
+        c->next_line++;
+        return true;
+    }
+    for (;;) {
+        if (c->i < n && s[c->i] == '"') {
+            sip_sb b = sip_sb_new();
+            c->i++;
+            for (;;) {
+                if (c->i >= n) break;
+                char ch = s[c->i];
+                if (ch == '"') {
+                    if (c->i + 1 < n && s[c->i + 1] == '"') { sip_sb_putc(&b, '"'); c->i += 2; continue; }
+                    c->i++;
+                    break;
+                }
+                if (ch == '\n') c->next_line++;
+                sip_sb_putc(&b, ch);
+                c->i++;
+            }
+            /* после закрывающей кавычки — как в Python: всё до разделителя дописывается в поле */
+            while (c->i < n && s[c->i] != c->d && s[c->i] != '\n' && s[c->i] != '\r') sip_sb_putc(&b, s[c->i++]);
+            sip_csv_push(c, sip_sb_done(&b));
+        } else {
+            int64_t start = c->i;
+            while (c->i < n && s[c->i] != c->d && s[c->i] != '\n' && s[c->i] != '\r') c->i++;
+            sip_csv_push(c, (sip_str){s + start, c->i - start});
+        }
+        if (c->i >= n) return true;
+        char ch = s[c->i];
+        if (ch == c->d) {
+            c->i++;
+            if (c->i >= n) { sip_csv_push(c, (sip_str){"", 0}); return true; }
+            continue;
+        }
+        if (ch == '\r' && c->i + 1 < n && s[c->i + 1] == '\n') c->i++;
+        c->i++;
+        c->next_line++;
+        return true;
+    }
+}
+
+static inline sip_str sip_csv_cell(sip_csv *c, int64_t i) {
+    return (i >= 0 && i < c->nf) ? c->f[i] : (sip_str){"", 0};
+}
+
+static int64_t sip_csv_col(sip_str *hdr, int64_t nh, sip_str name) {
+    for (int64_t i = 0; i < nh; i++) if (hdr[i].n == name.n && !memcmp(hdr[i].p, name.p, (size_t)name.n)) return i;
+    return -1;
+}
+
+static sip_str *sip_csv_header(sip_csv *c) {
+    sip_str *h = sip_alloc((size_t)(c->nf ? c->nf : 1) * sizeof(sip_str));
+    memcpy(h, c->f, (size_t)c->nf * sizeof(sip_str));
+    return h;
+}
+
+__attribute__((noreturn, cold)) static void sip_csv_bad(sip_csv *c, int64_t i, sip_str col, const char *what) {
+    sip_str v = sip_csv_cell(c, i);
+    if (col.n)
+        sip_raisef(SIP_E_ParseError, c->line, "CSV line %lld, column '%.*s': invalid %s: '%.*s'",
+                   (long long)c->row_line, (int)col.n, col.p, what, (int)(v.n > 40 ? 40 : v.n), v.p);
+    sip_raisef(SIP_E_ParseError, c->line, "CSV line %lld, column %lld: invalid %s: '%.*s'",
+               (long long)c->row_line, (long long)i + 1, what, (int)(v.n > 40 ? 40 : v.n), v.p);
+}
+
+static int64_t sip_csv_int(sip_csv *c, int64_t i, sip_str col) {
+    sip_str t = sip_str_strip(sip_csv_cell(c, i), 1, 1);
+    char buf[64];
+    if (t.n == 0 || t.n >= (int64_t)sizeof buf) sip_csv_bad(c, i, col, "int");
+    int64_t j = 0;
+    for (int64_t k = 0; k < t.n; k++) if (t.p[k] != '_') buf[j++] = t.p[k];
+    buf[j] = 0;
+    char *end;
+    errno = 0;
+    long long v = strtoll(buf, &end, 10);
+    if (*end || errno) sip_csv_bad(c, i, col, "int");
+    return v;
+}
+
+static double sip_csv_float(sip_csv *c, int64_t i, sip_str col) {
+    sip_str t = sip_str_strip(sip_csv_cell(c, i), 1, 1);
+    char buf[128];
+    if (t.n == 0 || t.n >= (int64_t)sizeof buf) sip_csv_bad(c, i, col, "float");
+    memcpy(buf, t.p, (size_t)t.n);
+    buf[t.n] = 0;
+    char *end;
+    double v = strtod(buf, &end);
+    if (*end) sip_csv_bad(c, i, col, "float");
+    return v;
+}
+
+static bool sip_csv_bool(sip_csv *c, int64_t i, sip_str col) {
+    sip_str t = sip_str_strip(sip_csv_cell(c, i), 1, 1);
+    if (sip_str_is(t, "true", 4) || sip_str_is(t, "True", 4) || sip_str_is(t, "1", 1) || sip_str_is(t, "yes", 3))
+        return true;
+    if (sip_str_is(t, "false", 5) || sip_str_is(t, "False", 5) || sip_str_is(t, "0", 1) || sip_str_is(t, "no", 2) ||
+        t.n == 0)
+        return false;
+    sip_csv_bad(c, i, col, "bool");
+}
+
+static void sip_csv_put(sip_sb *b, sip_str s, char d) {
+    bool q = false;
+    for (int64_t i = 0; i < s.n && !q; i++) q = s.p[i] == d || s.p[i] == '"' || s.p[i] == '\n' || s.p[i] == '\r';
+    if (!q) { sip_sb_str(b, s); return; }
+    sip_sb_putc(b, '"');
+    for (int64_t i = 0; i < s.n; i++) {
+        if (s.p[i] == '"') sip_sb_putc(b, '"');
+        sip_sb_putc(b, s.p[i]);
+    }
+    sip_sb_putc(b, '"');
+}
+
+/* ---------- HTTP (libcurl; подключается, только если программа пользуется http) ---------- */
+#ifdef SIP_USE_HTTP
+#include <curl/curl.h>
+#include <pthread.h>
+#include <ctype.h>
+
+typedef struct { int64_t status; sip_str body, url; sip_str *hk, *hv; int64_t nh, hcap; } sip_http_resp;
+
+static pthread_once_t sip_http_once = PTHREAD_ONCE_INIT;
+static void sip_http_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
+
+/* во время запроса другие потоки могут выполнять код Sip, поэтому здесь только malloc */
+typedef struct { char *p; size_t n, cap; } sip_mbuf;
+
+static size_t sip_http_wbuf(char *p, size_t sz, size_t n, void *ud) {
+    sip_mbuf *b = ud;
+    size_t len = sz * n;
+    if (b->n + len > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->n + len) cap *= 2;
+        char *np = realloc(b->p, cap);
+        if (!np) return 0;
+        b->p = np;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, p, len);
+    b->n += len;
+    return len;
+}
+
+/* заголовки ответа; имена — в нижнем регистре. После редиректа список начинается заново. */
+static void sip_http_headers(sip_http_resp *r, const char *p, size_t total) {
+    size_t i = 0;
+    while (i < total) {
+        const char *line = p + i;
+        const char *nl = memchr(line, '\n', total - i);
+        size_t len = nl ? (size_t)(nl - line) + 1 : total - i;
+        i += len;
+        if (len >= 5 && !memcmp(line, "HTTP/", 5)) { r->nh = 0; continue; }
+        const char *colon = memchr(line, ':', len);
+        if (!colon) continue;
+        int64_t kn = colon - line;
+        const char *v = colon + 1;
+        int64_t vn = (int64_t)len - kn - 1;
+        while (vn > 0 && (*v == ' ' || *v == '\t')) { v++; vn--; }
+        while (vn > 0 && (v[vn - 1] == '\r' || v[vn - 1] == '\n' || v[vn - 1] == ' ')) vn--;
+        char *k = sip_alloc((size_t)kn + 1);
+        for (int64_t j = 0; j < kn; j++) k[j] = (char)tolower((unsigned char)line[j]);
+        char *vv = sip_alloc((size_t)vn + 1);
+        memcpy(vv, v, (size_t)vn);
+        if (r->nh == r->hcap) {
+            r->hcap = r->hcap ? r->hcap * 2 : 16;
+            r->hk = sip_realloc(r->hk, (size_t)r->hcap * sizeof(sip_str));
+            r->hv = sip_realloc(r->hv, (size_t)r->hcap * sizeof(sip_str));
+        }
+        r->hk[r->nh] = (sip_str){k, kn};
+        r->hv[r->nh] = (sip_str){vv, vn};
+        r->nh++;
+    }
+}
+
+static char *sip_to_c(sip_str s) {
+    char *c = sip_alloc((size_t)s.n + 1);
+    memcpy(c, s.p, (size_t)s.n);
+    c[s.n] = 0;
+    return c;
+}
+
+static struct curl_slist *sip_http_header(struct curl_slist *h, sip_str k, sip_str v) {
+    sip_sb b = sip_sb_new();
+    sip_sb_str(&b, k);
+    sip_sb_put(&b, ": ", 2);
+    sip_sb_str(&b, v);
+    sip_sb_putc(&b, 0);
+    return curl_slist_append(h, b.p);
+}
+
+/* body == NULL — GET. Ошибка сети — IOError, ответ 4xx/5xx — HttpError. */
+static sip_http_resp sip_http_do(const char *method, sip_str url, const sip_str *body, struct curl_slist *hdrs,
+                                 double timeout, int line) {
+    pthread_once(&sip_http_once, sip_http_init);
+    CURL *c = curl_easy_init();
+    if (!c) sip_raise(SIP_E_IOError, SIP_LIT("http: cannot start libcurl"), line);
+    sip_http_resp r = {0};
+    sip_mbuf out = {0}, hbuf = {0};
+    char err[CURL_ERROR_SIZE] = {0};
+    char *curl = sip_to_c(url);
+    curl_easy_setopt(c, CURLOPT_URL, curl);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "sip/0.2");
+    curl_easy_setopt(c, CURLOPT_ERRORBUFFER, err);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sip_http_wbuf);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, sip_http_wbuf);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &hbuf);
+    if (timeout > 0) curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)(timeout * 1000));
+    if (body) {
+        curl_easy_setopt(c, CURLOPT_POST, 1L);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, body->p);
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)body->n);
+    }
+    if (strcmp(method, "GET") && strcmp(method, "POST")) curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
+    if (hdrs) curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
+    SIP_BLOCKING_BEGIN
+    CURLcode rc = curl_easy_perform(c);
+    SIP_BLOCKING_END
+    if (hdrs) curl_slist_free_all(hdrs);
+    long status = 0;
+    char *eff = NULL;
+    if (rc == CURLE_OK) {
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+        curl_easy_getinfo(c, CURLINFO_EFFECTIVE_URL, &eff);
+        r.status = status;
+        if (eff) {
+            int64_t n = (int64_t)strlen(eff);
+            char *u = sip_alloc((size_t)n + 1);
+            memcpy(u, eff, (size_t)n + 1);
+            r.url = (sip_str){u, n};
+        } else r.url = url;
+        char *bp = sip_alloc(out.n ? out.n : 1);
+        memcpy(bp, out.p ? out.p : "", out.n);
+        r.body = (sip_str){bp, (int64_t)out.n};
+        sip_http_headers(&r, hbuf.p ? hbuf.p : "", hbuf.n);
+    }
+    free(out.p);
+    free(hbuf.p);
+    curl_easy_cleanup(c);
+    if (rc != CURLE_OK)
+        sip_raisef(SIP_E_IOError, line, "http: %s (%.*s)", err[0] ? err : curl_easy_strerror(rc),
+                   (int)(url.n > 200 ? 200 : url.n), url.p);
+    if (status >= 400)
+        sip_raisef(SIP_E_HttpError, line, "HTTP %ld for %.*s", status, (int)(url.n > 200 ? 200 : url.n), url.p);
+    return r;
+}
+#endif
+
+/* ---------- задачи (async fn) ---------- */
+#ifdef SIP_USE_ASYNC
+typedef struct sip_task {
+    void (*run)(struct sip_task *);
+    int state;  /* 0 — не запускалась, 1 — выполняется, 2 — готова, 3 — ошибка */
+    int ek, el;
+    sip_str em;
+} sip_task;
+
+/* выполнить задачу в текущем потоке; ошибка запоминается в задаче */
+static void sip_task_exec(sip_task *t) {
+    sip_try fr;
+    t->state = 1;
+    sip_try_push(&fr);
+    if (setjmp(fr.jb) == 0) {
+        t->run(t);
+        sip_try_pop();
+        t->state = 2;
+    } else {
+        t->state = 3;
+        t->ek = sip_err_kind;
+        t->em = sip_err_msg;
+        t->el = sip_err_line;
+    }
+}
+
+static void sip_task_await(sip_task *t, int line) {
+    if (t->state == 0) sip_task_exec(t);
+    else if (t->state == 1) sip_raise(SIP_E_Error, SIP_LIT("a task cannot await itself"), line);
+    if (t->state == 3) sip_raise(t->ek, t->em, t->el);
+}
+
+typedef struct { sip_task **ts; int64_t n, next; } sip_pool;
+
+static void *sip_worker(void *arg) {
+    sip_pool *p = arg;
+    pthread_mutex_lock(&sip_gil);
+    while (p->next < p->n) {
+        sip_task *t = p->ts[p->next++];
+        if (t->state != 0) continue;
+        sip_try_top = NULL;
+        sip_task_exec(t);
+    }
+    pthread_mutex_unlock(&sip_gil);
+    return NULL;
+}
+
+#define SIP_MAX_WORKERS 64
+
+/* await all(...): задачи выполняются одновременно; первая ошибка (по порядку) пробрасывается */
+static void sip_gather(sip_task **ts, int64_t n, int line) {
+    int64_t todo = 0;
+    for (int64_t i = 0; i < n; i++) todo += ts[i]->state == 0;
+    if (todo == 1) {
+        for (int64_t i = 0; i < n; i++) if (ts[i]->state == 0) sip_task_exec(ts[i]);
+    } else if (todo > 1) {
+        if (!sip_threaded) { pthread_mutex_lock(&sip_gil); sip_threaded = true; }
+        int64_t nw = todo < SIP_MAX_WORKERS ? todo : SIP_MAX_WORKERS;
+        sip_pool pool = {ts, n, 0};
+        pthread_t th[SIP_MAX_WORKERS];
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, (size_t)64 << 20);
+        int64_t started = 0;
+        sip_tstate st = sip_gil_release();
+        for (int64_t i = 0; i < nw; i++) {
+            if (pthread_create(&th[started], &attr, sip_worker, &pool) == 0) started++;
+        }
+        if (started == 0) sip_worker(&pool);  /* потоки не создались — выполнить по очереди */
+        for (int64_t i = 0; i < started; i++) pthread_join(th[i], NULL);
+        sip_gil_acquire(st);
+        pthread_attr_destroy(&attr);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        if (ts[i]->state == 3) sip_raise(ts[i]->ek, ts[i]->em, ts[i]->el);
+        if (ts[i]->state == 1) sip_raise(SIP_E_Error, SIP_LIT("a task cannot await itself"), line);
+    }
+}
+#endif

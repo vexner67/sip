@@ -84,6 +84,21 @@ print apply(adder(3), 4), xs.map(sq)    # обычная функция тоже
 - Встроенные функции значениями не бывают: вместо `xs.map(str)` пишется `xs.map(fn(x) = str(x))`.
 - Компилятор встраивает вызов лямбды: `xs.map(fn(x) = x * 2)` работает так же быстро, как `[x * 2 for x in xs]`.
 
+Внутри функции можно объявить обычную функцию блоком, она тоже замыкание:
+
+```
+fn count_paths(n int) int
+    seen: {int: int} = {}
+    fn go(i int) int                       # видит n и seen, может вызывать себя
+        if i >= n then return 1
+        if i in seen then return seen[i]
+        seen[i] = go(i + 1) + go(i + 2)
+        seen[i]
+    go(0)
+```
+
+Присвоить внешней переменной вложенная функция не может (`n = ...` — ошибка), но менять список, словарь или запись по ссылке может.
+
 ## Управление
 
 ```
@@ -114,6 +129,19 @@ print if i % 3 == 0 then "Fizz" else i     # ветки str и другого т
 - `print a, b` можно писать без скобок.
 - Именованные аргументы: `f(x, reverse: true)` или `f(x, reverse=true)`.
 - `==` сравнивает списки, словари, кортежи и записи по содержимому. `<` работает для чисел, строк, кортежей и списков.
+
+## Множества
+
+```
+seen = {1, 2, 3}                           # тип {int}; пустое — set() или s: {str} = set()
+seen.add(4)
+print 2 in seen, len(seen)
+a | b, a & b, a - b, a ^ b                 # объединение, пересечение, разность, симметрическая
+a <= b                                     # подмножество
+uniq = {w.lower() for w in words}
+```
+
+Методы: `add remove discard clear copy update union intersection difference issubset`. Множество перебирается в порядке добавления (в Python порядок не определён). У словарей для удаления есть `d.pop(k)` и `d.clear()`, для слияния — `d.update(other)`.
 
 ## Записи
 
@@ -167,13 +195,103 @@ catch e                                   # ловит всё, e — текст 
 ```
 
 - `fail "сообщение"` бросает `Error`. `assert x > 0, "msg"` бросает `AssertionError`.
-- Виды: `NotFound` (файла нет), `IOError`, `ParseError` (плохое число; ловится и как `ValueError`), `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`, `AssertionError`, `NilError` (`nil` там, где нужно значение). `catch Exception` ловит всё.
+- Виды: `NotFound` (файла нет), `IOError`, `ParseError` (плохое число; ловится и как `ValueError`), `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`, `AssertionError`, `NilError` (`nil` там, где нужно значение), `HttpError` (ответ 4xx/5xx). `catch Exception` ловит всё.
 - Непойманная ошибка печатает одну строку и строку исходника, код выхода 1:
 
 ```
 prog.sip:3: IndexError: list index out of range
     fn get(i int) int = xs[i]
 ```
+
+## Модули
+
+```
+import geo                                 # geo.sip рядом с этим файлом
+import lib.strs as S                       # lib/strs.sip
+from geo import Point, area as square
+
+print geo.area(geo.Point(1, 2)), S.shout("hi")
+```
+
+- Модуль — это файл `.sip`; путь считается от файла, который его импортирует. Видны все имена верхнего уровня: функции, типы, варианты, глобальные переменные.
+- Код верхнего уровня модуля выполняется один раз, до кода программы. `fn main` модуля не вызывается.
+- Одинаковые имена в разных модулях не мешают друг другу. Циклический импорт — ошибка компиляции.
+- Ошибки в модуле показывают его файл и строку: `lib/strs.sip:2: IndexError: ...`.
+
+Встроенные модули доступны и без `import`:
+
+| модуль | содержимое |
+|---|---|
+| `math` | `sqrt floor ceil trunc log log2 log10 exp sin cos tan asin acos atan atan2 hypot pow isnan isinf gcd`, `pi e tau inf nan` |
+| `random` | `random() randint(a, b) uniform(a, b) choice(xs) shuffle(xs) seed(n)` |
+| `time` | `time() perf_counter() sleep(s)` |
+| `json`, `csv`, `http` | ниже |
+
+`math.floor`, `ceil` и `trunc` дают `int`. `math.sqrt(-1)` бросает `ValueError: math domain error`.
+
+## JSON
+
+JSON читается сразу в нужный тип. Тип берётся из контекста: из объявления переменной, типа результата функции или параметра.
+
+```
+type User(name str, age int, tags [str] = [], email str? = nil)
+
+users: [User] = json.read("users.json")
+fn load(path str) [User] = json.read(path)
+conf: {str: int} = json.parse(text)
+
+print json.stringify(users)                # одной строкой, как json.dumps
+json.write("out.json", users)              # с отступом 2; indent: 4 — свой
+```
+
+- Запись — объект JSON. Лишние поля пропускаются. Если поля нет, берётся значение по умолчанию, для `T?` — `nil`, иначе это ошибка.
+- Тип-сумма — объект с полем `"type"`: `{"type": "Circle", "r": 1.0}`.
+- `T?` — `null`, кортеж и множество — массив, `{int: V}` — объект с ключами-числами.
+- Плохие данные бросают `ParseError` с путём: `JSON $[0].age: expected int, got string (line 3, column 12)`.
+- Без контекста `x = json.parse(s)` не скомпилируется: нужно написать тип.
+
+## CSV
+
+```
+type Emp(name str, dept str, salary float, age int? = nil)
+
+rows = csv.read("emp.csv")                 # [{str: str}]: строка — словарь по заголовку
+emps: [Emp] = csv.read("emp.csv")          # колонки по именам полей, числа переводятся
+cells: [[str]] = csv.parse(text, delimiter: ";")   # все строки, без заголовка
+csv.write("out.csv", emps)                 # заголовок из полей; [[T]] и [(…)] — без заголовка
+```
+
+Пустая ячейка для `T?` — `nil`, для поля со значением по умолчанию — это значение. Кавычки и переводы строк внутри полей — как в модуле `csv` Python, строки записываются с `\r\n`. Ошибка выглядит так: `CSV line 2, column 'salary': invalid float: 'abc'`.
+
+## HTTP
+
+```
+r = http.get(url, timeout: 5, headers: {"Authorization": "Bearer {token}"})
+print r.status, r.ok, r.text, r.url, r.headers["content-type"]
+user: User = r.json()
+http.post(url, json: User("Ann", 30))      # тело — JSON с Content-Type: application/json
+http.post(url, body: "raw text")
+```
+
+- Ответ имеет тип `Response`: `status int`, `ok bool`, `text str`, `url str` (после редиректов), `headers {str: str}` (имена в нижнем регистре).
+- Ответ 4xx или 5xx бросает `HttpError: HTTP 404 for URL`, ошибка сети или таймаут — `IOError`.
+- Таймаут по умолчанию 30 секунд. Работает через libcurl, она подключается, только если программа пользуется `http`.
+
+## async
+
+```
+async fn status(url str) int = http.get(url).status
+
+async fn main(urls str)
+    codes = await all(status(u) for u in urls.split())    # запросы идут одновременно
+    print codes
+```
+
+- Вызов `async fn` возвращает задачу `Task[T]` и ничего не выполняет. `await t` выполняет её и даёт `T`, повторный `await` отдаёт тот же результат.
+- `await all(f(x) for x in xs)` выполняет элементы одновременно и возвращает список результатов в исходном порядке. Можно передать и список задач: `await all(tasks)`. Если `f` ничего не возвращает, результата нет.
+- Первая ошибка (по порядку элементов) пробрасывается из `await all`, остальные задачи успевают завершиться.
+- `await` пишется только внутри `async fn`. `async fn main` тоже можно.
+- Задачи работают в потоках, но код Sip в каждый момент выполняет один поток, как в Python. Пока задача ждёт сеть или `time.sleep`, работают другие. Поэтому общие списки и словари менять из задач безопасно, а счёт на нескольких ядрах не ускоряется.
 
 ## Программа и командная строка
 
@@ -208,7 +326,8 @@ sip run greet.sip Ann --times 3 --loud
 |---|---|
 | `str` | `lower upper strip lstrip rstrip split splitlines find count replace startswith endswith isdigit isalpha isspace join` |
 | список | `append pop insert extend clear sort reverse copy index count join sum avg top map filter sort_by group_by first` |
-| словарь | `get keys values items copy top` |
+| словарь | `get keys values items copy top pop update clear` |
+| множество | `add remove discard clear copy update union intersection difference issubset` |
 
 `xs.sort(key: f, reverse: true)` сортирует на месте, `xs.sort_by(f)` возвращает новый список. Сортировка устойчивая, ключ считается один раз на элемент.
 
@@ -227,7 +346,7 @@ sip run greet.sip Ann --times 3 --loud
 
 ## Чего пока нет
 
-Вложенные блоки `fn` (вместо них — лямбды), многострочные лямбды, `async`/`await`, `import`, `with`, множества, `*args`, `json`, `csv`, `http`. Парсер их понимает, а компилятор сообщает: `... is not supported by the native compiler yet`.
+Многострочные лямбды (вместо них — вложенные `fn`), `with`, `*args`, вложенные `async fn`. Парсер их понимает, а компилятор сообщает: `... is not supported by the native compiler yet`.
 
 ## Память
 

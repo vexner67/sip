@@ -65,14 +65,14 @@ def cmd_check(paths: list[str]) -> int:
     if not paths:
         return _err("check needs at least one file")
     from .checker import check_program
-    from .lexer import tokenize
-    from .parser import Parser
+    from .modules import load_program
     failed = 0
     for path in paths:
         try:
             with open(path, encoding="utf-8") as f:
                 src = f.read()
-            check_program(Parser(tokenize(src, path), path).parse_module(), path)
+            module, srcmap = load_program(path, src)
+            check_program(module, path, srcmap)
         except SipError as e:
             print(e, file=sys.stderr)
             failed += 1

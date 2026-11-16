@@ -442,10 +442,13 @@ class Parser:
             self.expect("]")
         elif self.accept("{"):
             key = self.parse_type()
-            self.expect(":")
-            value = self.parse_type()
-            self.expect("}")
-            t = TDict(key, value, line=tok.line)
+            if self.accept("}"):
+                t = TSet(key, line=tok.line)
+            else:
+                self.expect(":")
+                value = self.parse_type()
+                self.expect("}")
+                t = TDict(key, value, line=tok.line)
         elif self.accept("("):
             items = []
             while not self.at(")"):

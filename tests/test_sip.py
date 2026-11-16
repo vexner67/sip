@@ -536,14 +536,259 @@ class TypeErrorTest(unittest.TestCase):
         self.assertIn("unknown name 'y'", errors_of("x = 1\nprint y"))
 
     def test_empty_list_needs_type(self):
-        self.assertIn("xs: [int] = []", errors_of("xs = []\nprint len(xs)"))
+        self.assertEqual(run("xs = []\nprint len(xs), [], {}"), "0 [] {}\n")  # пустое без контекста — [int]
 
     def test_unsupported_feature_is_named(self):
-        self.assertIn("not supported by the native compiler", errors_of("async fn f()\n    pass"))
+        self.assertIn("not supported by the native compiler", errors_of("fn f(*xs)\n    pass"))
 
     def test_method_calls_another_method(self):
         src = "type T(v int)\n    fn a() int = .v + 1\n    fn b() int = .a() * 2\nprint T(1).b()"
         self.assertEqual(run(src), "4\n")
+
+
+def run_files(files: dict, main="main.sip", *args) -> subprocess.CompletedProcess:
+    """Программа из нескольких файлов: {путь: текст}."""
+    d = tempfile.mkdtemp(dir=TMP)
+    for name, text in files.items():
+        path = Path(d) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return cli("run", str(Path(d) / main), *args, cwd=d)
+
+
+class ModuleTest(unittest.TestCase):
+    def test_import_and_from_import(self):
+        r = run_files({
+            "geo.sip": "import math\ntype P(x float, y float)\n    fn len() float = math.hypot(.x, .y)\n"
+                       "fn helper(x int) int = x * 2\nORIGIN = P(0, 0)\nfn main()\n    print \"no\"\n",
+            "lib/strs.sip": "fn shout(s str) str = s.upper() + \"!\"\n",
+            "main.sip": "import geo\nfrom geo import P as Point\nimport lib.strs as S\nfrom lib.strs import shout\n"
+                        "fn helper(x int) int = x + 1\n"
+                        "print geo.P(3, 4).len(), Point(6, 8).len(), geo.ORIGIN, geo.helper(5), helper(5)\n"
+                        "print S.shout(\"a\"), shout(\"b\")\n",
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "5.0 10.0 P(x=0.0, y=0.0) 10 6\nA! B!\n")
+
+    def test_errors_point_into_module(self):
+        r = run_files({"m.sip": "fn ok() int = 1\nfn bad(xs [int]) int = xs[5]\n",
+                       "main.sip": "import m\nprint m.ok()\nprint m.bad([1])\n"})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("m.sip:2: IndexError", r.stderr)
+        r = run_files({"m.sip": "fn f() int = \"x\"\n", "main.sip": "import m\nprint m.f()\n"})
+        self.assertIn("m.sip:1", r.stderr)
+
+    def test_import_errors(self):
+        self.assertIn("module 'nope' not found", run_files({"main.sip": "import nope\n"}).stderr)
+        r = run_files({"a.sip": "import b\n", "b.sip": "import a\n", "main.sip": "import a\n"})
+        self.assertIn("circular import", r.stderr)
+        r = run_files({"m.sip": "x = 1\n", "main.sip": "from m import y\n"})
+        self.assertIn("module 'm' has no 'y'", r.stderr)
+        self.assertIn("module 'math' has no 'foo'", errors_of("print math.foo(1)"))
+
+
+class StdlibTest(unittest.TestCase):
+    def test_math(self):
+        src = ("from math import sqrt, floor\nprint sqrt(16), floor(2.7), math.ceil(2.1), math.gcd(12, 18), "
+               "math.inf, math.log(8, 2), math.pi > 3, math.pow(2, 10), math.isnan(math.nan)")
+        self.assertEqual(run(src), "4.0 2 3 6 inf 3.0 True 1024.0 True\n")
+        self.assertIn("ValueError: math domain error", failure("print math.sqrt(-1)"))
+        self.assertIn("needs a number", errors_of('print math.sqrt("x")'))
+
+    def test_random_and_time(self):
+        src = ("random.seed(1)\na = [random.randint(1, 6) for _ in 1..20]\nrandom.seed(1)\n"
+               "b = [random.randint(1, 6) for _ in 1..20]\nprint a == b, all(1 <= x and x <= 6 for x in a)\n"
+               "xs = [1, 2, 3]\nrandom.shuffle(xs)\nprint sorted(xs), random.choice([7]), 0.0 <= random.random() < 1.0\n"
+               "t = time.perf_counter()\ntime.sleep(0.01)\nprint time.perf_counter() - t >= 0.01, time.time() > 1e9")
+        self.assertEqual(run(src), "True True\n[1, 2, 3] 7 True\nTrue True\n")
+
+
+class JsonTest(unittest.TestCase):
+    TYPES = ("type Addr(city str, zip str? = nil)\n"
+             "type User(name str, age int, tags [str] = [], addr Addr? = nil)\n"
+             "type Shape = Circle(r float) | Dot\n")
+
+    def test_parse_into_types(self):
+        src = self.TYPES + (
+            'us: [User] = json.parse("[{{\\"name\\": \\"Ann\\", \\"age\\": 3, \\"addr\\": {{\\"city\\": \\"Rome\\"}}, '
+            '\\"x\\": [1, {{}}]}}]")\n'
+            'print us\n'
+            'm: {str: [int]} = json.parse(" {{\\"a\\": [1, 2]}} ")\n'
+            's: [Shape] = json.parse("[{{\\"type\\": \\"Circle\\", \\"r\\": 2}}, {{\\"type\\": \\"Dot\\"}}]")\n'
+            'u: str = json.parse("\\"\\\\u00e9\\\\ud83d\\\\ude00\\"")\n'
+            'print m, s, u')
+        self.assertEqual(run(src), "[User(name='Ann', age=3, tags=[], addr=Addr(city='Rome', zip=None))]\n"
+                                   "{'a': [1, 2]} [Circle(r=2.0), Dot()] é😀\n")
+
+    def test_stringify_like_python(self):
+        src = self.TYPES + (
+            'print json.stringify([User("Ann", 3, ["x"]), User("Bob", 4, addr: Addr("Рим"))])\n'
+            'print json.stringify({1: [1.5, 1e20]}), json.stringify("q\\"\\n\\u0001"), json.stringify([nil, 1])\n'
+            'print json.stringify({"a": [1, 2], "b": []}, indent: 2)\n'
+            'print json.stringify([Circle(1), Dot()])')
+        self.assertEqual(run(src), '[{"name": "Ann", "age": 3, "tags": ["x"], "addr": null}, '
+                                   '{"name": "Bob", "age": 4, "tags": [], "addr": {"city": "Рим", "zip": null}}]\n'
+                                   '{"1": [1.5, 1e+20]} "q\\"\\n\\u0001" [null, 1]\n'
+                                   '{\n  "a": [\n    1,\n    2\n  ],\n  "b": []\n}\n'
+                                   '[{"type": "Circle", "r": 1.0}, {"type": "Dot"}]\n')
+
+    def test_read_write_roundtrip(self):
+        path = os.path.join(TMP, "u.json")
+        src = self.TYPES + (
+            f'us = [User("Ann", 3, ["a", "b"], Addr("X", "1"))]\njson.write("{path}", us)\n'
+            f'fn load(p str) [User] = json.read(p)\nprint load("{path}") == us')
+        self.assertEqual(run(src), "True\n")
+        self.assertTrue(Path(path).read_text().startswith('[\n  {\n    "name": "Ann"'))
+
+    def test_errors(self):
+        def err(text):
+            src = self.TYPES + f'try\n    us: [User] = json.parse("{text}")\n    print us\ncatch ParseError e\n    print e'
+            return run(src).strip()
+        self.assertEqual(err('[{{\\"name\\": 1, \\"age\\": 2}}]'),
+                         "JSON $[0].name: expected string, got number (line 1, column 11)")
+        self.assertEqual(err('[{{\\"name\\": \\"a\\"}}]'), "JSON $[0]: missing field 'age'")
+        self.assertEqual(err('[{{\\"name\\": \\"a\\", \\"age\\": 1.5}}]'),
+                         "JSON $[0].age: expected int, got float (line 1, column 22)")
+        self.assertEqual(err("[1, 2"), "JSON $[0]: expected object, got number (line 1, column 2)")
+        self.assertEqual(err("[] x"), "invalid JSON: extra data after the value (line 1, column 4)")
+        self.assertIn("cannot infer the result type", errors_of('x = json.parse("1")\nprint x'))
+        self.assertIn("needs the type from the context", errors_of('c = json.parse("1")\nprint c["a"]'))
+        self.assertIn("cannot be read from JSON", errors_of('f: fn(int) int = json.parse("1")'))
+
+
+class CsvTest(unittest.TestCase):
+    def setUp(self):
+        self.path = os.path.join(TMP, "emp.csv")
+        Path(self.path).write_bytes(b'name,dept,salary,age\nAnn,dev,100.5,31\n"Smith, Bob",ops,80,\n\n'
+                                    b'"Multi\nline ""q""",dev,120,40\r\n')
+
+    def test_read_as_dicts_and_records(self):
+        src = (f'rows = csv.read("{self.path}")\nprint rows[1], len(rows)\n'
+               "type Emp(name str, dept str, salary float, age int? = nil, team str = \"core\")\n"
+               f'emps: [Emp] = csv.read("{self.path}")\nfor e in emps\n    print e\n'
+               'raw: [[str]] = csv.parse("a;b\\n1;\\"x;y\\"\\n", delimiter: ";")\nprint raw')
+        self.assertEqual(run(src),
+                         "{'name': 'Smith, Bob', 'dept': 'ops', 'salary': '80', 'age': ''} 3\n"
+                         "Emp(name='Ann', dept='dev', salary=100.5, age=31, team='core')\n"
+                         "Emp(name='Smith, Bob', dept='ops', salary=80.0, age=None, team='core')\n"
+                         "Emp(name='Multi\\nline \"q\"', dept='dev', salary=120.0, age=40, team='core')\n"
+                         "[['a', 'b'], ['1', 'x;y']]\n")
+
+    def test_write(self):
+        out = os.path.join(TMP, "out.csv")
+        src = ("type Emp(name str, salary float, age int?)\n"
+               f'csv.write("{out}", [Emp("A, B", 1.5, nil), Emp("C\\"", 2.0, 30)])\nprint read("{out}") == '
+               '"name,salary,age\\r\\n\\"A, B\\",1.5,\\r\\n\\"C\\"\\"\\",2.0,30\\r\\n"\n'
+               f'csv.write("{out}", [[1, 2], [3, 4]], delimiter: "\\t")\nprint read("{out}") == "1\\t2\\r\\n3\\t4\\r\\n"')
+        self.assertEqual(run(src), "True\nTrue\n")
+
+    def test_errors(self):
+        src = 'type E(name str, n int)\ntry\n    es: [E] = csv.parse("name,n\\nx,abc\\n")\ncatch ParseError e\n    print e'
+        self.assertEqual(run(src), "CSV line 2, column 'n': invalid int: 'abc'\n")
+        src = 'type E(name str, n int)\ntry\n    es: [E] = csv.parse("name\\nx\\n")\ncatch ParseError e\n    print e'
+        self.assertEqual(run(src), "CSV has no column 'n' (needed for E)\n")
+
+
+class _Handler(__import__("http.server").server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, body, ctype="application/json"):
+        b = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("X-Test", "yes")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        import json
+        import time
+        if self.path.startswith("/users/"):
+            i = int(self.path.split("/")[2])
+            self.reply(200, json.dumps({"id": i, "name": f"user{i}"}))
+        elif self.path.startswith("/slow"):
+            time.sleep(0.3)
+            self.reply(200, '"ok"')
+        elif self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/users/7")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/auth":
+            self.reply(200, self.headers.get("Authorization", ""), "text/plain")
+        else:
+            self.reply(404, "no", "text/plain")
+
+    def do_POST(self):
+        import json
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        self.reply(201, json.dumps({"got": body, "ctype": self.headers.get("Content-Type", "")}))
+
+
+class HttpTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import ThreadingHTTPServer
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def test_get_post(self):
+        b = self.base
+        src = (f'type User(id int, name str)\nBASE = "{b}"\nr = http.get("{{BASE}}/users/3")\n'
+               'print r.status, r.ok, r.headers["content-type"], r.text\nu: User = r.json()\nprint u\n'
+               'print http.get("{BASE}/redirect").url.endswith("/users/7")\n'
+               'print http.post("{BASE}/p", json: User(1, "A")).text\n'
+               'print http.post("{BASE}/p", body: "raw", headers: {"Content-Type": "text/plain"}).text\n'
+               'print http.get("{BASE}/auth", headers: {"Authorization": "Bearer t"}, timeout: 5).text')
+        self.assertEqual(run(src), '200 True application/json {"id": 3, "name": "user3"}\nUser(id=3, name=\'user3\')\n'
+                                   'True\n{"got": "{\\"id\\": 1, \\"name\\": \\"A\\"}", "ctype": "application/json"}\n'
+                                   '{"got": "raw", "ctype": "text/plain"}\nBearer t\n')
+
+    def test_errors(self):
+        b = self.base
+        src = (f'try\n    http.get("{b}/nope")\ncatch HttpError e\n    print e\n'
+               f'try\n    http.get("{b}/slow", timeout: 0.05)\ncatch IOError e\n    print "timeout"\n'
+               'try\n    http.get("http://127.0.0.1:1/")\ncatch IOError e\n    print "refused"')
+        self.assertEqual(run(src), f"HTTP 404 for {b}/nope\ntimeout\nrefused\n")
+
+    def test_parallel_requests(self):
+        src = (f'async fn get(u str) int = http.get(u).status\n'
+               f'async fn main()\n    t = time.perf_counter()\n'
+               f'    rs = await all(get("{self.base}/slow") for _ in 1..10)\n'
+               f'    print rs.count(200), time.perf_counter() - t < 2.0')
+        self.assertEqual(run(src), "10 True\n")
+
+
+class AsyncTest(unittest.TestCase):
+    def test_tasks(self):
+        src = ("async fn slow(i int) int\n    time.sleep(0.2)\n    i * 10\n"
+               "async fn twice(i int) int = (await slow(i)) + 1\n"
+               "async fn add(xs [int])\n    xs.append(len(xs))\n"
+               "async fn main()\n    t0 = time.perf_counter()\n    rs = await all(slow(i) for i in 0..7)\n"
+               "    print rs, time.perf_counter() - t0 < 1.0\n"
+               "    t = slow(1)\n    print await t, await t, t\n"
+               "    print await all([twice(i) for i in 0..2]), await all(i * i for i in 0..3)\n"
+               "    xs = []\n    await all(add(xs) for _ in 1..50)\n    print sorted(xs) == list(0..49)")
+        self.assertEqual(run(src), "[0, 10, 20, 30, 40, 50, 60, 70] True\n10 10 <task>\n[1, 11, 21] [0, 1, 4, 9]\nTrue\n")
+
+    def test_errors(self):
+        src = ('async fn boom(i int) int\n    if i == 3 then fail "task {i} failed"\n    i\n'
+               'async fn main()\n    try\n        await all(boom(i) for i in 0..5)\n    catch e\n        print e\n'
+               '    print await boom(3)')
+        r = proc(src)
+        self.assertEqual(r.stdout, "task 3 failed\n")
+        self.assertIn("t.sip:2: Error: task 3 failed", r.stderr)
+        self.assertIn("await is only allowed inside an async fn", errors_of("async fn f() int = 1\nprint await f()"))
+        self.assertIn("'g' is not async", errors_of("async fn f() int = 1\nfn g() int = await f()"))
+        self.assertIn("needs a list of tasks", errors_of("async fn main()\n    print await all(5)"))
 
 
 class ExamplesTest(unittest.TestCase):
@@ -593,6 +838,15 @@ class ExamplesTest(unittest.TestCase):
         p = self.d / "s.csv"
         p.write_text("name,dept,salary\nann,eng,100\nbob,eng,120\ncat,ops,90\n")
         self.assertEqual(self.ex("csv_groupby", str(p)), "eng: 110\nops: 90\n")
+
+    def test_todo_json(self):
+        p = str(self.d / "todo.json")
+        self.ex("todo", p, "--add", "a")
+        self.assertEqual(self.ex("todo", p, "--add", "b", "--done", "1"), "1. [x] a\n2. [ ] b\n")
+
+    def test_report_imports_module(self):
+        self.assertEqual(self.ex("report"), "Circle(r=1.0): 3.14\nRect(w=2.0, h=3.0): 6.00\nCircle(r=0.5): 0.79\n"
+                                            "total: 9.93\n")
 
     def test_config(self):
         p = self.d / "c.conf"
