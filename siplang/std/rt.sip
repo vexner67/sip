@@ -196,7 +196,94 @@ fn parse_int(s str) int
     if big or (not neg and v == -9223372036854775807 - 1) then fail OverflowError("int out of range: '{_head(s)}'")
     if neg then v else -v
 
+# ---------- символы и строки ----------
+
+# ord: код символа UTF-8; у строки из одного байта — сам байт (s[i] режет по байтам)
+fn str_ord(s str) int
+    n = len(s)
+    if n == 1 then return _byte(s, 0)
+    c = if n > 0 then _byte(s, 0) else 0
+    cp = -1
+    if n == 2 and (c & 224) == 192
+        cp = (c & 31) * 64 + (_byte(s, 1) & 63)
+    elif n == 3 and (c & 240) == 224
+        cp = (c & 15) * 4096 + (_byte(s, 1) & 63) * 64 + (_byte(s, 2) & 63)
+    elif n == 4 and (c & 248) == 240
+        cp = (c & 7) * 262144 + (_byte(s, 1) & 63) * 4096 + (_byte(s, 2) & 63) * 64 + (_byte(s, 3) & 63)
+    if cp < 0 then fail ValueError("ord() expected a character, but string of length {n} found")
+    cp
+
+fn str_chr(cp int) str
+    if cp < 0 or cp > 1114111 then fail ValueError("chr() arg not in range(0x110000)")
+    p = _alloc(4)
+    if cp < 128
+        _set(p, 0, cp)
+        return _str(p, 1)
+    if cp < 2048
+        _set(p, 0, 192 | (cp // 64))
+        _set(p, 1, 128 | (cp & 63))
+        return _str(p, 2)
+    if cp < 65536
+        _set(p, 0, 224 | (cp // 4096))
+        _set(p, 1, 128 | ((cp // 64) & 63))
+        _set(p, 2, 128 | (cp & 63))
+        return _str(p, 3)
+    _set(p, 0, 240 | (cp // 262144))
+    _set(p, 1, 128 | ((cp // 4096) & 63))
+    _set(p, 2, 128 | ((cp // 64) & 63))
+    _set(p, 3, 128 | (cp & 63))
+    _str(p, 4)
+
+# strip (left и right), lstrip, rstrip: пробельные байты ASCII по краям
+fn str_strip(s str, left bool, right bool) str
+    a = 0
+    b = len(s)
+    if left
+        while a < b and _space(_byte(s, a))
+            a += 1
+    if right
+        while b > a and _space(_byte(s, b - 1))
+            b -= 1
+    _sub(s, a, b)
+
+# repr строки как в Python: в одинарных кавычках, если внутри нет только одинарных
+fn repr_str(b ptr, s str)
+    q = if _find(s, "'", 0) >= 0 and _find(s, "\"", 0) < 0 then 34 else 39
+    _putc(b, q)
+    start = 0
+    for i in 0..len(s) - 1
+        c = _byte(s, i)
+        if c == 92 or c == q or c < 32 or c == 127
+            _put(b, _sub(s, start, i))
+            start = i + 1
+            if c == 92
+                _put(b, "\\\\")
+            elif c == q
+                _putc(b, 92)
+                _putc(b, c)
+            elif c == 10
+                _put(b, "\\n")
+            elif c == 9
+                _put(b, "\\t")
+            elif c == 13
+                _put(b, "\\r")
+            else
+                _put(b, "\\x")
+                _put(b, _sub(_HEX, c // 16, c // 16 + 1))
+                _put(b, _sub(_HEX, c & 15, (c & 15) + 1))
+    _put(b, _sub(s, start, len(s)))
+    _putc(b, q)
+
+_HEX = "0123456789abcdef"
+
 # ---------- числа ----------
+
+# float(s): пробелы по краям и всё, что понимает strtod
+fn parse_float(s str) float
+    v = _tofloat(str_strip(s, true, true))
+    if _fbad() then fail ParseError("invalid float: '{_head(s)}'")
+    v
+
 
 # float как в Python: кратчайшая запись, которая читается обратно; экспонента, если порядок < -4 или >= 16.
 # Если 15 значащих цифр читаются обратно, кратчайшая запись — они же без нулей в конце (более короткая
@@ -629,8 +716,6 @@ fn je_sep(b ptr, ind int, depth int, first bool)
 fn je_close(b ptr, ind int, depth int, c int)
     if ind >= 0 then je_sep(b, ind, depth, true)
     _putc(b, c)
-
-_HEX = "0123456789abcdef"
 
 fn je_str(b ptr, s str)
     _putc(b, 34)

@@ -1638,10 +1638,10 @@ class CGen:
         return ""
 
     def b_ord(self, e):
-        return f"sip_ord({self.ex(e.args[0])}, {e.line})"
+        return self.rt("str_ord", [self.ex(e.args[0])], e.line)
 
     def b_chr(self, e):
-        return f"sip_chr({self.ex(e.args[0])}, {e.line})"
+        return self.rt("str_chr", [self.ex(e.args[0])], e.line)
 
     def b_len(self, e):
         (a,) = e.args
@@ -1673,7 +1673,7 @@ class CGen:
         t = self.ty(a)
         code = self.ex(a)
         if t is STR:
-            return f"sip_parse_float({code}, {e.line})"
+            return self.rt("parse_float", [code], e.line)
         return f"((double)({code}))"
 
     def b_bool(self, e):
@@ -2093,13 +2093,13 @@ class CGen:
         return self.rt("str_map", [self.recv_args(e)[0], "true"])
 
     def ms_strip(self, e, t):
-        return f"sip_str_strip({self.recv_args(e)[0]}, 1, 1)"
+        return self.rt("str_strip", [self.recv_args(e)[0], "true", "true"])
 
     def ms_lstrip(self, e, t):
-        return f"sip_str_strip({self.recv_args(e)[0]}, 1, 0)"
+        return self.rt("str_strip", [self.recv_args(e)[0], "true", "false"])
 
     def ms_rstrip(self, e, t):
-        return f"sip_str_strip({self.recv_args(e)[0]}, 0, 1)"
+        return self.rt("str_strip", [self.recv_args(e)[0], "false", "true"])
 
     def ms_isdigit(self, e, t):
         return self.rt("str_all", [self.recv_args(e)[0], "0"])

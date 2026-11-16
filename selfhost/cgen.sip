@@ -1962,8 +1962,8 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
                     .emit(fmt_call(.ty(xn), sb, .ex(xn)))
             .emit("sip_print_line();")
             return ""
-        if name == "ord" then return "sip_ord({.ex(a[0])}, {l})"
-        if name == "chr" then return "sip_chr({.ex(a[0])}, {l})"
+        if name == "ord" then return .rt("str_ord", [.ex(a[0])], l)
+        if name == "chr" then return .rt("str_chr", [.ex(a[0])], l)
         if name == "len"
             t = .ty(a[0])
             code = .ex(a[0])
@@ -1982,7 +1982,7 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         if name == "float"
             t = .ty(a[0])
             code = .ex(a[0])
-            if t.id == STR.id then return "sip_parse_float({code}, {l})"
+            if t.id == STR.id then return .rt("parse_float", [code], l)
             return "((double)({code}))"
         if name == "bool" then return .cond(a[0])
         if name == "abs"
@@ -2284,9 +2284,9 @@ type CGen(c checker.Checker, file str, ld modules.Loader, reg creg.Registry, use
         c = .recv_args(e)
         if m == "lower" then return .rt("str_map", [c[0], "false"])
         if m == "upper" then return .rt("str_map", [c[0], "true"])
-        if m == "strip" then return "sip_str_strip({c[0]}, 1, 1)"
-        if m == "lstrip" then return "sip_str_strip({c[0]}, 1, 0)"
-        if m == "rstrip" then return "sip_str_strip({c[0]}, 0, 1)"
+        if m == "strip" then return .rt("str_strip", [c[0], "true", "true"])
+        if m == "lstrip" then return .rt("str_strip", [c[0], "true", "false"])
+        if m == "rstrip" then return .rt("str_strip", [c[0], "false", "true"])
         if m == "isdigit" then return .rt("str_all", [c[0], "0"])
         if m == "isalpha" then return .rt("str_all", [c[0], "1"])
         if m == "isspace" then return .rt("str_all", [c[0], "2"])

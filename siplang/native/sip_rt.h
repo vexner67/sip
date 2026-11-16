@@ -916,39 +916,9 @@ static int64_t sip_str_find(sip_str s, sip_str sub) {
 
 static inline bool sip_str_contains(sip_str s, sip_str sub) { return sip_str_find(s, sub) >= 0; }
 
-/* ord: код символа UTF-8; у строки из одного байта — сам байт (s[i] режет по байтам) */
-static int64_t sip_ord(sip_str s, int line) {
-    if (s.n == 1) return (unsigned char)s.p[0];
-    const unsigned char *p = (const unsigned char *)s.p;
-    int64_t n = s.n, cp = -1;
-    if (n == 2 && (p[0] & 0xE0) == 0xC0) cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
-    else if (n == 3 && (p[0] & 0xF0) == 0xE0) cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
-    else if (n == 4 && (p[0] & 0xF8) == 0xF0)
-        cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
-    if (cp < 0) sip_raisef(SIP_E_ValueError, line, "ord() expected a character, but string of length %lld found", (long long)n);
-    return cp;
-}
+/* ord, chr, strip, float(s), repr строки — в std/rt.sip */
 
-static sip_str sip_chr(int64_t cp, int line) {
-    if (cp < 0 || cp > 0x10FFFF) sip_raisef(SIP_E_ValueError, line, "chr() arg not in range(0x110000)");
-    char *p = sip_alloc_atomic(4);
-    int n;
-    if (cp < 0x80) { p[0] = (char)cp; n = 1; }
-    else if (cp < 0x800) { p[0] = (char)(0xC0 | (cp >> 6)); p[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
-    else if (cp < 0x10000) {
-        p[0] = (char)(0xE0 | (cp >> 12)); p[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); p[2] = (char)(0x80 | (cp & 0x3F)); n = 3;
-    } else {
-        p[0] = (char)(0xF0 | (cp >> 18)); p[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-        p[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); p[3] = (char)(0x80 | (cp & 0x3F)); n = 4;
-    }
-    return (sip_str){p, n};
-}
-
-
-
-
-
-
+static inline bool sip_isspace(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
 
 static inline bool sip_str_startswith(sip_str s, sip_str p) {
     return p.n <= s.n && memcmp(s.p, p.p, (size_t)p.n) == 0;
@@ -959,40 +929,17 @@ static inline bool sip_str_endswith(sip_str s, sip_str p) {
 }
 
 
-static inline bool sip_isspace(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
-
-static sip_str sip_str_strip(sip_str s, int left, int right) {
-    int64_t a = 0, b = s.n;
-    if (left) while (a < b && sip_isspace(s.p[a])) a++;
-    if (right) while (b > a && sip_isspace(s.p[b - 1])) b--;
-    return (sip_str){s.p + a, b - a};
-}
-
-
-
-
-static double sip_parse_float(sip_str s, int line) {
-    sip_str t = sip_str_strip(s, 1, 1);
-    char buf[128];
-    if (t.n == 0 || t.n >= (int64_t)sizeof buf) goto bad;
-    memcpy(buf, t.p, (size_t)t.n);
-    buf[t.n] = 0;
-    char *end;
-    double v = strtod(buf, &end);
-    if (*end) goto bad;
-    return v;
-bad:
-    sip_raisef(SIP_E_ParseError, line, "invalid float: '%.*s'", (int)(s.n > 40 ? 40 : s.n), s.p);
-}
-
 /* Печать float как в Python (кратчайшая запись, которая читается обратно) написана на Sip: fmt_float
  * в std/rt.sip. Здесь — только объявление: rt.sip подключается к каждой программе. */
 #ifdef SIP_SPLIT
-void f_std__rt__fmt_float(void *b, double x);
+#define SIP_RT_DECL
 #else
-static void f_std__rt__fmt_float(void *b, double x);
+#define SIP_RT_DECL static
 #endif
+SIP_RT_DECL void f_std__rt__fmt_float(void *b, double x);
+SIP_RT_DECL void f_std__rt__repr_str(void *b, sip_str s);
 static inline void str_float(sip_sb *b, double x) { f_std__rt__fmt_float(b, x); }
+static inline void repr_str(sip_sb *b, sip_str s) { f_std__rt__repr_str(b, s); }
 
 static inline void str_int(sip_sb *b, int64_t x) {
     char buf[24];
@@ -1025,24 +972,6 @@ static void str_ptr(sip_sb *b, void *p) {
 #define repr_float str_float
 #define repr_bool str_bool
 #define repr_range str_range
-
-static void repr_str(sip_sb *b, sip_str s) {
-    bool has_sq = memchr(s.p, '\'', (size_t)s.n) != NULL;
-    bool has_dq = memchr(s.p, '"', (size_t)s.n) != NULL;
-    char q = (has_sq && !has_dq) ? '"' : '\'';
-    sip_sb_putc(b, q);
-    for (int64_t i = 0; i < s.n; i++) {
-        unsigned char c = (unsigned char)s.p[i];
-        if (c == '\\') sip_sb_put(b, "\\\\", 2);
-        else if (c == (unsigned char)q) { sip_sb_putc(b, '\\'); sip_sb_putc(b, (char)c); }
-        else if (c == '\n') sip_sb_put(b, "\\n", 2);
-        else if (c == '\t') sip_sb_put(b, "\\t", 2);
-        else if (c == '\r') sip_sb_put(b, "\\r", 2);
-        else if (c < 32 || c == 127) sip_sb_printf(b, "\\x%02x", c);
-        else sip_sb_putc(b, (char)c);
-    }
-    sip_sb_putc(b, q);
-}
 
 static inline sip_str sip_int_to_str(int64_t x) { sip_sb b = sip_sb_new(); str_int(&b, x); return sip_sb_done(&b); }
 
