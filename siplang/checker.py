@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from .errors import SipError
 from .nodes import *  # noqa: F403
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, ListT, Prim, RecordT, SumT, TupleT, TVar,
-                    comparable, deep, hashable, is_resolved, prune, same, show, truthy_ok)
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SumT, TupleT,
+                    TVar, comparable, deep, hashable, is_resolved, opt, prune, same, show, truthy_ok)
 
 ERROR_KINDS = ["Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
-               "ZeroDivisionError", "AssertionError", "IOError"]
+               "ZeroDivisionError", "AssertionError", "IOError", "NilError"]
 CATCH_ALL = {"Exception"}
 
 UNSUPPORTED = "is not supported by the native compiler yet"
@@ -108,6 +108,8 @@ class Checker:
         self.cur: FnInfo | None = None
         self.scopes: list = []
         self.uid = 0
+        self.lambdas: list = []  # лямбды, тело которых проверяется сейчас (вложенные — в конце)
+        self.nils: list = []     # литералы nil: тип без контекста потом станет int?
 
     # ---------- общее ----------
 
@@ -136,15 +138,58 @@ class Checker:
             return self.unify(a.key, b.key) and self.unify(a.val, b.val)
         if isinstance(a, TupleT):
             return len(a.items) == len(b.items) and all(self.unify(x, y) for x, y in zip(a.items, b.items))
+        if isinstance(a, OptT):
+            return self.unify(a.inner, b.inner)
+        if isinstance(a, FnT):
+            return (len(a.params) == len(b.params) and all(self.unify(x, y) for x, y in zip(a.params, b.params))
+                    and self.unify(a.ret, b.ret))
         return False  # разные Prim, разные записи
 
-    def expect(self, want, got, node, what: str):
-        """Значение типа got кладётся туда, где ждут want. int становится float сам."""
-        if prune(want) is FLOAT and prune(got) is INT:
+    def expect(self, want, got, node, what: str, src=None):
+        """Значение типа got кладётся туда, где ждут want.
+
+        int становится float сам. Если передано выражение src, разрешены и
+        преобразования T -> T? (обёртка) и T? -> T (проверка на nil при
+        выполнении); они записываются в src.cty для генератора C.
+        """
+        pw, pg = prune(want), prune(got)
+        if pw is FLOAT and pg is INT:
+            return
+        if src is not None and isinstance(pw, OptT) and not isinstance(pg, (OptT, TVar)) and pg is not UNIT:
+            self.expect(pw.inner, got, node, what)
+            src.cty = want
+            return
+        if isinstance(pg, OptT) and not isinstance(pw, (OptT, TVar)):
+            if is_nil(src) or src is None:
+                self.err(f"{what}: {show(want)} cannot be nil (use {show(want)}? for an optional value)", node)
+            self.expect(want, pg.inner, node, what)
+            src.cty = want
             return
         if not self.unify(want, got):
-            hint = " (write 0.0 for a float)" if prune(want) is INT and prune(got) is FLOAT else ""
+            hint = " (write 0.0 for a float)" if pw is INT and pg is FLOAT else ""
             self.err(f"{what}: expected {show(want)}, got {show(got)}{hint}", node)
+
+    def unite(self, items, what: str):
+        """Общий тип нескольких значений [(узел, тип)]: int+float -> float, T+nil -> T?."""
+        anyopt = any(isinstance(prune(t), OptT) for _, t in items)
+        acc = TVar()
+        for n, t in items:
+            pt = prune(t)
+            acc = self.join(acc, pt.inner if isinstance(pt, OptT) else t, n, what)
+        target = OptT(acc) if anyopt else acc
+        for n, t in items:
+            self.expect(target, t, n, what, src=n)
+        return target
+
+    def compatible(self, a, b) -> bool:
+        a, b = prune(a), prune(b)
+        a = prune(a.inner) if isinstance(a, OptT) else a
+        b = prune(b.inner) if isinstance(b, OptT) else b
+        if isinstance(a, TVar) or isinstance(b, TVar):
+            return True
+        if a in (INT, FLOAT) and b in (INT, FLOAT):
+            return True
+        return same(a, b)
 
     def join(self, a, b, node, what: str):
         """Общий тип двух веток: int и float дают float."""
@@ -160,7 +205,8 @@ class Checker:
 
     def need_resolved(self, t, node, what: str):
         if not is_resolved(t):
-            self.err(f"cannot infer the type of {what}; add a type, e.g. xs: [int] = []", node)
+            hint = "x: int? = nil" if isinstance(prune(t), OptT) else "xs: [int] = []"
+            self.err(f"cannot infer the type of {what}; add a type, e.g. {hint}", node)
 
     def to_type(self, t):
         if isinstance(t, TName):
@@ -176,7 +222,7 @@ class Checker:
                 self.err(f"write {'[T]' if n == 'list' else '{K: V}' if n == 'dict' else '(A, B)'} "
                          f"instead of '{n}'", t)
             if n == "None":
-                self.err(f"nil {UNSUPPORTED}", t)
+                self.err("nil is not a type; write T? for a value that may be nil, e.g. int?", t)
             self.err(f"unknown type '{n}'", t)
         if isinstance(t, TList):
             return ListT(self.to_type(t.item))
@@ -188,7 +234,9 @@ class Checker:
         if isinstance(t, TTuple):
             return TupleT([self.to_type(i) for i in t.items])
         if isinstance(t, TOptional):
-            self.err(f"optional types (T?) {UNSUPPORTED}", t)
+            return opt(self.to_type(t.inner))
+        if isinstance(t, TFn):
+            return FnT([self.to_type(p) for p in t.params], UNIT if t.ret is None else self.to_type(t.ret))
         self.err("bad type", t)
 
     # ---------- модуль ----------
@@ -279,21 +327,31 @@ class Checker:
         for fi in list(p.fns.values()) + p.methods:
             self.check_fn(fi)
 
+        self.default_nils(0)
         for name, v in p.globals.items():
             self.need_resolved(v.ty, None, f"global '{name}'")
         if "main" in p.fns:
             m = p.fns["main"]
-            for name, t, _ in m.params:
-                if prune(t) not in (INT, FLOAT, STR, BOOL):
-                    self.err(f"main parameter '{name}' must be int, float, str or bool", m.node)
+            for name, t, d in m.params:
+                pt = prune(t)
+                if isinstance(pt, OptT) and d is not None:
+                    pt = prune(pt.inner)
+                if pt not in (INT, FLOAT, STR, BOOL):
+                    self.err(f"main parameter '{name}' must be int, float, str or bool (or T? = nil)", m.node)
             p.main = m
         return p
+
+    def default_nils(self, start: int):
+        """nil, тип которого ничто не уточнило (print nil, (1, nil)), хранится как int?."""
+        for n in self.nils[start:]:
+            if not is_resolved(n.ty):
+                self.unify(prune(n.ty).inner, INT)
 
     def default_type(self, e):
         if not literal_default(e):
             self.err("default value must be a literal", e)
         saved, self.cur = self.cur, None
-        t = self.expr(e)
+        t = self.expr(e, opt=True)
         self.cur = saved
         return t
 
@@ -314,8 +372,11 @@ class Checker:
                 if prm.default is not None:
                     if not literal_default(prm.default):
                         self.err("default value must be a literal", prm.default)
-                    self.expect(t, self.default_type(prm.default), prm.default, f"default of '{prm.name}'")
+                    self.expect(t, self.default_type(prm.default), prm.default, f"default of '{prm.name}'",
+                                src=prm.default)
             elif prm.default is not None:
+                if is_nil(prm.default):
+                    self.err(f"parameter '{prm.name}' needs a type, e.g. {prm.name} int? = nil", prm)
                 t = self.default_type(prm.default)
             else:
                 self.err(f"parameter '{prm.name}' needs a type, e.g. {prm.name} int", prm)
@@ -333,8 +394,8 @@ class Checker:
         if fi.state != "new":
             return
         fi.state = "busy"
-        saved = (self.cur, self.scopes)
-        self.cur, self.scopes = fi, []
+        saved = (self.cur, self.scopes, self.lambdas)
+        self.cur, self.scopes, self.lambdas = fi, [], []
         if fi.owner is not None:
             fi.locals["self"] = Var("self", fi.owner, "self", "param")
         for name, t, _ in fi.params:
@@ -347,7 +408,9 @@ class Checker:
         for name in names:
             if name not in fi.locals:
                 fi.locals[name] = Var(name, TVar(), f"v_{name}", "local")
+        start = len(self.nils)
         self.block(fi.body)
+        self.default_nils(start)
         if isinstance(prune(fi.ret), TVar):
             fi.ret.ref = UNIT
         for v in fi.locals.values():
@@ -355,7 +418,7 @@ class Checker:
         if fi.cache and prune(fi.ret) is UNIT:
             self.err("@cache function must return a value", fi.node)
         fi.state = "done"
-        self.cur, self.scopes = saved
+        self.cur, self.scopes, self.lambdas = saved
 
     def assigned(self, stmts: list, augs: list | None = None) -> list:
         """Имена, которым что-то присваивается: это локальные переменные.
@@ -425,12 +488,23 @@ class Checker:
         return names
 
     def lookup(self, name: str):
-        for scope in reversed(self.scopes):
-            if name in scope:
-                return scope[name]
+        for i in range(len(self.scopes) - 1, -1, -1):
+            if name in self.scopes[i]:
+                var = self.scopes[i][name]
+                self.capture(var, i)
+                return var
         if self.cur is not None and name in self.cur.locals:
-            return self.cur.locals[name]
+            var = self.cur.locals[name]
+            if var.kind != "global":
+                self.capture(var, -1)
+            return var
         return self.p.globals.get(name)
+
+    def capture(self, var, level: int):
+        """Переменная из внешней области видимости, использованная в лямбде, копируется в её окружение."""
+        for lam in self.lambdas:
+            if level < lam.depth and var.cname not in lam.captures:
+                lam.captures[var.cname] = var
 
     # ---------- инструкции ----------
 
@@ -447,14 +521,14 @@ class Checker:
     def s_ExprStmt(self, s):
         self.expr(s.expr)
 
-    def assign_to(self, t, vt, node):
+    def assign_to(self, t, vt, node, src=None):
         if isinstance(t, Name):
             var = self.lookup(t.id)
             if var is None:
                 self.err(f"cannot assign to '{t.id}'", t)
             t.var = var
             t.ty = var.ty
-            self.expect(var.ty, vt, node, f"assignment to '{t.id}'")
+            self.expect(var.ty, vt, node, f"assignment to '{t.id}'", src)
         elif isinstance(t, TupleLit):
             pv = prune(vt)
             if not isinstance(pv, TupleT) or len(pv.items) != len(t.items):
@@ -463,34 +537,43 @@ class Checker:
             for item, it in zip(t.items, pv.items):
                 self.assign_to(item, it, node)
         else:
-            tt = self.expr(t)
+            tt = self.expr(t, opt=True)
             if isinstance(t, Index) and getattr(t, "index_kind", "") not in ("list", "dict"):
                 self.err(f"cannot assign into {show(t.obj.ty)}", t)
-            self.expect(tt, vt, node, "assignment")
+            self.expect(tt, vt, node, "assignment", src)
 
     def s_Assign(self, s):
-        vt = self.expr(s.value)
+        want = None
+        if len(s.targets) == 1 and isinstance(s.targets[0], Name):
+            var = self.lookup(s.targets[0].id)
+            want = var.ty if var is not None else None
+        vt = self.expr(s.value, opt=True, want=want)
         if prune(vt) is UNIT:
             self.err("this expression has no value", s.value)
         for t in s.targets:
-            self.assign_to(t, vt, s)
+            self.assign_to(t, vt, s, s.value)
 
     def s_AnnAssign(self, s):
         want = self.to_type(s.type)
         var = self.lookup(s.target.id)
         self.expect(var.ty, want, s, f"variable '{s.target.id}'")
-        self.assign_to(s.target, self.expr(s.value), s)
+        self.assign_to(s.target, self.expr(s.value, opt=True, want=want), s, s.value)
 
     def s_AugAssign(self, s):
         if isinstance(s.target, TupleLit):
             self.err("cannot use an augmented assignment with several targets", s)
+        tt = self.expr(s.target, opt=True)
         s.binop = BinOp(s.op[:-1], s.target, s.value, line=s.line)
         t = self.expr(s.binop)
-        tt = s.target.ty
+        if isinstance(prune(tt), OptT):
+            # x += 1 для x: int? — это x = x + 1 с проверкой на nil
+            s.as_assign = Assign([s.target], s.binop, line=s.line)
+            self.expect(tt, t, s, f"'{s.op}'", src=s.binop)
+            return
         self.expect(tt, t, s, f"'{s.op}'")
 
     def cond(self, e):
-        t = self.expr(e)
+        t = self.expr(e, opt=True)
         if not truthy_ok(t):
             self.err(f"a condition must be bool, number, str, list or dict, not {show(t)}", e)
 
@@ -534,11 +617,13 @@ class Checker:
     def s_Return(self, s):
         if self.cur is self.p.top:
             self.err("return outside a function", s)
-        t = UNIT if s.value is None else self.expr(s.value)
-        if not self.unify(self.cur.ret, t):
-            if prune(self.cur.ret) is FLOAT and prune(t) is INT:
-                return
-            self.err(f"{self.cur.name} returns {show(self.cur.ret)}, got {show(t)}", s)
+        if s.value is None:
+            t = UNIT
+        else:
+            t = self.expr(s.value, opt=True, want=self.cur.ret)
+        if is_nil(s.value) and isinstance(prune(self.cur.ret), TVar):
+            self.err(f"{self.cur.name}() returns nil here: declare its return type, e.g. fn {self.cur.name}(...) int?", s)
+        self.expect(self.cur.ret, t, s, f"{self.cur.name}() result", src=s.value)
 
     def s_Break(self, s):
         pass
@@ -572,7 +657,7 @@ class Checker:
             self.block(h.body)
 
     def s_Match(self, s):
-        st = self.expr(s.subject)
+        st = self.expr(s.subject, opt=True)
         self.need_resolved(st, s.subject, "the match subject")
         for arm in s.arms:
             self.pattern(arm.pattern, st, arm)
@@ -584,6 +669,17 @@ class Checker:
         t = prune(t)
         if isinstance(p, PWild):
             return
+        if isinstance(t, OptT) and not isinstance(p, (PCapture, POr)):
+            if isinstance(p, PLit) and is_nil(p.expr):
+                self.expr(p.expr, opt=True)
+                p.nil = True
+                p.ty = t
+                return
+            p.unwrap = True  # остальные образцы сначала проверяют, что значение не nil
+            self.pattern(p, t.inner, node, in_or)
+            return
+        if isinstance(p, PLit) and is_nil(p.expr):
+            self.err(f"pattern nil cannot match {show(t)}, which is never nil", p)
         if isinstance(p, (PCapture, PStar)):
             if in_or:
                 self.err("names cannot be bound inside '|' patterns", p)
@@ -659,12 +755,22 @@ class Checker:
 
     # ---------- выражения ----------
 
-    def expr(self, e):
-        m = getattr(self, "e_" + type(e).__name__, None)
-        if m is None:
-            self.err(f"{type(e).__name__.lower()} {UNSUPPORTED}", e)
-        t = m(e)
+    def expr(self, e, opt=False, want=None):
+        """Тип выражения. Если opt=False, значение T? сразу проверяется на nil и даёт T."""
+        if isinstance(e, Lambda):
+            t = self.e_Lambda(e, want)
+        else:
+            m = getattr(self, "e_" + type(e).__name__, None)
+            if m is None:
+                self.err(f"{type(e).__name__.lower()} {UNSUPPORTED}", e)
+            t = m(e)
         e.ty = t
+        pt = prune(t)
+        if not opt and isinstance(pt, OptT):
+            if is_nil(e):
+                self.err("nil cannot be used here", e)
+            e.cty = pt.inner
+            return pt.inner
         return t
 
     def e_Num(self, e):
@@ -673,7 +779,7 @@ class Checker:
     def e_Str(self, e):
         for part in e.parts:
             if isinstance(part, Interp):
-                t = self.expr(part.expr)
+                t = self.expr(part.expr, opt=part.spec is None)
                 if prune(t) is UNIT:
                     self.err("this expression has no value", part.expr)
                 if part.spec is not None and prune(t) not in (INT, FLOAT, STR):
@@ -682,7 +788,8 @@ class Checker:
 
     def e_Const(self, e):
         if e.value == "None":
-            self.err(f"nil {UNSUPPORTED}", e)
+            self.nils.append(e)
+            return OptT(TVar())
         return BOOL
 
     def e_Name(self, e):
@@ -702,8 +809,14 @@ class Checker:
                 self.err(f"'{e.id}' needs its fields: {e.id}(...)", e)
             e.variant = (st, e.id)
             return st
-        if e.id in self.p.fns or e.id in BUILTINS:
-            self.err(f"functions as values {UNSUPPORTED}; call it: {e.id}(...)", e)
+        if e.id in self.p.fns:
+            fi = self.p.fns[e.id]
+            if fi.state == "new" and isinstance(prune(fi.ret), TVar):
+                self.check_fn(fi)
+            e.fnref = fi
+            return FnT([t for _, t, _ in fi.params], fi.ret)
+        if e.id in BUILTINS:
+            self.err(f"built-in '{e.id}' cannot be used as a value; wrap it: fn(x) = {e.id}(x)", e)
         self.err(f"unknown name '{e.id}'", e)
 
     def e_SelfAttr(self, e):
@@ -712,6 +825,7 @@ class Checker:
             self.err(f"'.{e.name}' used outside a method", e)
         if not isinstance(fi.owner, RecordT) or e.name not in fi.owner.fields:
             self.err(f"{show(fi.owner)} has no field '{e.name}'", e)
+        self.lookup("self")  # внутри лямбды self попадает в окружение
         return fi.owner.fields[e.name]
 
     def e_Attr(self, e):
@@ -783,16 +897,19 @@ class Checker:
                 if default is None:
                     self.err(f"{what} is missing argument '{n}'", call)
                 bound[i] = default
-            at = self.expr(bound[i])
-            self.expect(t, at, bound[i], f"argument '{n}' of {what}")
+            at = self.expr(bound[i], opt=True, want=t)
+            self.expect(t, at, bound[i], f"argument '{n}' of {what}", src=bound[i])
         call.bound = bound
 
     def e_Call(self, e):
         f = e.func
+        if isinstance(f, SelfAttr) and self.cur is not None and self.cur.owner is not None \
+                and f.name in self.cur.owner.methods:
+            f = e.func = Attr(Name("self", line=f.line), f.name, line=f.line)  # .other() внутри метода
         if isinstance(f, Name):
             name = f.id
             if self.lookup(name) is not None:
-                self.err(f"'{name}' is a variable, not a function", e)
+                return self.call_value(e)
             if name in self.p.fns:
                 fi = self.p.fns[name]
                 self.bind_args(e, fi.params, f"{name}()")
@@ -825,11 +942,45 @@ class Checker:
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)
                 return fi.ret
+            if isinstance(rt, RecordT) and f.name in rt.fields:
+                return self.call_value(e)
             e.ckind, e.mname, e.recv = "bmethod", f.name, f.obj
             return self.bmethod(e, rt, f.name)
-        self.err(f"calling this expression {UNSUPPORTED}", e)
+        return self.call_value(e)
 
-    def args(self, e, lo: int, hi: int | None = None, kw=()):
+    def call_value(self, e):
+        """Вызов значения-функции (лямбды, параметра типа fn(...))."""
+        ft = prune(self.expr(e.func))
+        if isinstance(ft, TVar):
+            self.err("cannot call a value of unknown type", e)
+        if not isinstance(ft, FnT):
+            self.err(f"{show(ft)} is not a function", e)
+        if e.kwargs:
+            self.err("a function value takes positional arguments only", e)
+        if len(e.args) != len(ft.params):
+            self.err(f"function takes {len(ft.params)} argument(s), got {len(e.args)}", e)
+        for i, (a, pt) in enumerate(zip(e.args, ft.params)):
+            self.expect(pt, self.expr(a, opt=True, want=pt), a, f"argument {i + 1}", src=a)
+        e.ckind, e.bound = "closure", list(e.args)
+        return ft.ret
+
+    def fnarg(self, node, params, ret, what):
+        """Аргумент-функция встроенного метода: map(fn(x) = ...) и т. п."""
+        ft = prune(self.expr(node, want=FnT(params, ret)))
+        if not isinstance(ft, FnT) or len(ft.params) != len(params):
+            self.err(f"{what} needs a function of {len(params)} argument(s), not {show(ft)}", node)
+        for a, b in zip(ft.params, params):
+            if not self.unify(a, b):
+                self.err(f"{what}: the function takes {show(a)}, but gets {show(b)}", node)
+        return ft.ret
+
+    def kwarg(self, e, name):
+        for k, v in e.kwargs:
+            if k == name:
+                return v
+        return None
+
+    def args(self, e, lo: int, hi: int | None = None, kw=(), opt=False):
         hi = lo if hi is None else hi
         name = e.bname if getattr(e, "ckind", "") == "builtin" else e.mname
         if not lo <= len(e.args) <= hi:
@@ -838,7 +989,7 @@ class Checker:
         for k, _ in e.kwargs:
             if k not in kw:
                 self.err(f"{name}() has no parameter '{k}'", e)
-        return [self.expr(a) for a in e.args]
+        return [self.expr(a, opt=opt) for a in e.args]
 
     def bmethod(self, e, t, name):
         t = prune(t)
@@ -864,11 +1015,21 @@ class Checker:
     def e_BinOp(self, e):
         op = e.op
         if op in ("and", "or"):
-            lt, rt = self.expr(e.left), self.expr(e.right)
+            lt, rt = self.expr(e.left, opt=True), self.expr(e.right, opt=True)
             for side, st in ((e.left, lt), (e.right, rt)):
                 if not truthy_ok(st):
                     self.err(f"'{op}' needs bool, number, str, list or dict, not {show(st)}", side)
-            return self.join(lt, rt, e, f"'{op}'")
+            pl, pr = prune(lt), prune(rt)
+            if op == "or" and isinstance(pl, OptT) and not isinstance(pr, (OptT, TVar)) \
+                    and self.compatible(pl.inner, pr):
+                e.opt_or = True  # name or "anon": nil (и пустое значение) заменяется вторым
+                res = self.join(pl.inner, rt, e, "'or'")
+                e.right.cty = res
+                return res
+            if not self.compatible(lt, rt):
+                e.logic_bool = True  # x and x.n > 0: в условии важна только истинность
+                return BOOL
+            return self.unite([(e.left, lt), (e.right, rt)], f"'{op}'")
         lt, rt = self.expr(e.left), self.expr(e.right)
         pl, pr = prune(lt), prune(rt)
         # неизвестный тип (рекурсия) принимает тип другой стороны
@@ -901,9 +1062,30 @@ class Checker:
         self.err(f"operator '{op}' {UNSUPPORTED}", e)
 
     def e_Compare(self, e):
-        left = self.expr(e.left)
+        eqish = all(op in ("==", "!=", "is", "is not") for op, _ in e.ops)
+        left = self.expr(e.left, opt=eqish)
+        lnode = e.left
+        e.nilcmp = []
         for op, right in e.ops:
-            rt = self.expr(right)
+            rt = self.expr(right, opt=eqish)
+            nil_side = right if is_nil(right) else lnode if is_nil(lnode) else None
+            if op in ("==", "!=", "is", "is not") and nil_side is not None:
+                other, ot = (lnode, left) if nil_side is right else (right, rt)
+                po = prune(ot)
+                if isinstance(po, TVar):
+                    self.unify(po, OptT(TVar()))
+                elif not isinstance(po, OptT):
+                    self.err(f"{show(ot)} is never nil", e)
+                e.nilcmp.append(True)
+                left, lnode = rt, right
+                continue
+            e.nilcmp.append(False)
+            if op in ("is", "is not"):
+                self.err(f"'{op}' works only with nil; use == or !=", e)
+            if op in ("==", "!=") and (isinstance(prune(left), OptT) or isinstance(prune(rt), OptT)):
+                self.unite([(lnode, left), (right, rt)], f"'{op}'")
+                left, lnode = rt, right
+                continue
             if op in ("in", "not in"):
                 c = prune(rt)
                 if isinstance(c, ListT):
@@ -923,11 +1105,11 @@ class Checker:
                     self.join(left, rt, e, f"'{op}'")
                 if op not in ("==", "!=") and not comparable(left):
                     self.err(f"cannot order {show(left)} with '{op}'", e)
-            left = rt
+            left, lnode = rt, right
         return BOOL
 
     def e_Unary(self, e):
-        t = self.expr(e.operand)
+        t = self.expr(e.operand, opt=e.op == "not")
         if e.op == "not":
             if not truthy_ok(t):
                 self.err(f"'not' needs bool, number, str, list or dict, not {show(t)}", e)
@@ -943,13 +1125,14 @@ class Checker:
 
     def e_IfExpr(self, e):
         self.cond(e.cond)
-        a, b = self.expr(e.then), self.expr(e.other)
+        a, b = self.expr(e.then, opt=True), self.expr(e.other, opt=True)
         pa, pb = deep(a), deep(b)
         # `if ... then "Fizz" else i`: ветки разных типов, одна из них str -> обе в str
-        if is_resolved(pa) and is_resolved(pb) and STR in (pa, pb) and not same(pa, pb):
+        if is_resolved(pa) and is_resolved(pb) and STR in (pa, pb) and not same(pa, pb) \
+                and not isinstance(pa, OptT) and not isinstance(pb, OptT):
             e.stringify = True
             return STR
-        return self.join(a, b, e, "if-expression branches")
+        return self.unite([(e.then, a), (e.other, b)], "if-expression branches")
 
     def e_Range(self, e):
         self.expect(INT, self.expr(e.lo), e.lo, "range start")
@@ -957,23 +1140,25 @@ class Checker:
         return RANGE
 
     def e_ListLit(self, e):
-        elem = TVar()
+        items = []
         for item in e.items:
             if isinstance(item, Starred):
                 self.err(f"*spread {UNSUPPORTED}", item)
-            elem = self.join(elem, self.expr(item), item, "list items")
-        return ListT(elem)
+            items.append((item, self.expr(item, opt=True)))
+        return ListT(self.unite(items, "list items") if items else TVar())
 
     def e_TupleLit(self, e):
-        return TupleT([self.expr(i) for i in e.items])
+        return TupleT([self.expr(i, opt=True) for i in e.items])
 
     def e_DictLit(self, e):
-        kt, vt = TVar(), TVar()
+        kt = TVar()
+        vals = []
         for k, v in e.pairs:
             if k is None:
                 self.err(f"**spread {UNSUPPORTED}; use a | b", v)
             kt = self.join(kt, self.expr(k), k, "dict keys")
-            vt = self.join(vt, self.expr(v), v, "dict values")
+            vals.append((v, self.expr(v, opt=True)))
+        vt = self.unite(vals, "dict values") if vals else TVar()
         if is_resolved(kt) and not hashable(kt):
             self.err(f"dict key type must be hashable, not {show(kt)}", e)
         return DictT(kt, vt)
@@ -988,7 +1173,7 @@ class Checker:
             self.bind_comp_target(c.target, elem, scope, c)
             for cond in c.conds:
                 self.cond(cond)
-        elt = self.expr(e.elt)
+        elt = self.expr(e.elt, opt=e.kind != "dict")
         if prune(elt) is UNIT:
             self.err("this expression has no value", e.elt)
         result = ListT(elt)
@@ -1002,7 +1187,7 @@ class Checker:
         if isinstance(t, Name):
             var = Var(t.id, ty, self.fresh(f"c_{t.id}_"), "comp")
             scope[t.id] = var
-            self.cur.extra.append(var)
+            (self.lambdas[-1].extra if self.lambdas else self.cur.extra).append(var)
             t.var = var
             t.ty = ty
         elif isinstance(t, TupleLit):
@@ -1013,8 +1198,36 @@ class Checker:
             for item, it in zip(t.items, pt.items):
                 self.bind_comp_target(item, it, scope, node)
 
-    def e_Lambda(self, e):
-        self.err(f"anonymous functions {UNSUPPORTED}; use a comprehension or a named fn", e)
+    def e_Lambda(self, e, want=None):
+        pw = prune(want) if want is not None else None
+        if isinstance(pw, OptT):
+            pw = prune(pw.inner)
+        ptypes = [self.to_type(tn) if tn is not None else TVar() for tn in e.types]
+        if isinstance(pw, FnT):
+            if len(pw.params) != len(ptypes):
+                self.err(f"expected a function of {len(pw.params)} argument(s), got {len(ptypes)}", e)
+            for name, a, b in zip(e.params, ptypes, pw.params):
+                if not self.unify(a, b):
+                    self.err(f"parameter '{name}' is {show(a)}, but the function gets {show(b)}", e)
+        for name, t in zip(e.params, ptypes):
+            if not is_resolved(t):
+                self.err(f"cannot infer the type of '{name}'; write fn({name} int) = ...", e)
+        e.lid = self.fresh("")
+        e.captures = {}
+        e.extra = []
+        e.pvars = [Var(n, t, f"a{e.lid}_{n}", "lparam") for n, t in zip(e.params, ptypes)]
+        e.depth = len(self.scopes)
+        self.scopes.append({v.name: v for v in e.pvars})
+        self.lambdas.append(e)
+        try:
+            rt = self.expr(e.body, opt=True)
+        finally:
+            self.lambdas.pop()
+            self.scopes.pop()
+        if isinstance(pw, FnT):
+            self.expect(pw.ret, rt, e.body, "function result", src=e.body)
+            rt = pw.ret
+        return FnT(ptypes, rt)
 
     def e_Await(self, e):
         self.err(f"await {UNSUPPORTED}", e)
@@ -1035,7 +1248,7 @@ def b_print(c, e):
     for k, _ in e.kwargs:
         c.err(f"print() has no parameter '{k}'", e)
     for a in e.args:
-        if prune(c.expr(a)) is UNIT:
+        if prune(c.expr(a, opt=True)) is UNIT:
             c.err("this expression has no value", a)
     return UNIT
 
@@ -1049,7 +1262,7 @@ def b_len(c, e):
 
 
 def b_str(c, e):
-    (t,) = c.args(e, 1)
+    (t,) = c.args(e, 1, opt=True)
     if prune(t) is UNIT:
         c.err("this expression has no value", e)
     return STR
@@ -1070,7 +1283,7 @@ def b_float(c, e):
 
 
 def b_bool(c, e):
-    (t,) = c.args(e, 1)
+    (t,) = c.args(e, 1, opt=True)
     if not truthy_ok(t):
         c.err(f"bool() cannot convert {show(t)}", e)
     return BOOL
@@ -1084,13 +1297,21 @@ def b_abs(c, e):
 
 
 def b_minmax(c, e):
-    ts = c.args(e, 1, 16)
+    ts = c.args(e, 1, 16, kw=("key",))
+    keyf = c.kwarg(e, "key")
     if len(ts) == 1:
         elem = _seq_elem(c, e, ts[0], e.bname)
-        if not comparable(elem):
+        e.minmax_key = keyf
+        if keyf is not None:
+            kt = c.fnarg(keyf, [elem], TVar(), f"{e.bname}() key")
+            if not comparable(kt):
+                c.err(f"{e.bname}() key must be comparable, not {show(kt)}", keyf)
+        elif not comparable(elem):
             c.err(f"{e.bname}() cannot compare {show(elem)}", e)
         e.minmax_seq = True
         return elem
+    if keyf is not None:
+        c.err(f"{e.bname}(..., key:) works with one list argument", e)
     t = ts[0]
     for other, node in zip(ts[1:], e.args[1:]):
         t = c.join(t, other, node, f"{e.bname}() arguments")
@@ -1124,13 +1345,27 @@ def b_anyall(c, e):
     return BOOL
 
 
+def _sort_kwargs(c, e, elem, what):
+    rev = c.kwarg(e, "reverse")
+    if rev is not None:
+        c.expect(BOOL, c.expr(rev), rev, "reverse")
+    keyf = c.kwarg(e, "key")
+    e.sort_key = keyf
+    if keyf is not None:
+        kt = c.fnarg(keyf, [elem], TVar(), f"{what} key")
+        if not comparable(kt):
+            c.err(f"{what} key must be comparable, not {show(kt)}", keyf)
+        e.sort_key_ty = kt
+    elif not comparable(elem):
+        c.err(f"cannot sort {show(elem)}", e)
+
+
 def b_sorted(c, e):
-    (t,) = c.args(e, 1, kw=("reverse",))
-    for _, v in e.kwargs:
-        c.expect(BOOL, c.expr(v), v, "reverse")
+    (t,) = c.args(e, 1, kw=("reverse", "key"))
     pt = prune(t)
-    if not isinstance(pt, ListT) or not comparable(pt.elem):
-        c.err(f"sorted() needs a list of comparable values, not {show(t)}", e)
+    if not isinstance(pt, ListT):
+        c.err(f"sorted() needs a list, not {show(t)}", e)
+    _sort_kwargs(c, e, pt.elem, "sorted()")
     return pt
 
 
@@ -1263,8 +1498,8 @@ STR_METHODS = {
 
 
 def m_list_append(c, e, t):
-    (x,) = c.args(e, 1)
-    c.expect(t.elem, x, e, "append()")
+    (x,) = c.args(e, 1, opt=True)
+    c.expect(t.elem, x, e, "append()", src=e.args[0])
     return UNIT
 
 
@@ -1276,9 +1511,9 @@ def m_list_pop(c, e, t):
 
 
 def m_list_insert(c, e, t):
-    i, x = c.args(e, 2)
-    c.expect(INT, i, e, "insert() index")
-    c.expect(t.elem, x, e, "insert() value")
+    i, x = c.args(e, 2, opt=True)
+    c.expect(INT, i, e, "insert() index", src=e.args[0])
+    c.expect(t.elem, x, e, "insert() value", src=e.args[1])
     return UNIT
 
 
@@ -1312,12 +1547,52 @@ def m_list_count(c, e, t):
 
 
 def m_list_sort(c, e, t):
-    c.args(e, 0, kw=("reverse",))
-    for _, v in e.kwargs:
-        c.expect(BOOL, c.expr(v), v, "reverse")
-    if not comparable(t.elem):
-        c.err(f"cannot sort {show(t.elem)}", e)
+    c.args(e, 0, kw=("reverse", "key"))
+    _sort_kwargs(c, e, t.elem, "sort()")
     return UNIT
+
+
+def m_list_map(c, e, t):
+    if len(e.args) != 1 or e.kwargs:
+        c.err("map() takes a function", e)
+    ret = c.fnarg(e.args[0], [t.elem], TVar(), "map()")
+    if prune(ret) is UNIT:
+        c.err("map() needs a function that returns a value", e)
+    return ListT(ret)
+
+
+def m_list_filter(c, e, t):
+    if len(e.args) != 1 or e.kwargs:
+        c.err("filter() takes a function", e)
+    ret = c.fnarg(e.args[0], [t.elem], TVar(), "filter()")
+    if not truthy_ok(ret):
+        c.err(f"filter() function must return bool, not {show(ret)}", e)
+    return t
+
+
+def m_list_sort_by(c, e, t):
+    if len(e.args) != 1:
+        c.err("sort_by() takes a function", e)
+    for k, _ in e.kwargs:
+        if k != "reverse":
+            c.err(f"sort_by() has no parameter '{k}'", e)
+    e.kwargs = e.kwargs + [("key", e.args[0])]
+    _sort_kwargs(c, e, t.elem, "sort_by()")
+    return t
+
+
+def m_list_group_by(c, e, t):
+    if len(e.args) != 1 or e.kwargs:
+        c.err("group_by() takes a function", e)
+    kt = c.fnarg(e.args[0], [t.elem], TVar(), "group_by()")
+    if not hashable(kt):
+        c.err(f"group_by() key must be int, float, bool, str or a tuple, not {show(kt)}", e)
+    return DictT(kt, t)
+
+
+def m_list_first(c, e, t):
+    c.args(e, 0)
+    return OptT(t.elem)
 
 
 def m_list_join(c, e, t):
@@ -1350,13 +1625,17 @@ LIST_METHODS = {
     "clear": m_list_noarg(UNIT), "reverse": m_list_noarg(UNIT), "copy": m_list_noarg(lambda t: t),
     "index": m_list_index, "count": m_list_count, "sort": m_list_sort, "join": m_list_join,
     "sum": m_list_num(False), "avg": m_list_num(True), "top": m_list_top,
+    "map": m_list_map, "filter": m_list_filter, "sort_by": m_list_sort_by, "group_by": m_list_group_by,
+    "first": m_list_first,
 }
 
 
 def m_dict_get(c, e, t):
-    k, d = c.args(e, 2)
-    c.expect(t.key, k, e, "get() key")
-    c.expect(t.val, d, e, "get() default")
+    ts = c.args(e, 1, 2, opt=True)
+    c.expect(t.key, ts[0], e, "get() key", src=e.args[0])
+    if len(ts) == 1:
+        return OptT(t.val)  # d.get(k): nil, если ключа нет
+    c.expect(t.val, ts[1], e, "get() default", src=e.args[1])
     return t.val
 
 
@@ -1375,6 +1654,10 @@ DICT_METHODS = {
     "items": lambda c, e, t: (c.args(e, 0), ListT(TupleT([t.key, t.val])))[1],
     "copy": lambda c, e, t: (c.args(e, 0), t)[1], "top": m_dict_top,
 }
+
+
+def is_nil(e) -> bool:
+    return isinstance(e, Const) and e.value == "None"
 
 
 def check_program(mod: Module, file: str = "<input>") -> Program:

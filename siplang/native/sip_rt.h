@@ -54,11 +54,11 @@ static void *sip_realloc(void *p, size_t n) {
 
 enum {
     SIP_E_Error, SIP_E_NotFound, SIP_E_ParseError, SIP_E_IndexError, SIP_E_KeyError,
-    SIP_E_ValueError, SIP_E_ZeroDivisionError, SIP_E_AssertionError, SIP_E_IOError
+    SIP_E_ValueError, SIP_E_ZeroDivisionError, SIP_E_AssertionError, SIP_E_IOError, SIP_E_NilError
 };
 static const char *const sip_err_names[] = {
     "Error", "NotFound", "ParseError", "IndexError", "KeyError",
-    "ValueError", "ZeroDivisionError", "AssertionError", "IOError"
+    "ValueError", "ZeroDivisionError", "AssertionError", "IOError", "NilError"
 };
 
 typedef struct sip_try { jmp_buf jb; struct sip_try *prev; } sip_try;

@@ -13,11 +13,11 @@ import re
 from pathlib import Path
 
 from .checker import ERROR_KINDS, Program
-from .cregistry import Registry, cmp_fn, eq_expr, fmt_call, hash_fn
+from .cregistry import Registry, cmp_fn, eq_expr, fmt_call, hash_fn, nil_code, opt_has, opt_val
 from .errors import SipError
 from .nodes import *  # noqa: F403
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, ListT, RecordT, SumT, TupleT, ctype, deep,
-                    key, prune)
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, RecordT, SumT, TupleT, ctype,
+                    deep, is_ref, key, prune)
 
 RUNTIME = (Path(__file__).parent / "native" / "sip_rt.h").read_text(encoding="utf-8")
 SIMPLE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$|^-?[0-9.]+(LL)?$")
@@ -68,6 +68,7 @@ class CGen:
         self.fn_code: list[str] = []
         self.protos: list[str] = []
         self.statics: list[str] = []
+        self.wrappers: set = set()
         # состояние текущей функции
         self.fi = None
         self.lines: list = []
@@ -81,7 +82,8 @@ class CGen:
         raise SipError(msg, getattr(node, "line", 0) or 0, 0, self.file)
 
     def ty(self, node):
-        return deep(node.ty)
+        """Тип значения, которое даёт ex(node): с учётом преобразований T <-> T?."""
+        return deep(getattr(node, "cty", None) or node.ty)
 
     def c(self, t) -> str:
         self.reg.need(t)
@@ -149,6 +151,8 @@ class CGen:
             usage = Path(self.file).stem
             for name, t, d in m.params:
                 flag = name.replace("_", "-")
+                if isinstance(prune(t), OptT):
+                    t = prune(t).inner
                 if d is None:
                     usage += f" {name.upper()}"
                 elif prune(t) is BOOL:
@@ -162,20 +166,21 @@ class CGen:
             pos = 0
             for name, t, d in m.params:
                 flag = c_bytes(name.replace("_", "-").encode())
-                pt = prune(t)
+                full = deep(t)
+                pt = prune(full.inner) if isinstance(full, OptT) else full
                 conv = {INT: "sip_arg_int", FLOAT: "sip_arg_float", BOOL: "sip_arg_bool"}.get(pt)
-                var = self.tmp(self.c(pt), "a")
+                var = self.tmp(self.c(full), "a")
                 if d is None:
                     s = f"sip_positional({pos}, {c_bytes(name.encode())}, {u})"
                     pos += 1
                     self.emit(f"{var} = " + (f"{conv}({s}, {flag}, {u});" if conv else f"sip_cstr({s});"))
-                elif pt is BOOL:
+                elif pt is BOOL and full is pt:
                     self.emit(f"{var} = sip_flag_bool({flag}, {self.ex(d)});")
                 else:
                     s = self.tmp("const char *", "s")
                     self.emit(f"{s} = sip_flag({flag}, {u});")
                     val = f"{conv}({s}, {flag}, {u})" if conv else f"sip_cstr({s})"
-                    self.emit(f"{var} = {s} ? {val} : {self.ex(d)};")
+                    self.emit(f"{var} = {s} ? {self.convert(val, pt, full, 0)} : {self.ex(d)};")
                 args.append(var)
             self.emit("sip_args_done(" + u + ");")
             self.emit(f"{m.cname}({', '.join(args)});")
@@ -319,6 +324,8 @@ class CGen:
         self.store(s.target, self.ex(s.value), self.ty(s.value))
 
     def s_AugAssign(self, s):
+        if hasattr(s, "as_assign"):
+            return self.s_Assign(s.as_assign)
         b = s.binop
         t = s.target
         vt = self.ty(s.value)
@@ -357,10 +364,18 @@ class CGen:
         if t is RANGE:
             r = self.spill(code, t)
             return f"({r}.hi >= {r}.lo)"
+        if isinstance(t, OptT):
+            v = self.spill(code, t)
+            inner = deep(t.inner)
+            if isinstance(inner, (RecordT, SumT, FnT)):
+                return opt_has(t, v)
+            return f"({opt_has(t, v)} && {self.truthy(opt_val(t, v), inner)})"
+        if isinstance(t, (RecordT, SumT, FnT)):
+            return "true"
         return f"(({code})->n != 0)"
 
     def cond(self, node) -> str:
-        return self.truthy(self.ex(node), node.ty)
+        return self.truthy(self.ex(node), self.ty(node))
 
     def s_If(self, s):
         opened = 0
@@ -495,14 +510,14 @@ class CGen:
         return f"sip_sb_done(&{sb})"
 
     def s_Fail(self, s):
-        msg = self.to_str(self.ex(s.value), s.value.ty)
+        msg = self.to_str(self.ex(s.value), self.ty(s.value))
         self.emit(f"sip_raise(SIP_E_Error, {msg}, {s.line});")
 
     def s_Assert(self, s):
         c = self.cond(s.cond)
         self.emit(f"if (SIP_UNLIKELY(!{c})) {{")
         self.depth += 1
-        msg = self.to_str(self.ex(s.msg), s.msg.ty) if s.msg is not None else 'SIP_LIT("assertion failed")'
+        msg = self.to_str(self.ex(s.msg), self.ty(s.msg)) if s.msg is not None else 'SIP_LIT("assertion failed")'
         self.emit(f"sip_raise(SIP_E_AssertionError, {msg}, {s.line});")
         self.depth -= 1
         self.emit("}")
@@ -565,6 +580,16 @@ class CGen:
         t = deep(t)
         if isinstance(p, PWild):
             return [], []
+        if getattr(p, "nil", False):
+            return [f"(!{opt_has(t, path)})"], []
+        if getattr(p, "unwrap", False) and isinstance(t, OptT):
+            inner = opt_val(t, path)
+            p.unwrap = False
+            try:
+                tests, binds = self.pat(p, inner, t.inner)
+            finally:
+                p.unwrap = True
+            return [opt_has(t, path)] + tests, binds
         if isinstance(p, PCapture):
             return [], [f"{p.var.cname} = {path};"]
         if isinstance(p, PLit):
@@ -614,7 +639,23 @@ class CGen:
     # ---------- выражения ----------
 
     def ex(self, e) -> str:
-        return getattr(self, "e_" + type(e).__name__)(e)
+        code = getattr(self, "e_" + type(e).__name__)(e)
+        to = getattr(e, "cty", None)
+        if to is not None and code:
+            code = self.convert(code, e.ty, to, e.line)
+        return code
+
+    def convert(self, code: str, raw, to, line) -> str:
+        raw, to = deep(raw), deep(to)
+        if isinstance(raw, OptT) and not isinstance(to, OptT):
+            return f"unwrap_{self.k(raw)}({code}, {line})"
+        if isinstance(to, OptT) and not isinstance(raw, OptT):
+            self.k(to)
+            return code if is_ref(to.inner) else f"(({ctype(to)}){{true, {code}}})"
+        return code
+
+    def call_fn(self, f: str, args) -> str:
+        return f"{f}.fn({f}.env{''.join(', ' + a for a in args)})"
 
     def eval_args(self, nodes) -> list[str]:
         """Аргументы вычисляются слева направо, как в Python."""
@@ -622,11 +663,11 @@ class CGen:
         for n in nodes:
             code, pre = self.capture(lambda n=n: self.ex(n))
             if pre and codes:
-                codes = [self.spill(c, nd.ty) for c, nd in zip(codes, nodes)]
+                codes = [self.spill(c, self.ty(nd)) for c, nd in zip(codes, nodes)]
             self.replay(pre)
             codes.append(code)
         if sum(1 for n in nodes if has_call(n)) >= 2:
-            codes = [self.spill(c, n.ty) for c, n in zip(codes, nodes)]
+            codes = [self.spill(c, self.ty(n)) for c, n in zip(codes, nodes)]
         return codes
 
     def e_Num(self, e):
@@ -688,15 +729,71 @@ class CGen:
         self.err(f"unsupported format spec ':{spec}'", node)
 
     def e_Const(self, e):
+        if e.value == "None":
+            self.k(e.ty)
+            return nil_code(e.ty)
         return "true" if e.value == "True" else "false"
 
     def e_Name(self, e):
         if hasattr(e, "var"):
             return e.var.cname
+        if hasattr(e, "fnref"):
+            return self.fn_value(e.fnref, deep(e.ty))
         if hasattr(e, "const"):
             return e.const
         st, vname = e.variant
         return f"{self.k(st)}_new_{vname}()"
+
+    def fn_value(self, fi, ft) -> str:
+        """Обычная функция как значение: обёртка с пустым окружением."""
+        fk = self.k(ft)
+        name = f"fnv_{fi.cname}"
+        if name not in self.wrappers:
+            self.wrappers.add(name)
+            ps = [f"{self.c(t)} p{i}" for i, t in enumerate(ft.params)]
+            call = f"{fi.cname}({', '.join(f'p{i}' for i in range(len(ps)))})"
+            body = f"{call};" if deep(ft.ret) is UNIT else f"return {call};"
+            sig = f"static {self.c(ft.ret)} {name}({', '.join(['void *env'] + ps)})"
+            self.protos.append(sig + ";")
+            self.fn_code.append(f"{sig} {{ (void)env; {body} }}\n")
+        return f"(({fk}){{{name}, NULL}})"
+
+    def e_Lambda(self, e):
+        ft = deep(e.ty)
+        fk = self.k(ft)
+        name = f"lam_{e.lid}"
+        caps = list(e.captures.values())
+        if caps:
+            fields = " ".join(f"{self.c(v.ty)} {v.cname};" for v in caps)
+            self.statics.append(f"struct env_{e.lid} {{ {fields} }};")
+        # тело лямбды — отдельная функция C со своим состоянием генератора
+        saved = (self.lines, self.decls, self.depth, self.ctl)
+        self.lines, self.decls, self.depth, self.ctl = [], [], 1, []
+        if caps:
+            self.decls.append(f"struct env_{e.lid} *env = envp;")
+            for v in caps:
+                self.decls.append(f"{self.c(v.ty)} {v.cname} = env->{v.cname};")
+        for v in e.extra:
+            self.decls.append(f"{self.c(v.ty)} {v.cname} = {{0}};")
+        code = self.ex(e.body)
+        if deep(ft.ret) is UNIT:
+            if code:
+                self.emit(code + ";")
+        else:
+            self.emit(f"return {code};")
+        body = self.finish()
+        self.lines, self.decls, self.depth, self.ctl = saved
+        params = ["void *envp"] + [f"{self.c(v.ty)} {v.cname}" for v in e.pvars]
+        sig = f"static {self.c(ft.ret)} {name}({', '.join(params)})"
+        self.protos.append(sig + ";")
+        self.fn_code.append(sig + " {\n" + body + "}\n")
+        if not caps:
+            return f"(({fk}){{{name}, NULL}})"
+        env = self.tmp(f"struct env_{e.lid} *", "env")
+        self.emit(f"{env} = sip_alloc(sizeof *{env});")
+        for v in caps:
+            self.emit(f"{env}->{v.cname} = {v.cname};")
+        return f"(({fk}){{{name}, {env}}})"
 
     def e_SelfAttr(self, e):
         return f"self->f_{e.name}"
@@ -739,10 +836,14 @@ class CGen:
         if kind == "variant":
             st, vname = e.variant
             return f"{self.k(st)}_new_{vname}({', '.join(self.eval_args(e.bound))})"
+        if kind == "closure":
+            codes = self.eval_args([e.func] + e.bound)
+            f = self.spill(codes[0], self.ty(e.func))
+            return self.call_fn(f, codes[1:])
         if kind == "builtin":
             return getattr(self, "b_" + e.bname)(e)
         if kind == "bmethod":
-            rt = deep(e.recv.ty)
+            rt = deep(self.ty(e.recv))
             prefix = "ms" if rt is STR else "ml" if isinstance(rt, ListT) else "md"
             return getattr(self, f"{prefix}_{e.mname}")(e, rt)
         raise AssertionError(kind)
@@ -780,13 +881,41 @@ class CGen:
         if e.op in ("and", "or"):
             return self.logic(e)
         lc, rc = self.eval_args([e.left, e.right])
-        return self.binop_code(e.op, e.left.ty, e.right.ty, e.ty, lc, rc, e.line)
+        return self.binop_code(e.op, self.ty(e.left), self.ty(e.right), e.ty, lc, rc, e.line)
 
     def logic(self, e):
         res = deep(e.ty)
+        if getattr(e, "logic_bool", False):
+            lc = self.cond(e.left)
+            rc, pre = self.capture(lambda: self.cond(e.right))
+            if not pre:
+                return f"({lc} {'&&' if e.op == 'and' else '||'} {rc})"
+            t = self.tmp("bool")
+            self.emit(f"{t} = {lc};")
+            self.emit(f"if ({'' if e.op == 'and' else '!'}{t}) {{")
+            self.depth += 1
+            self.replay(pre)
+            self.emit(f"{t} = {rc};")
+            self.depth -= 1
+            self.emit("}")
+            return t
+        if getattr(e, "opt_or", False):
+            lt = self.ty(e.left)
+            left = self.spill(self.ex(e.left), lt)
+            rc, pre = self.capture(lambda: self.ex(e.right))
+            t = self.tmp(self.c(res))
+            self.emit(f"if ({self.truthy(left, lt)}) {{")
+            self.emit(f"    {t} = {opt_val(lt, left)};")
+            self.emit("} else {")
+            self.depth += 1
+            self.replay(pre)
+            self.emit(f"{t} = {rc};")
+            self.depth -= 1
+            self.emit("}")
+            return t
         lc = self.ex(e.left)
         rc, pre = self.capture(lambda: self.ex(e.right))
-        lt, rt = deep(e.left.ty), deep(e.right.ty)
+        lt, rt = deep(self.ty(e.left)), deep(self.ty(e.right))
         if res is BOOL and lt is BOOL and rt is BOOL and not pre:
             return f"({lc} {'&&' if e.op == 'and' else '||'} {rc})"
         t = self.tmp(self.c(res))
@@ -823,16 +952,24 @@ class CGen:
         nodes = [e.left] + [r for _, r in e.ops]
         codes = self.eval_args(nodes)
         if len(e.ops) > 1:
-            codes = [codes[0]] + [self.spill(c, n.ty) for c, n in zip(codes[1:], nodes[1:])]
+            codes = [codes[0]] + [self.spill(c, self.ty(n)) for c, n in zip(codes[1:], nodes[1:])]
         parts = []
+        nilcmp = getattr(e, "nilcmp", [False] * len(e.ops))
         for i, (op, _) in enumerate(e.ops):
-            parts.append(self.cmp_code(op, nodes[i].ty, nodes[i + 1].ty, codes[i], codes[i + 1]))
+            if nilcmp[i]:
+                j = i if not (isinstance(nodes[i], Const) and nodes[i].value == "None") else i + 1
+                ot = self.ty(nodes[j])
+                test = (f"({codes[j]} == NULL)" if is_ref(ot.inner) else f"(!({codes[j]}).has)") \
+                    if isinstance(ot, OptT) else "false"
+                parts.append(test if op in ("==", "is") else f"(!{test})")
+                continue
+            parts.append(self.cmp_code(op, self.ty(nodes[i]), self.ty(nodes[i + 1]), codes[i], codes[i + 1]))
         return parts[0] if len(parts) == 1 else "(" + " && ".join(parts) + ")"
 
     def e_Unary(self, e):
         code = self.ex(e.operand)
         if e.op == "not":
-            return f"(!{self.truthy(code, e.operand.ty)})"
+            return f"(!{self.truthy(code, self.ty(e.operand))})"
         return f"({e.op}{code})"
 
     def e_IfExpr(self, e):
@@ -841,7 +978,7 @@ class CGen:
 
         def branch(n):
             code = self.ex(n)
-            return self.to_str(code, n.ty) if conv else code
+            return self.to_str(code, self.ty(n)) if conv else code
         a, pa = self.capture(lambda: branch(e.then))
         b, pb = self.capture(lambda: branch(e.other))
         if not pa and not pb:
@@ -974,7 +1111,7 @@ class CGen:
             if isinstance(a, Str) and any(isinstance(p, Interp) for p in a.parts):
                 self.str_parts(a, sb)
             else:
-                self.emit(fmt_call(a.ty, sb, self.ex(a)))
+                self.emit(fmt_call(self.ty(a), sb, self.ex(a)))
         self.emit("sip_print_line();")
         return ""
 
@@ -993,7 +1130,7 @@ class CGen:
 
     def b_str(self, e):
         (a,) = e.args
-        return self.to_str(self.ex(a), a.ty)
+        return self.to_str(self.ex(a), self.ty(a))
 
     def b_int(self, e):
         (a,) = e.args
@@ -1020,18 +1157,41 @@ class CGen:
         return f"llabs({code})" if self.ty(a) is INT else f"fabs({code})"
 
     def minmax(self, e):
+        if e.minmax_seq and getattr(e, "minmax_key", None) is not None:
+            return self.minmax_key(e)
         if e.minmax_seq:
             return self.reduce(e.bname, e.args[0], e.ty, e.line)
         res = deep(e.ty)
-        codes = [self.spill(c, n.ty) for c, n in zip(self.eval_args(e.args), e.args)]
+        codes = [self.spill(c, self.ty(n)) for c, n in zip(self.eval_args(e.args), e.args)]
         acc = self.tmp(self.c(res), "acc")
         self.emit(f"{acc} = {codes[0]};")
         op = "<" if e.bname == "min" else ">"
         for c, n in zip(codes[1:], e.args[1:]):
-            self.emit(f"if ({self.cmp_code(op, n.ty, res, c, acc)}) {acc} = {c};")
+            self.emit(f"if ({self.cmp_code(op, self.ty(n), res, c, acc)}) {acc} = {c};")
         return acc
 
     b_min = b_max = minmax
+
+    def minmax_key(self, e):
+        res = deep(e.ty)
+        f = None
+        acc = self.tmp(self.c(res), "acc")
+        ft = self.ty(e.minmax_key)
+        kt = deep(ft.ret)
+        best = self.tmp(self.c(kt), "bk")
+        has = self.tmp("bool", "has")
+        self.emit(f"{has} = false;")
+        f = self.spill(self.ex(e.minmax_key), ft)
+        op = "<" if e.bname == "min" else ">"
+
+        def step(c, t):
+            v = self.spill(c, t)
+            kv = self.spill(self.call_fn(f, [v]), kt)
+            better = self.cmp_code(op, kt, kt, kv, best)
+            self.emit(f"if (!{has} || {better}) {{ {acc} = {v}; {best} = {kv}; {has} = true; }}")
+        self.each(e.args[0], step)
+        self.emit(f'if (SIP_UNLIKELY(!{has})) sip_raise(SIP_E_ValueError, SIP_LIT("{e.bname}() of an empty sequence"), {e.line});')
+        return acc
 
     def b_sum(self, e):
         return self.reduce("sum", e.args[0], e.ty, e.line)
@@ -1053,11 +1213,36 @@ class CGen:
 
     def b_sorted(self, e):
         (a,) = e.args
-        k = self.k(a.ty)
+        lt = self.ty(a)
+        k = self.k(lt)
         r = self.tmp(k, "s")
         self.emit(f"{r} = {k}_copy({self.ex(a)});")
-        self.emit(f"{k}_sort({r}, {self.kwarg(e, 'reverse', 'false')});")
+        self.sort_list(e, r, lt)
         return r
+
+    def sort_list(self, e, lst: str, lt):
+        """Сортировка списка на месте; с key: ключи считаются один раз, порядок равных сохраняется."""
+        k = self.k(lt)
+        rev = self.spill(self.kwarg(e, "reverse", "false"), BOOL)
+        if getattr(e, "sort_key", None) is None:
+            self.emit(f"{k}_sort({lst}, {rev});")
+            return
+        f = self.spill(self.ex(e.sort_key), self.ty(e.sort_key))
+        kt = deep(e.sort_key_ty)
+        pt = TupleT([kt, INT])
+        pk = self.k(ListT(pt))
+        pairs = self.tmp(pk, "kp")
+        i = self.tmp("int64_t", "i")
+        tmp = self.tmp(f"{self.c(lt.elem)} *", "buf")
+        # (ключ, ±номер): при reverse номера отрицательны, и равные остаются в исходном порядке
+        self.emit(f"{pairs} = {pk}_new({lst}->n);")
+        self.emit(f"for ({i} = 0; {i} < {lst}->n; {i}++) {pk}_push({pairs}, (({self.c(pt)}){{"
+                  f"{self.call_fn(f, [f'{lst}->d[{i}]'])}, {rev} ? -{i} : {i}}}));")
+        self.emit(f"{pk}_sort({pairs}, {rev});")
+        self.emit(f"{tmp} = malloc((size_t)({lst}->n ? {lst}->n : 1) * sizeof *{tmp});")
+        self.emit(f"for ({i} = 0; {i} < {lst}->n; {i}++) {tmp}[{i}] = {lst}->d[{rev} ? -{pairs}->d[{i}].f1 : {pairs}->d[{i}].f1];")
+        self.emit(f"if ({lst}->n) memcpy({lst}->d, {tmp}, (size_t){lst}->n * sizeof *{tmp});")
+        self.emit(f"free({tmp});")
 
     def as_list(self, node):
         """Список из списка, range, строки или словаря (ключи)."""
@@ -1176,7 +1361,7 @@ class CGen:
 
     def ms_join(self, e, t):
         sep, lst = self.recv_args(e)
-        return f"{self.k(e.args[0].ty)}_join({lst}, {sep})"
+        return f"{self.k(self.ty(e.args[0]))}_join({lst}, {sep})"
 
     def split_into(self, s, sep):
         """Разбиение строки на список: по пробельным символам или по разделителю."""
@@ -1256,8 +1441,64 @@ class CGen:
         return f"{self.k(e.ty)}_count({codes[0]})"
 
     def ml_sort(self, e, t):
-        lst = self.recv_args(e)[0]
-        return f"{self.k(t)}_sort({lst}, {self.kwarg(e, 'reverse', 'false')})"
+        lst = self.spill(self.recv_args(e)[0], t)
+        self.sort_list(e, lst, t)
+        return "((void)0)"
+
+    def ml_sort_by(self, e, t):
+        k = self.k(t)
+        r = self.tmp(k, "s")
+        self.emit(f"{r} = {k}_copy({self.ex(e.recv)});")
+        self.sort_list(e, r, t)
+        return r
+
+    def recv_fn(self, e, t):
+        lst, f = self.eval_args([e.recv, e.args[0]])
+        return self.spill(lst, t), self.spill(f, self.ty(e.args[0]))
+
+    def ml_map(self, e, t):
+        lst, f = self.recv_fn(e, t)
+        rk = self.k(e.ty)
+        r = self.tmp(rk, "m")
+        i = self.tmp("int64_t", "i")
+        self.emit(f"{r} = {rk}_new({lst}->n);")
+        self.emit(f"for ({i} = 0; {i} < {lst}->n; {i}++) {rk}_push({r}, {self.call_fn(f, [f'{lst}->d[{i}]'])});")
+        return r
+
+    def ml_filter(self, e, t):
+        lst, f = self.recv_fn(e, t)
+        k = self.k(t)
+        r = self.tmp(k, "f")
+        i = self.tmp("int64_t", "i")
+        ft = self.ty(e.args[0])
+        self.emit(f"{r} = {k}_new(0);")
+        self.emit(f"for ({i} = 0; {i} < {lst}->n; {i}++) {{")
+        self.depth += 1
+        test = self.truthy(self.call_fn(f, [f"{lst}->d[{i}]"]), ft.ret)
+        self.emit(f"if ({test}) {k}_push({r}, {lst}->d[{i}]);")
+        self.depth -= 1
+        self.emit("}")
+        return r
+
+    def ml_group_by(self, e, t):
+        lst, f = self.recv_fn(e, t)
+        dt = deep(e.ty)
+        dk, lk = self.k(dt), self.k(t)
+        r = self.tmp(dk, "g")
+        i = self.tmp("int64_t", "i")
+        p = self.tmp(f"{lk} *", "p")
+        self.emit(f"{r} = {dk}_new();")
+        self.emit(f"for ({i} = 0; {i} < {lst}->n; {i}++) {{")
+        self.emit(f"    {p} = {dk}_slot({r}, {self.call_fn(f, [f'{lst}->d[{i}]'])}, NULL);")
+        self.emit(f"    if (!*{p}) *{p} = {lk}_new(0);")
+        self.emit(f"    {lk}_push(*{p}, {lst}->d[{i}]);")
+        self.emit("}")
+        return r
+
+    def ml_first(self, e, t):
+        lst = self.spill(self.recv_args(e)[0], t)
+        ot = deep(e.ty)
+        return f"({lst}->n ? {self.convert(f'{lst}->d[0]', t.elem, ot, e.line)} : {nil_code(ot)})"
 
     def ml_join(self, e, t):
         codes = self.recv_args(e)
@@ -1279,8 +1520,15 @@ class CGen:
     # ---------- методы словарей ----------
 
     def md_get(self, e, t):
-        d, k, dflt = self.recv_args(e)
-        return f"{self.k(t)}_get_or({d}, {k}, {dflt})"
+        codes = self.recv_args(e)
+        if len(codes) == 3:
+            return f"{self.k(t)}_get_or({codes[0]}, {codes[1]}, {codes[2]})"
+        d = self.spill(codes[0], t)
+        kv = self.spill(codes[1], t.key)
+        j = self.tmp("int64_t", "j")
+        ot = deep(e.ty)
+        self.emit(f"{j} = {self.k(t)}_find({d}, {kv}, {hash_fn(t.key)}({kv}));")
+        return f"({j} >= 0 ? {self.convert(f'{d}->e[{j}].v', t.val, ot, e.line)} : {nil_code(ot)})"
 
     def md_keys(self, e, t):
         return f"{self.k(t)}_keys({self.recv_args(e)[0]})"

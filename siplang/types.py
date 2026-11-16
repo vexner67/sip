@@ -62,6 +62,29 @@ class SumT(Type):
         return list(self.variants).index(variant)
 
 
+@dataclass(eq=False, repr=False)
+class OptT(Type):
+    """`T?`: значение или nil. Для ссылочных типов nil — это NULL."""
+    inner: Type
+
+
+@dataclass(eq=False, repr=False)
+class FnT(Type):
+    """Функция как значение: замыкание {указатель на код, окружение}."""
+    params: list
+    ret: Type
+
+
+def opt(t: Type) -> Type:
+    """T -> T?, без вложенных T??."""
+    return t if isinstance(prune(t), OptT) else OptT(t)
+
+
+def is_ref(t: Type) -> bool:
+    """Тип хранится как указатель, и nil для него — NULL."""
+    return isinstance(prune(t), (ListT, DictT, RecordT, SumT))
+
+
 _tv_counter = [0]
 
 
@@ -91,6 +114,10 @@ def deep(t: Type) -> Type:
         return DictT(deep(t.key), deep(t.val))
     if isinstance(t, TupleT):
         return TupleT([deep(i) for i in t.items])
+    if isinstance(t, OptT):
+        return OptT(deep(t.inner))
+    if isinstance(t, FnT):
+        return FnT([deep(p) for p in t.params], deep(t.ret))
     return t
 
 
@@ -104,6 +131,10 @@ def is_resolved(t: Type) -> bool:
         return is_resolved(t.key) and is_resolved(t.val)
     if isinstance(t, TupleT):
         return all(is_resolved(i) for i in t.items)
+    if isinstance(t, OptT):
+        return is_resolved(t.inner)
+    if isinstance(t, FnT):
+        return all(is_resolved(p) for p in t.params) and is_resolved(t.ret)
     return True
 
 
@@ -119,6 +150,11 @@ def show(t: Type) -> str:
         return "(" + ", ".join(show(i) for i in t.items) + ")"
     if isinstance(t, (RecordT, SumT)):
         return t.name
+    if isinstance(t, OptT):
+        return show(t.inner) + "?"
+    if isinstance(t, FnT):
+        ret = "" if prune(t.ret) is UNIT else " " + show(t.ret)
+        return "fn(" + ", ".join(show(p) for p in t.params) + ")" + ret
     if isinstance(t, TVar):
         return "?"
     return type(t).__name__
@@ -139,6 +175,10 @@ def key(t: Type) -> str:
         return f"R_{t.name}"
     if isinstance(t, SumT):
         return f"S_{t.name}"
+    if isinstance(t, OptT):
+        return f"O_{key(t.inner)}"
+    if isinstance(t, FnT):
+        return f"F{len(t.params)}_" + "_".join(key(p) for p in t.params) + f"__{key(t.ret)}"
     raise TypeError(f"unresolved type {show(t)}")
 
 
@@ -156,6 +196,8 @@ def ctype(t: Type) -> str:
         return "void"
     if t is RANGE:
         return "sip_range"
+    if isinstance(t, OptT) and is_ref(t.inner):
+        return ctype(t.inner)
     return key(t)
 
 
@@ -171,6 +213,11 @@ def same(a: Type, b: Type) -> bool:
         return same(a.key, b.key) and same(a.val, b.val)
     if isinstance(a, TupleT):
         return len(a.items) == len(b.items) and all(same(x, y) for x, y in zip(a.items, b.items))
+    if isinstance(a, OptT):
+        return same(a.inner, b.inner)
+    if isinstance(a, FnT):
+        return (len(a.params) == len(b.params) and all(same(x, y) for x, y in zip(a.params, b.params))
+                and same(a.ret, b.ret))
     return False
 
 
@@ -197,4 +244,4 @@ def comparable(t: Type) -> bool:
 
 def truthy_ok(t: Type) -> bool:
     t = prune(t)
-    return t in (INT, FLOAT, BOOL, STR, RANGE) or isinstance(t, (ListT, DictT))
+    return t in (INT, FLOAT, BOOL, STR, RANGE) or isinstance(t, (ListT, DictT, OptT))

@@ -57,7 +57,7 @@ pip install -e .
 
 ## Чего пока нет
 
-Нативный компилятор ещё не поддерживает `nil` и необязательные типы, лямбды и вложенные функции, `async`, `import` (модули Python больше не доступны), множества, `json`, `csv` и `http`. Компилятор сообщает об этом явно: `... is not supported by the native compiler yet`.
+Нативный компилятор ещё не поддерживает вложенные блоки `fn` (лямбды `fn(x) = ...` есть), `async`, `import` (модули Python больше не доступны), множества, `json`, `csv` и `http`. Компилятор сообщает об этом явно: `... is not supported by the native compiler yet`.
 
 ## Устройство
 
@@ -76,7 +76,7 @@ pip install -e .
 ## Документация
 
 - [docs/spec.md](docs/spec.md) — справочник языка.
-- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 680 токенов.
+- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 840 токенов.
 - [bench/](bench/) — замер токенов, по которому выбирали синтаксис ([DECISION.md](bench/DECISION.md)), и замер скорости ([speed](bench/speed/)).
 
 ## Тесты

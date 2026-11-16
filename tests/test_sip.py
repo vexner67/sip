@@ -375,6 +375,139 @@ class SemanticsTest(unittest.TestCase):
         self.assertEqual(run("s = 'привет'\nprint s, s.upper() == s, s + '!'"), "привет True привет!\n")
 
 
+class NilTest(unittest.TestCase):
+    def test_optional_return_and_checks(self):
+        src = (
+            "fn find(xs [int], x int) int?\n"
+            "    for i in 0..len(xs) - 1\n"
+            "        if xs[i] == x then return i\n"
+            "    nil\n"
+            "i = find([5, 7, 9], 7)\nj = find([5, 7, 9], 4)\n"
+            "print i, j, i == nil, j == nil, j is nil, i is not nil, i + 10"
+        )
+        self.assertEqual(run(src), "1 None False True True True 11\n")
+
+    def test_linked_list(self):
+        src = (
+            "type Node(v int, next Node? = nil)\n"
+            "fn length(n Node?) int = if n == nil then 0 else 1 + length(n.next)\n"
+            "lst = Node(1, Node(2))\nlst.next.next = Node(3)\n"
+            "print length(lst), length(nil), lst.next.v, Node(5)"
+        )
+        self.assertEqual(run(src), "3 0 2 Node(v=5, next=None)\n")
+
+    def test_or_default_and_truthiness(self):
+        src = ("name: str? = nil\nprint name or 'anon', name\nname = ''\nprint name or 'empty'\n"
+               "name = 'bob'\nprint name or 'anon', '{name}!'\nif name then print 'set'")
+        self.assertEqual(run(src), "anon None\nempty\nbob bob!\nset\n")
+
+    def test_inferred_optional_variable(self):
+        src = "best = nil\nfor x in [3, 9, 2]\n    if best == nil or x > best\n        best = x\nprint best"
+        self.assertEqual(run(src), "9\n")
+
+    def test_collections_of_optionals(self):
+        src = ("xs: [int?] = [1, nil, 3]\nd: {str: int?} = {a: 1, b: nil}\n"
+               "print xs, [x for x in xs if x != nil], d, (1, nil), [1, nil] == [1, nil]")
+        self.assertEqual(run(src), "[1, None, 3] [1, 3] {'a': 1, 'b': None} (1, None) True\n")
+
+    def test_dict_get_and_first(self):
+        src = "d = {a: 1}\ne: [int] = []\nprint d.get('a'), d.get('z'), d.get('z') or 0, e.first(), [4, 5].first()"
+        self.assertEqual(run(src), "1 None 0 None 4\n")
+
+    def test_match_nil(self):
+        src = ("fn label(x int?) str = match x\n    nil -> 'none'\n    0 -> 'zero'\n    n -> 'n={n}'\n"
+               "print label(nil), label(0), label(5)")
+        self.assertEqual(run(src), "none zero n=5\n")
+
+    def test_augmented_assignment_on_optional(self):
+        self.assertEqual(run("c: int? = 5\nc += 1\nprint c"), "6\n")
+
+    def test_nil_error_at_runtime(self):
+        err = failure("x: int? = nil\n\nprint x + 1")
+        self.assertEqual(err, "t.sip:3: NilError: value is nil\n    print x + 1\n")
+        self.assertIn("t.sip:3: caught", run("type N(next N? = nil)\nn = N()\ntry\n    print n.next.next\n"
+                                             "catch NilError e\n    print 't.sip:3: caught', e"))
+
+    def test_main_optional_flags(self):
+        src = "fn main(name str? = nil, n int? = nil)\n    print name or 'nobody', n"
+        self.assertEqual(run(src), "nobody None\n")
+        self.assertEqual(run(src, "--name", "ann", "--n", "3"), "ann 3\n")
+
+    def test_nil_type_errors(self):
+        self.assertIn("int cannot be nil", errors_of("x: int = nil"))
+        self.assertIn("int cannot be nil", errors_of("fn f(x int) int = x\nprint f(nil)"))
+        self.assertIn("int is never nil", errors_of("x = 5\nprint x == nil"))
+        self.assertIn("'is' works only with nil", errors_of("x = 1\nprint x is 1"))
+        self.assertIn("declare its return type", errors_of("fn f(x int)\n    if x > 0 then return nil\n    1"))
+
+
+class LambdaTest(unittest.TestCase):
+    def test_map_filter_with_capture(self):
+        src = "xs = [3, 1, 4]\nk = 10\nprint xs.map(fn(x) = x * k), xs.filter(fn(x) = x % 2 == 1), xs.map(fn(x) = '{x}!')"
+        self.assertEqual(run(src), "[30, 10, 40] [3, 1] ['3!', '1!', '4!']\n")
+
+    def test_function_types_and_closures(self):
+        src = (
+            "fn apply(f fn(int) int, x int) int = f(x)\n"
+            "fn twice(f fn(int) int) fn(int) int = fn(x) = f(f(x))\n"
+            "fn adder(n int) fn(int) int = fn(x) = x + n\n"
+            "fn sq(x int) int = x * x\n"
+            "inc = fn(x int) = x + 1\n"
+            "fs = [adder(1), adder(2), sq]\n"
+            "print apply(fn(x) = x + 1, 5), twice(adder(3))(10), apply(sq, 7), inc(41), [f(10) for f in fs]"
+        )
+        self.assertEqual(run(src), "6 16 49 42 [11, 12, 100]\n")
+
+    def test_sorting_with_key_is_stable(self):
+        src = (
+            "words = ['pear', 'fig', 'banana', 'kiwi']\n"
+            "print words.sort_by(fn(w) = len(w)), sorted(words, key: fn(w) = w[-1])\n"
+            "print sorted(words, key: fn(w) = len(w), reverse: true), words\n"
+            "ws = words.copy()\nws.sort(key: fn(w) = len(w))\n"
+            "print ws, max(words, key: fn(w) = len(w)), min(words, key: fn(w) = len(w))"
+        )
+        self.assertEqual(run(src), (
+            "['fig', 'pear', 'kiwi', 'banana'] ['banana', 'fig', 'kiwi', 'pear']\n"
+            "['banana', 'pear', 'kiwi', 'fig'] ['pear', 'fig', 'banana', 'kiwi']\n"
+            "['fig', 'pear', 'kiwi', 'banana'] banana fig\n"
+        ))
+
+    def test_group_by(self):
+        self.assertEqual(run("print [3, 1, 4, 1, 5].group_by(fn(x) = x % 3)"), "{0: [3], 1: [1, 4, 1], 2: [5]}\n")
+
+    def test_lambdas_in_records_methods_and_try(self):
+        src = (
+            "type Counter(step int)\n"
+            "    fn adder() fn(int) int = fn(x) = x + .step\n"
+            "    fn run(xs [int]) [int] = xs.map(.adder())\n"
+            "type Btn(label str, on_click fn(str) str)\n"
+            "fn safe(xs [str]) [int]\n"
+            "    try\n"
+            "        xs.map(fn(s) = int(s) * 2)\n"
+            "    catch ValueError\n"
+            "        [-1]\n"
+            "b = Btn('ok', fn(s) = 'clicked ' + s)\n"
+            "print Counter(5).run([1, 2]), b.on_click(b.label), safe(['1', '2']), safe(['x'])"
+        )
+        self.assertEqual(run(src), "[6, 7] clicked ok [2, 4] [-1]\n")
+
+    def test_nested_lambdas_and_comprehensions(self):
+        src = ("k = 100\nprint [1, 2].map(fn(a) = [10, 20].map(fn(b) = a + b + k))\n"
+               "print [[1, 2], [3]].map(fn(r) = sum(x * x for x in r))")
+        self.assertEqual(run(src), "[[111, 121], [112, 122]]\n[5, 9]\n")
+
+    def test_locals_are_captured_by_value_globals_by_reference(self):
+        src = ("n = 1\nf = fn(x int) = x + n\nn = 100\n"
+               "fn g() int\n    m = 1\n    h = fn(x int) = x + m\n    m = 100\n    h(1)\nprint f(1), g()")
+        self.assertEqual(run(src), "101 2\n")
+
+    def test_lambda_type_errors(self):
+        self.assertIn("write fn(x int) = ...", errors_of("f = fn(x) = x"))
+        self.assertIn("takes 1 argument(s), got 2", errors_of("f = fn(x int) = x\nprint f(1, 2)"))
+        self.assertIn("is not a function", errors_of("x = 1\nprint x(2)"))
+        self.assertIn("wrap it", errors_of("print [1].map(str)"))
+
+
 class TypeErrorTest(unittest.TestCase):
     def test_syntax_error_is_one_line_with_position(self):
         msg = errors_of("x = (1 +\n")
@@ -408,6 +541,10 @@ class TypeErrorTest(unittest.TestCase):
     def test_unsupported_feature_is_named(self):
         self.assertIn("not supported by the native compiler", errors_of("async fn f()\n    pass"))
 
+    def test_method_calls_another_method(self):
+        src = "type T(v int)\n    fn a() int = .v + 1\n    fn b() int = .a() * 2\nprint T(1).b()"
+        self.assertEqual(run(src), "4\n")
+
 
 class ExamplesTest(unittest.TestCase):
     def setUp(self):
@@ -438,6 +575,11 @@ class ExamplesTest(unittest.TestCase):
         self.assertEqual(self.ex("binary_search"), "3 -1\n")
         self.assertEqual(self.ex("user"), "Hello, Ann! True\n")
         self.assertEqual(self.ex("shapes"), "Circle(r=1.0): 3.14\nRect(w=2.0, h=3.0): 6.00\nTriangle(b=4.0, h=5.0): 10.00\n")
+
+    def test_people(self):
+        self.assertEqual(self.ex("people"), "Ann, Cid\nCid\nBob: no email\n")
+        self.assertEqual(self.ex("people", "--who", "Ann").splitlines()[-1], "Ann: ann@example.com")
+        self.assertEqual(self.ex("people", "--who", "Zed").splitlines()[-1], "Zed: not found")
 
     def test_greet(self):
         self.assertEqual(self.ex("greet", "Bob", "--times", "2"), "Hello, Bob!\nHello, Bob!\n")

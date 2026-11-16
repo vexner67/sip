@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
-from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, ListT, Prim, RecordT, SumT, TupleT,
-                    comparable, ctype, deep, hashable, key)
+from .types import (BOOL, FLOAT, INT, RANGE, STR, UNIT, DictT, FnT, ListT, OptT, Prim, RecordT, SumT, TupleT,
+                    comparable, ctype, deep, hashable, is_ref, key)
 
 
 def fmt_call(t, sb: str, val: str) -> str:
@@ -18,7 +18,24 @@ def fmt_call(t, sb: str, val: str) -> str:
         return f"sip_sb_str({sb}, {val});"
     if isinstance(t, Prim):
         return f"str_{t.name}({sb}, {val});"
+    if isinstance(t, OptT):
+        return f"str_{key(t)}({sb}, {val});"
     return f"repr_{key(t)}({sb}, {val});"
+
+
+def opt_has(t, code: str) -> str:
+    """Условие «значение T? не nil»."""
+    return f"({code} != NULL)" if is_ref(deep(t).inner) else f"({code}).has"
+
+
+def opt_val(t, code: str) -> str:
+    """Значение T? без проверки (проверку сделали раньше)."""
+    return code if is_ref(deep(t).inner) else f"({code}).v"
+
+
+def nil_code(t) -> str:
+    t = deep(t)
+    return "NULL" if is_ref(t.inner) else f"(({ctype(t)}){{0}})"
 
 
 def repr_call(t, sb: str, val: str) -> str:
@@ -110,6 +127,12 @@ class Registry:
             for fields in t.variants.values():
                 for _, ft in fields:
                     self.need(ft)
+        elif isinstance(t, OptT):
+            self.need(t.inner)
+        elif isinstance(t, FnT):
+            for pt in t.params:
+                self.need(pt)
+            self.need(t.ret)
         self.order.append(k)
         return k
 
@@ -122,10 +145,16 @@ class Registry:
             if isinstance(t, (ListT, DictT, RecordT, SumT)):
                 fwd.append(f"typedef struct {k}_s *{k};")
         for k in self.order:
+            # значения по месту: кортежи, T? для не-ссылочных T, замыкания — в порядке зависимостей
             t = self.types[k]
             if isinstance(t, TupleT):
                 fields = " ".join(f"{ctype(it)} f{i};" for i, it in enumerate(t.items))
                 tuples.append(f"typedef struct {{ {fields} }} {k};")
+            elif isinstance(t, OptT) and not is_ref(t.inner):
+                tuples.append(f"typedef struct {{ bool has; {ctype(t.inner)} v; }} {k};")
+            elif isinstance(t, FnT):
+                ps = ", ".join(["void *"] + [ctype(p) for p in t.params])
+                tuples.append(f"typedef struct {{ {ctype(t.ret)} (*fn)({ps}); void *env; }} {k};")
         for k in self.order:
             t = self.types[k]
             gen = getattr(self, "gen_" + type(t).__name__)
@@ -415,6 +444,33 @@ static {lt} {k}_top({k} d, int64_t n, bool has_n) {{
 }}"""
         return body, ps, im
 
+    # ---------- T? ----------
+
+    def gen_OptT(self, k, t):
+        ce, ci = ctype(t), ctype(t.inner)
+        has, val = opt_has(t, "a"), opt_val(t, "a")
+        hb, vb = opt_has(t, "b"), opt_val(t, "b")
+        ps = [f"static bool eq_{k}({ce} a, {ce} b);", f"static void repr_{k}(sip_sb *b, {ce} a);",
+              f"static void str_{k}(sip_sb *b, {ce} a);",
+              f"static inline {ci} unwrap_{k}({ce} a, int line);"]
+        im = [f"static bool eq_{k}({ce} a, {ce} b) {{ if (!{has} || !{hb}) return {has} == {hb}; "
+              f"return {eq_expr(t.inner, val, vb)}; }}",
+              f'static void repr_{k}(sip_sb *b, {ce} a) {{ if (!{has}) sip_sb_put(b, "None", 4); '
+              f'else {repr_call(t.inner, "b", val)} }}',
+              f'static void str_{k}(sip_sb *b, {ce} a) {{ if (!{has}) sip_sb_put(b, "None", 4); '
+              f'else {fmt_call(t.inner, "b", val)} }}',
+              f"static inline {ci} unwrap_{k}({ce} a, int line) {{ if (SIP_UNLIKELY(!{has})) "
+              f'sip_raise(SIP_E_NilError, SIP_LIT("value is nil"), line); return {val}; }}']
+        return "", ps, "\n".join(im)
+
+    # ---------- функции-значения ----------
+
+    def gen_FnT(self, k, t):
+        ps = [f"static bool eq_{k}({k} a, {k} b);", f"static void repr_{k}(sip_sb *b, {k} a);"]
+        im = (f"static bool eq_{k}({k} a, {k} b) {{ return a.fn == b.fn && a.env == b.env; }}\n"
+              f'static void repr_{k}(sip_sb *b, {k} a) {{ (void)a; sip_sb_put(b, "<fn>", 4); }}')
+        return "", ps, im
+
     # ---------- записи ----------
 
     def gen_RecordT(self, k, t):
@@ -475,4 +531,5 @@ static {lt} {k}_top({k} d, int64_t n, bool has_n) {{
         return body, ps, "\n".join(im)
 
 
-__all__ = ["Registry", "fmt_call", "repr_call", "eq_expr", "cmp_fn", "hash_fn", "UNIT", "RANGE"]
+__all__ = ["Registry", "fmt_call", "repr_call", "eq_expr", "cmp_fn", "hash_fn", "opt_has", "opt_val", "nil_code",
+           "UNIT", "RANGE"]

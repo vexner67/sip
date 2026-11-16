@@ -432,6 +432,9 @@ class Parser:
                 break
         return params
 
+    def at_type_start(self) -> bool:
+        return self.at("[", "{", "(", "nil", "fn", "NAME")
+
     def parse_type(self):
         tok = self.peek()
         if self.accept("["):
@@ -453,6 +456,16 @@ class Parser:
             t = TTuple(items, line=tok.line)
         elif self.accept("nil"):
             t = TName("None", line=tok.line)
+        elif self.accept("fn"):
+            self.expect("(")
+            params = []
+            while not self.at(")"):
+                params.append(self.parse_type())
+                if not self.accept(","):
+                    break
+            self.expect(")")
+            ret = self.parse_type() if self.at_type_start() else None
+            t = TFn(params, ret, line=tok.line)
         elif self.at("NAME"):
             name = self.parse_dotted()
             args = []
@@ -550,17 +563,16 @@ class Parser:
     def parse_lambda(self):
         tok = self.advance()  # fn
         self.expect("(")
-        names = []
+        names, types = [], []
         while not self.at(")"):
             names.append(self.expect("NAME", "parameter name").value)
             self.accept(":")
-            if not self.at(",", ")"):
-                self.parse_type()
+            types.append(None if self.at(",", ")") else self.parse_type())
             if not self.accept(","):
                 break
         self.expect(")")
         self.expect("=", "'=' before the body of fn(...)")
-        return Lambda(names, self.parse_expr(), line=tok.line)
+        return Lambda(names, self.parse_expr(), types, line=tok.line)
 
     def _binary(self, sub, ops):
         left = sub()
@@ -722,6 +734,9 @@ class Parser:
         if k in ("nil", "true", "false"):
             self.advance()
             return Const({"nil": "None", "true": "True", "false": "False"}[k], line=tok.line)
+        if k == "NAME" and tok.value == "None":  # привычка из Python
+            self.advance()
+            return Const("None", line=tok.line)
         if k == ".":
             self.advance()
             name = self.advance()

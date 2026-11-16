@@ -31,10 +31,58 @@ fn describe(x int) str                    # блочное тело
 | `[int]` | список | динамический массив |
 | `{str: float}` | словарь с порядком вставки | хэш-таблица |
 | `(str, int)` | кортеж | структура по значению |
+| `int?` | значение или `nil` | `{has, v}`; для списков, словарей и записей — `NULL` |
+| `fn(int) str` | функция-значение | замыкание: код и окружение |
 
 Типы переменных выводятся. Пустой коллекции нужен тип: `xs: [int] = []`. Одна переменная имеет один тип на всю функцию.
 
 `int` автоматически превращается во `float`, где ожидается `float`: `fn half(x float)` можно вызвать как `half(3)`.
+
+## nil и необязательные значения
+
+`T?` — значение типа `T` или `nil`:
+
+```
+fn find(xs [int], x int) int?
+    for i in 0..len(xs) - 1
+        if xs[i] == x then return i
+    nil
+
+type Node(v int, next Node? = nil)
+
+i = find(xs, 7)
+if i == nil then print "нет"            # также: i is nil, i != nil, i is not nil
+print name or "anon"                    # nil (или пустое значение) заменяется вторым
+d.get("key")                            # int?: nil, если ключа нет
+xs.first()                              # первый элемент или nil
+```
+
+- `T` подставляется туда, где ждут `T?`, сам: `x: int? = 5`.
+- `T?` там, где нужен `T` (`i + 1`, `node.next.v`), проверяется при выполнении. Если там `nil`, будет ошибка `NilError: value is nil` со строкой исходника.
+- `x = nil` без типа: тип уточнит следующее присваивание (`x = 5` делает `x` типом `int?`).
+- В `match` есть образец `nil`: `nil -> "none"`.
+- `print` и строки показывают `nil` как `None`, как Python.
+
+## Лямбды и функции-значения
+
+```
+xs.map(fn(x) = x * 2)
+xs.filter(fn(x) = x > 0)
+users.sort_by(fn(u) = u.age, reverse: true)
+sorted(words, key: fn(w) = len(w))
+max(words, key: fn(w) = len(w))
+xs.group_by(fn(x) = x % 2)              # {1: [...], 0: [...]}
+
+fn apply(f fn(int) int, x int) int = f(x)
+fn adder(n int) fn(int) int = fn(x) = x + n
+inc = fn(x int) = x + 1                 # без контекста тип параметра пишется явно
+print apply(adder(3), 4), xs.map(sq)    # обычная функция тоже значение
+```
+
+- Тело лямбды — одно выражение. Тип параметров берётся из контекста (`map`, параметр `fn(...)`, тип результата функции) или пишется явно.
+- Лямбда видит переменные вокруг. Локальные переменные копируются в момент создания лямбды, глобальные читаются в момент вызова.
+- Встроенные функции значениями не бывают: вместо `xs.map(str)` пишется `xs.map(fn(x) = str(x))`.
+- Компилятор встраивает вызов лямбды: `xs.map(fn(x) = x * 2)` работает так же быстро, как `[x * 2 for x in xs]`.
 
 ## Управление
 
@@ -119,7 +167,7 @@ catch e                                   # ловит всё, e — текст 
 ```
 
 - `fail "сообщение"` бросает `Error`. `assert x > 0, "msg"` бросает `AssertionError`.
-- Виды: `NotFound` (файла нет), `IOError`, `ParseError` (плохое число; ловится и как `ValueError`), `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`, `AssertionError`. `catch Exception` ловит всё.
+- Виды: `NotFound` (файла нет), `IOError`, `ParseError` (плохое число; ловится и как `ValueError`), `ValueError`, `IndexError`, `KeyError`, `ZeroDivisionError`, `AssertionError`, `NilError` (`nil` там, где нужно значение). `catch Exception` ловит всё.
 - Непойманная ошибка печатает одну строку и строку исходника, код выхода 1:
 
 ```
@@ -139,7 +187,7 @@ fn main(name str, times = 1, loud = false)
 sip run greet.sip Ann --times 3 --loud
 ```
 
-Параметр без значения по умолчанию — позиционный аргумент, со значением — флаг (`_` в имени становится `-`). Для `bool` есть `--loud` и `--no-loud`. Неверный аргумент даёт сообщение и код выхода 2.
+Параметр без значения по умолчанию — позиционный аргумент, со значением — флаг (`_` в имени становится `-`). Для `bool` есть `--loud` и `--no-loud`. Флаг `email str? = nil` равен `nil`, если его не передали. Неверный аргумент даёт сообщение и код выхода 2.
 
 ## Встроенные функции
 
@@ -147,8 +195,8 @@ sip run greet.sip Ann --times 3 --loud
 |---|---|
 | `print a, b` | печать через пробел |
 | `len str int float bool abs round` | как в Python; `int("x")` бросает `ParseError` |
-| `min max sum avg any all` | по списку, диапазону или генератору: `sum(x * x for x in xs)`; `min(a, b)` |
-| `sorted(xs, reverse: true)`, `list(x)` | новый список |
+| `min max sum avg any all` | по списку, диапазону или генератору: `sum(x * x for x in xs)`; `min(a, b)`; `max(xs, key: f)` |
+| `sorted(xs, key: f, reverse: true)`, `list(x)` | новый список |
 | `count(xs)` | словарь `{элемент: сколько раз}` |
 | `zip(a, b)`, `enumerate(xs)` | списки кортежей |
 | `read(path)`, `write(path, text)`, `input(prompt)` | файлы и ввод |
@@ -159,8 +207,10 @@ sip run greet.sip Ann --times 3 --loud
 | тип | методы |
 |---|---|
 | `str` | `lower upper strip lstrip rstrip split splitlines find count replace startswith endswith isdigit isalpha isspace join` |
-| список | `append pop insert extend clear sort reverse copy index count join sum avg top` |
+| список | `append pop insert extend clear sort reverse copy index count join sum avg top map filter sort_by group_by first` |
 | словарь | `get keys values items copy top` |
+
+`xs.sort(key: f, reverse: true)` сортирует на месте, `xs.sort_by(f)` возвращает новый список. Сортировка устойчивая, ключ считается один раз на элемент.
 
 `xs.count()` без аргумента — словарь частот, `.top(n)` — `n` самых частых пар `(ключ, число)`. `xs.count(x)` — сколько раз встречается `x`. `[1, 2].join(", ")` и питоновский `", ".join(xs)` оба работают.
 
@@ -171,13 +221,13 @@ sip run greet.sip Ann --times 3 --loud
 - двоеточие в конце заголовка: `if x:`, `fn f():`;
 - `x: int` в параметрах и `-> int` перед типом результата;
 - явный `self` в методах;
-- `True`, `False`, `else if`.
+- `True`, `False`, `None`, `else if`.
 
 Для `def`, `class`, `lambda`, `except` и `raise` компилятор выдаёт короткую подсказку, как написать это на Sip.
 
 ## Чего пока нет
 
-`nil` и необязательные типы `T?`, лямбды и функции как значения, вложенные функции, `async`/`await`, `import`, `with`, множества, `*args`, `json`, `csv`, `http`. Парсер их понимает, а компилятор сообщает: `... is not supported by the native compiler yet`.
+Вложенные блоки `fn` (вместо них — лямбды), многострочные лямбды, `async`/`await`, `import`, `with`, множества, `*args`, `json`, `csv`, `http`. Парсер их понимает, а компилятор сообщает: `... is not supported by the native compiler yet`.
 
 ## Память
 

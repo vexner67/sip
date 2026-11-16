@@ -37,6 +37,13 @@ class TOptional(Node):
     inner: Node
 
 
+@dataclass
+class TFn(Node):
+    """Тип функции: `fn(int, str) bool`."""
+    params: list
+    ret: Node | None
+
+
 # ---------- выражения ----------
 
 @dataclass
@@ -176,6 +183,7 @@ class Comp(Node):
 class Lambda(Node):
     params: list  # имена
     body: Node
+    types: list = field(default_factory=list)  # тип или None для каждого параметра
 
 
 @dataclass
