@@ -17,6 +17,10 @@ from siplang.compiler import build_cached  # noqa: E402
 from siplang.errors import SipError  # noqa: E402
 from siplang.lexer import tokenize  # noqa: E402
 from siplang.parser import parse  # noqa: E402
+from siplang.checker import check_program  # noqa: E402
+from siplang.modules import NATIVE, load_program  # noqa: E402
+from siplang.nodes import FromImport, Import  # noqa: E402
+from siplang.types import show  # noqa: E402
 from dataclasses import fields, is_dataclass  # noqa: E402
 
 CASES = [
@@ -63,7 +67,7 @@ def py_dump(src: str, name: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def ast_lines(v, depth, out):
+def ast_lines(v, depth, out, types=False):
     pad = "  " * depth
     if isinstance(v, bool):
         out.append(pad + ("T" if v else "F"))
@@ -74,16 +78,19 @@ def ast_lines(v, depth, out):
     elif isinstance(v, (list, tuple)):
         out.append(pad + ("[" if isinstance(v, list) else "<") + str(len(v)))
         for x in v:
-            ast_lines(x, depth + 1, out)
+            ast_lines(x, depth + 1, out, types)
     elif is_dataclass(v):
-        out.append(pad + f"{type(v).__name__}@{v.line}")
+        line = pad + f"{type(v).__name__}@{v.line}"
+        if types and "ty" in v.__dict__:
+            line += " :: " + show(v.ty)
+        out.append(line)
         for f in fields(v):
             if f.name != "line":
-                ast_lines(getattr(v, f.name), depth + 1, out)
+                ast_lines(getattr(v, f.name), depth + 1, out, types)
         if hasattr(v, "extern"):
             out.append(pad + f"  extern@{v.line}")
             for x in (v.extern, v.csym, v.ctypes, v.cret):
-                ast_lines(x, depth + 2, out)
+                ast_lines(x, depth + 2, out, types)
     else:
         raise TypeError(f"unexpected value in AST: {v!r}")
 
@@ -96,6 +103,69 @@ def py_ast(src: str, name: str) -> str:
     out = []
     ast_lines(tree, 0, out)
     return "\n".join(out) + "\n"
+
+
+def py_check(src: str, name: str) -> str:
+    try:
+        mod, srcmap = load_program(name, src)
+        check_program(mod, name, srcmap)
+    except SipError as e:
+        return str(e) + "\n"
+    out = []
+    ast_lines(mod, 0, out, types=True)
+    return "\n".join(out) + "\n"
+
+
+def single_file(path: str) -> bool:
+    """Программа без импорта других файлов .sip: такие проверяет checker.sip."""
+    with open(path, encoding="utf-8", newline="") as f:
+        src = f.read()
+    try:
+        mod = parse(src, path)
+    except SipError:
+        return True
+    for s in mod.body:
+        if isinstance(s, (Import, FromImport)) and s.module not in NATIVE:
+            return False
+    return True
+
+
+CORPUS = os.path.join(os.path.expanduser("~"), ".cache", "sip", "selfhost-corpus")
+
+
+def collect_corpus():
+    """Программы, которые компилирует набор тестов: материал для сравнения проверки типов."""
+    import hashlib
+    import unittest
+    from siplang import modules
+    os.makedirs(CORPUS, exist_ok=True)
+    orig = modules.Loader.load_root
+
+    def load_root(self, path, src):
+        h = hashlib.sha1(src.encode()).hexdigest()[:16]
+        with open(os.path.join(CORPUS, h + ".sip"), "w", encoding="utf-8", newline="") as f:
+            f.write(src)
+        return orig(self, path, src)
+    modules.Loader.load_root = load_root
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    suite = unittest.defaultTestLoader.loadTestsFromName("test_sip")
+    suite = unittest.TestSuite(t for t in _flat(suite) if "Selfhost" not in type(t).__name__)
+    unittest.TextTestRunner(stream=open(os.devnull, "w")).run(suite)
+    modules.Loader.load_root = orig
+    print(f"corpus: {len(os.listdir(CORPUS))} programs in {CORPUS}")
+
+
+def _flat(suite):
+    for t in suite:
+        if isinstance(t, unittest_suite()):
+            yield from _flat(t)
+        else:
+            yield t
+
+
+def unittest_suite():
+    import unittest
+    return unittest.TestSuite
 
 
 PARSER_CASES = [
@@ -156,12 +226,25 @@ def write_cases(tmp, prefix, cases):
 
 
 def main(argv):
+    if argv[:1] == ["--corpus"]:
+        collect_corpus()
+        return 0
+    only = None
+    if argv[:2] and argv[0] == "--only":
+        only, argv = argv[1], argv[2:]
     files = argv or sorted(set(glob.glob(os.path.join(ROOT, "**", "*.sip"), recursive=True)))
     tmp = tempfile.mkdtemp()
     lex_in = (write_cases(tmp, "case", CASES) if not argv else []) + files
     par_in = (write_cases(tmp, "pcase", PARSER_CASES + CASES) if not argv else []) + files
-    bad = compare(build_cached(os.path.join(ROOT, "selfhost", "lexer.sip")), lex_in, py_dump, "lexer")
-    bad += compare(build_cached(os.path.join(ROOT, "selfhost", "parser.sip")), par_in, py_ast, "parser")
+    corpus = sorted(glob.glob(os.path.join(CORPUS, "*.sip"))) if not argv else []
+    chk_in = [p for p in par_in + corpus if single_file(p)]
+    bad = 0
+    if only in (None, "lexer"):
+        bad += compare(build_cached(os.path.join(ROOT, "selfhost", "lexer.sip")), lex_in, py_dump, "lexer")
+    if only in (None, "parser"):
+        bad += compare(build_cached(os.path.join(ROOT, "selfhost", "parser.sip")), par_in, py_ast, "parser")
+    if only in (None, "checker"):
+        bad += compare(build_cached(os.path.join(ROOT, "selfhost", "checker.sip")), chk_in, py_check, "checker")
     return 1 if bad else 0
 
 

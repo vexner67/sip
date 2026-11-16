@@ -5,7 +5,7 @@
 
 import lexer
 
-type N(kind str, line int, s str, kids [N])
+type N(kind str, line int, s str, kids [N], ty int = 0)
 
 type ParseError(msg str, line int, col int)
 
