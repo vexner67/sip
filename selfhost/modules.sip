@@ -9,6 +9,15 @@ import lexer
 import parser
 from parser import N, mk, S, L
 
+# Встроенные имена, которые корневой файл может перекрыть своим определением (fn sum, type ValueError,
+# len = 3). Такие определения корня получают имя _root_X: модули (и рантайм std/rt.sip) по-прежнему видят
+# встроенное X, а код корня — своё. Совпадает с SHADOWABLE в siplang/modules.py.
+SHADOWABLE = {"print", "len", "str", "int", "float", "bool", "abs", "min", "max", "sum", "avg", "any", "all",
+              "sorted", "list", "count", "read", "write", "input", "round", "zip", "enumerate", "exit", "set",
+              "ord", "chr", "Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
+              "ZeroDivisionError", "AssertionError", "IOError", "NilError", "HttpError", "OverflowError",
+              "Exception"}
+
 BAND = 1048576  # строк на файл: номер строки = номер файла * BAND + строка в файле
 
 type SipErr(msg str, file str, line int, col int)
@@ -412,7 +421,10 @@ type Loader(std str, files [(int, str)] = [], srcs [[str]] = [], extra [str] = [
         .base = if pkg != nil then pkg.root else path.dirname(abspath(p))
         .loading[abspath(p)] = true  # import самого себя — циклический импорт
         .load_rt()
-        out = .process(body, "", p, offset, {})
+        shadow: {str: str} = {}
+        for n in top_names(body)
+            if n in SHADOWABLE then shadow[n] = "_root_" + n
+        out = .process(body, "", p, offset, shadow)
         .bodies + out
 
     # import a.b -> (путь файла, префикс имён): рядом с файлом, в зависимости пакета, от корня пакета, в std

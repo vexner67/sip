@@ -17,9 +17,6 @@ extern "sip" fn _str(p ptr, n int) str = sip_rt_str
 extern "sip" fn _sb() ptr = sip_rt_sb
 extern "sip" fn _put(b ptr, s str) = sip_rt_put
 extern "sip" fn _done(b ptr) str = sip_rt_done
-# ParseError и OverflowError на строке вызова; через C, потому что программа может назвать так свой тип
-extern "sip" fn _parse_error(msg str) = sip_rt_parse_error
-extern "sip" fn _overflow(msg str) = sip_rt_overflow
 
 fn _space(c int) bool = c == 32 or (c >= 9 and c <= 13)
 
@@ -117,7 +114,7 @@ fn str_remove_affix(s str, a str, suffix bool) str
 fn str_pad(s str, width int, mode int) str
     n = len(s)
     if width <= n then return s
-    if width > 1099511627776 then _overflow("width is too large")
+    if width > 1099511627776 then fail OverflowError("width is too large")
     p = _alloc(width)
     fill = width - n
     if mode == 0
@@ -152,7 +149,7 @@ fn str_replace(s str, old str, rep str) str
 fn str_repeat(s str, k int) str
     n = len(s)
     if k <= 0 or n == 0 then return ""
-    if k > 281474976710656 // n then _overflow("repeated string is too long")
+    if k > 281474976710656 // n then fail OverflowError("repeated string is too long")
     p = _alloc(n * k)
     for i in 0..k - 1
         _copy(p, i * n, s)
@@ -169,7 +166,7 @@ fn parse_int(s str) int
         lo += 1
     while hi > lo and _space(_byte(s, hi - 1))
         hi -= 1
-    if hi == lo or hi - lo >= 64 then _parse_error("invalid int: '{_head(s)}'")
+    if hi == lo or hi - lo >= 64 then fail ParseError("invalid int: '{_head(s)}'")
     i = lo
     neg = false
     c = _byte(s, i)
@@ -183,13 +180,13 @@ fn parse_int(s str) int
         c = _byte(s, i)
         i += 1
         if c == 95 then continue
-        if not _digit(c) then _parse_error("invalid int: '{_head(s)}'")
+        if not _digit(c) then fail ParseError("invalid int: '{_head(s)}'")
         digits += 1
         d = c - 48
         if big or v < -922337203685477580 or (v == -922337203685477580 and d > 8)
             big = true
         else
             v = v * 10 - d
-    if digits == 0 then _parse_error("invalid int: '{_head(s)}'")
-    if big or (not neg and v == -9223372036854775807 - 1) then _overflow("int out of range: '{_head(s)}'")
+    if digits == 0 then fail ParseError("invalid int: '{_head(s)}'")
+    if big or (not neg and v == -9223372036854775807 - 1) then fail OverflowError("int out of range: '{_head(s)}'")
     if neg then v else -v

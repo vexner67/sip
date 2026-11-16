@@ -1065,9 +1065,6 @@ static inline void *sip_rt_sb(void) { sip_sb *b = sip_alloc(sizeof *b); *b = sip
 static inline void sip_rt_put(void *b, sip_str s) { sip_sb_str((sip_sb *)b, s); }
 static inline void sip_rt_putc(void *b, int64_t c) { sip_sb_putc((sip_sb *)b, (char)c); }
 static inline sip_str sip_rt_done(void *b) { return sip_sb_done((sip_sb *)b); }
-/* ошибки rt.sip — на строке кода пользователя, который вызвал рантайм */
-static void sip_rt_parse_error(sip_str msg) { sip_raise(SIP_E_ParseError, msg, sip_std_line); }
-static void sip_rt_overflow(sip_str msg) { sip_raise(SIP_E_OverflowError, msg, sip_std_line); }
 
 /* ---------- файлы ---------- */
 

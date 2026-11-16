@@ -14,6 +14,27 @@ ERROR_KINDS = ["Error", "NotFound", "ParseError", "IndexError", "KeyError", "Val
 NEED_TEXT = {"ord": "comparison with < (or sorting, min, max)", "hash": "use as a dict key or set item",
              "num": "arithmetic", "add": "'+'"}
 
+# имена корня, перекрывшие встроенные (_root_X, см. modules.SHADOWABLE), в сообщениях — как в исходнике:
+# убирает _root_ в начале слова (как re.sub(r"\b_root_(?=\w)", "", msg))
+fn word_byte(b int) bool = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 or b >= 128
+
+fn unroot(msg str) str
+    if msg.find("_root_") < 0 then return msg
+    out: [str] = []
+    i = 0
+    n = len(msg)
+    start = 0
+    while i < n
+        if (msg[i:i + 6] == "_root_" and (i == 0 or not word_byte(ord(msg[i - 1])))
+                and i + 6 < n and word_byte(ord(msg[i + 6])))
+            out.append(msg[start:i])
+            i += 6
+            start = i
+        else
+            i += 1
+    out.append(msg[start:])
+    "".join(out)
+
 # ---------- типы ----------
 
 NEXT_ID = 0
@@ -383,7 +404,8 @@ type Checker(file str, std str, loader modules.Loader, tys [Ty] = [], records {s
 
     # ---------- общее ----------
 
-    fn err(msg str, node N? = nil)
+    fn err(msg0 str, node N? = nil)
+        msg = unroot(msg0)
         line = if node == nil then 0 else node.line
         f = .file
         if line != 0

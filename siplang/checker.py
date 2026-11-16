@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import os
 
 from .errors import SipError
@@ -135,6 +136,7 @@ class Checker:
     # ---------- общее ----------
 
     def err(self, msg: str, node=None):
+        msg = re.sub(r"\b_root_(?=\w)", "", msg)  # имена корня, перекрывшие встроенные (см. modules.SHADOWABLE)
         line = getattr(node, "line", 0) or 0
         file = self.file
         if self.srcmap is not None and line:

@@ -22,6 +22,15 @@ from .parser import Parser
 
 STD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "std")
 
+# Встроенные имена, которые корневой файл может перекрыть своим определением (fn sum, type ValueError,
+# len = 3). Такие определения корня получают имя _root_X: модули (и рантайм std/rt.sip) по-прежнему видят
+# встроенное X, а код корня — своё. Совпадает с BUILTINS без точки, ERROR_KINDS и CATCH_ALL из checker.py.
+SHADOWABLE = {"print", "len", "str", "int", "float", "bool", "abs", "min", "max", "sum", "avg", "any", "all",
+              "sorted", "list", "count", "read", "write", "input", "round", "zip", "enumerate", "exit", "set",
+              "ord", "chr", "Error", "NotFound", "ParseError", "IndexError", "KeyError", "ValueError",
+              "ZeroDivisionError", "AssertionError", "IOError", "NilError", "HttpError", "OverflowError",
+              "Exception"}
+
 # Встроенные модули и их члены. Вызов `math.sqrt(x)` становится встроенной функцией "math.sqrt".
 NATIVE = {
     "math": {"sqrt", "floor", "ceil", "trunc", "log", "log2", "log10", "exp", "sin", "cos", "tan", "asin",
@@ -206,7 +215,8 @@ class Loader:
         self.base = pkg.root if pkg is not None else os.path.dirname(os.path.abspath(path))
         self.loading.add(os.path.abspath(path))  # import самого себя — циклический импорт
         self.load_rt()
-        body = self.process(mod.body, "", path, offset)
+        shadow = {n: "_root_" + n for n in _top_names(mod.body) if n in SHADOWABLE}
+        body = self.process(mod.body, "", path, offset, shadow)
         out = Module(self.bodies + body, line=1)
         out.tests = tests if self.tests else None
         return out

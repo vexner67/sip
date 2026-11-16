@@ -593,6 +593,38 @@ class ModuleTest(unittest.TestCase):
         self.assertIn("module 'math' has no 'foo'", errors_of("print math.foo(1)"))
 
 
+class ShadowBuiltinTest(unittest.TestCase):
+    """Корень перекрывает встроенное имя (fn len, sum = 5, type ValueError): модули и рантайм на Sip
+    по-прежнему видят встроенное, а код корня — своё."""
+
+    def test_root_shadows_builtin_fn_and_global(self):
+        self.assertEqual(run("sum = 5\nfn len(x int) int = x * 10\n"
+                             "print \"aaa\".count(\"a\"), \"ab\".zfill(4), \"x y\".title(), sum, len(2)\n"),
+                         "3 00ab X Y 5 20\n")
+
+    def test_module_sees_builtin_error_types(self):
+        r = run_files({
+            "m.sip": "fn f() str\n    try\n        fail ParseError(\"bad\")\n    catch ParseError e\n"
+                     "        return \"module caught {e}\"\n",
+            "main.sip": "import m\ntype ParseError(msg str, line int)\ntype ValueError(code int)\n"
+                        "print m.f(), int(\"42\")\n"
+                        "try\n    fail ValueError(7)\ncatch ValueError e\n    print \"root caught\", e.code\n",
+        })
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "module caught bad 42\nroot caught 7\n")
+
+    def test_messages_use_source_names(self):
+        self.assertIn("assignment to 'sum': expected int, got str", errors_of("sum = 5\nsum = \"x\"\n"))
+        self.assertIn("argument 'x' of len(): expected int, got str",
+                      errors_of("fn len(x int) int = x\nprint len(\"a\")\n"))
+        self.assertIn("ValueError(code=4)", failure("type ValueError(code int)\nfail ValueError(4)\n"))
+
+    def test_shadowable_matches_checker(self):
+        from siplang import checker, modules
+        plain = {n for n in checker.BUILTINS if "." not in n}
+        self.assertEqual(modules.SHADOWABLE, plain | set(checker.ERROR_KINDS) | set(checker.CATCH_ALL))
+
+
 class StdlibTest(unittest.TestCase):
     def test_math(self):
         src = ("from math import sqrt, floor\nprint sqrt(16), floor(2.7), math.ceil(2.1), math.gcd(12, 18), "
