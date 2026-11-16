@@ -12,6 +12,7 @@ extern "sip" fn _mtime(path str) float = sip_os_mtime
 extern "sip" fn _mkdir(path str, exist_ok bool) = sip_os_mkdir
 extern "sip" fn _remove(path str) = sip_os_remove
 extern "sip" fn _rename(src str, dst str) = sip_os_rename
+extern "sip" fn _chmod(path str, mode int) = sip_os_chmod
 extern "sip" fn _opendir(path str) ptr = sip_os_opendir
 extern "sip" fn _readdir(d ptr) str? = sip_os_readdir
 extern "sip" fn _closedir(d ptr) = sip_os_closedir
@@ -20,6 +21,17 @@ extern "sip" fn _output(cmd str) str = sip_os_output
 extern "sip" fn _status() int = sip_os_status
 extern "sip" fn _pid() int = sip_os_pid
 extern "sip" fn _platform() str = sip_os_platform
+extern "sip" fn _balloc(n int) ptr = sip_rt_alloc
+extern "sip" fn _bset(p ptr, i int, b int) = sip_rt_set
+extern "sip" fn _bstr(p ptr, n int) str = sip_rt_str
+
+# строка из сырых байтов (0..255) — для двоичных файлов: write(path, os.bytes(xs))
+fn bytes(xs [int]) str
+    p = _balloc(len(xs))
+    for i, x in enumerate(xs)
+        if x < 0 or x > 255 then fail ValueError("byte must be in range(0, 256), got {x}")
+        _bset(p, i, x)
+    _bstr(p, len(xs))
 
 # значение переменной окружения или nil
 fn env(name str) str? = _getenv(name)
@@ -84,6 +96,9 @@ fn mkdir(path str, parents = false)
 fn remove(path str) = _remove(path)
 
 fn rename(src str, dst str) = _rename(src, dst)
+
+# права доступа: os.chmod(path, 493) — это 0755
+fn chmod(path str, mode int) = _chmod(path, mode)
 
 # запускает команду через sh; вывод идёт на экран; результат — код выхода
 fn run(cmd str) int = _system(cmd)

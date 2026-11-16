@@ -26,7 +26,7 @@ Sip is Python with less noise, statically typed, compiled to native code (via C)
 - JSON and CSV read straight into the expected type: `users: [User] = json.read(p)`, `fn load(p str) [Row] = csv.read(p)`; `json.stringify(x, indent: 2)`, `json.write(p, x)`, `csv.write(p, rows)`. Plain `csv.read(p)` gives `[{str: str}]`.
 - `r = http.get(url, timeout: 5, headers: {...})`: `r.status r.ok r.text r.headers`, `u: User = r.json()`; `http.post(url, json: x)`. 4xx/5xx raise `HttpError`.
 - `async fn f(u str) int`; calling it makes a task; `await f(u)`; `await all(f(u) for u in urls)` runs them concurrently, in order. `await` only inside `async fn` (`async fn main` is fine).
-- Std (import): `os` env cwd exists isfile isdir listdir walk mkdir remove rename run output; `path` join basename dirname ext stem normalize abs; `re` (POSIX ERE + \d\w\s) test full search find find_all matches replace("$1") replace_fn split; `Match(text, start, end, groups)`.
+- Std (import): `os` env cwd exists isfile isdir listdir walk mkdir remove rename chmod bytes run output; `path` join basename dirname ext stem normalize abs; `re` (POSIX ERE + \d\w\s) test full search find find_all matches replace("$1") replace_fn split; `Match(text, start, end, groups)`.
 - FFI: `extern fn strlen(s str) usize`, `extern "z" fn f() str` (links -lz), `extern "glue.c" fn g(p ptr, n i32) f64`; C types i8..u64 usize f32 f64, `str` = const char*, `ptr` = void*, `str?`/`ptr?` for NULL.
 - Tests: top-level `test "name"` blocks with `assert a == b` (shows both values); `sip test` runs them, `-k text` filters. `sip fmt` formats.
 - Not available: slice steps, decorators other than `@cache`, generic functions as values (wrap in a lambda).

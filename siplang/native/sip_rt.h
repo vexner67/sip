@@ -1485,6 +1485,8 @@ static void sip_os_remove(sip_str p) { if (remove(sip_ffi_cstr(p))) sip_os_fail(
 
 static void sip_os_rename(sip_str a, sip_str b) { if (rename(sip_ffi_cstr(a), sip_ffi_cstr(b))) sip_os_fail(a); }
 
+static void sip_os_chmod(sip_str p, int64_t mode) { if (chmod(sip_ffi_cstr(p), (mode_t)mode)) sip_os_fail(p); }
+
 static void *sip_os_opendir(sip_str p) {
     DIR *d = opendir(sip_ffi_cstr(p));
     if (!d) sip_os_fail(p);

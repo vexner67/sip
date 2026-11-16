@@ -403,7 +403,7 @@ for f in os.walk("src")
 
 | модуль | функции |
 |---|---|
-| `os` | `env(name) str?`, `setenv`, `unsetenv`, `cwd`, `chdir`, `exists`, `isfile`, `isdir`, `size`, `mtime`, `listdir(dir) [str]` (по алфавиту), `walk(dir) [str]` (все файлы вглубь), `mkdir(p, parents: true)`, `remove`, `rename`, `run(cmd) int` (код выхода), `output(cmd) str` (вывод; ненулевой код — ошибка), `pid`, `platform` |
+| `os` | `env(name) str?`, `setenv`, `unsetenv`, `cwd`, `chdir`, `exists`, `isfile`, `isdir`, `size`, `mtime`, `listdir(dir) [str]` (по алфавиту), `walk(dir) [str]` (все файлы вглубь), `mkdir(p, parents: true)`, `remove`, `rename`, `chmod(p, mode)`, `bytes(xs [int]) str` (строка из сырых байтов 0..255, для двоичных файлов), `run(cmd) int` (код выхода), `output(cmd) str` (вывод; ненулевой код — ошибка), `pid`, `platform` |
 | `path` | `join(*parts)`, `basename`, `dirname`, `ext` (`".gz"`), `stem`, `normalize` (`a/./b/../c` → `a/c`), `abs`, `isabs` |
 | `re` | `test(p, s) bool`, `full(p, s) bool`, `search(p, s) Match?`, `find(p, s) str?`, `find_all(p, s) [str]`, `matches(p, s) [Match]`, `replace(p, s, "$1")`, `replace_fn(p, s, fn(m) = ...)`, `split(p, s)` |
 

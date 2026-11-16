@@ -1875,5 +1875,70 @@ class SelfhostTest(unittest.TestCase):
             self.assertEqual(out, "Hello, Ann!\n")
 
 
+
+NATIVE_OK = sys.platform == "darwin" and os.uname().machine == "arm64"
+
+NATIVE_ERRORS = {
+    "mul": "fn f(n int) int = n * n * n\nprint \"before\"\nx = 1\nfor i in 1..30\n    x = f(x + 2)\n    print x\n",
+    "div": "fn d(a int, b int) int = a // b\nprint d(5, 2)\nprint d(1, 0)\n",
+    "mod": "fn m(a int) int = 10 % a\nprint m(0)\n",
+    "noret": "fn g(a int) int\n    if a > 0\n        return 1\nprint g(1)\nprint g(0)\n",
+    "neg": "x = -9223372036854775807 - 1\nprint -x\n",
+    "divneg": "x = -9223372036854775807 - 1\nprint x // -1\n",
+}
+
+
+@unittest.skipUnless(NATIVE_OK, "native backend: macOS arm64 only")
+class NativeTest(unittest.TestCase):
+    """sipc native (arm64, Mach-O без C) даёт тот же вывод, ошибки и код выхода, что C-бэкенд."""
+
+    @classmethod
+    def setUpClass(cls):
+        from siplang.compiler import build_cached
+        cls.sipc = build_cached(str(ROOT / "selfhost" / "sipc.sip"))
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.d = Path(cls.tmp.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def both(self, src):
+        p = self.d / "prog.sip"
+        p.write_text(src)
+        got = []
+        for cmd, exe in (("native", self.d / "n"), ("build", self.d / "c")):
+            r = subprocess.run([self.sipc, cmd, str(p), "-o", str(exe)], capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            r = subprocess.run([str(exe)], capture_output=True, text=True)
+            got.append((r.stdout, r.stderr, r.returncode))
+        self.assertEqual(got[0], got[1])
+        return got[0]
+
+    def test_basic_program(self):
+        out, _, rc = self.both((ROOT / "tests" / "native_basic.sip").read_text())
+        self.assertEqual(rc, 0)
+        self.assertIn("primes: 10", out)
+
+    def test_fib(self):
+        out, _, _ = self.both((ROOT / "bench" / "speed" / "fib.sip").read_text())
+        self.assertEqual(out, "9227465\n")
+
+    def test_runtime_errors(self):
+        for name, src in NATIVE_ERRORS.items():
+            with self.subTest(name):
+                _, err, rc = self.both(src)
+                self.assertEqual(rc, 1)
+                self.assertIn("Error", err)
+
+    def test_unsupported(self):
+        p = self.d / "list.sip"
+        p.write_text("xs = [1, 2]\nprint xs\n")
+        r = subprocess.run([self.sipc, "native", str(p), "-o", str(self.d / "x")], capture_output=True, text=True,
+                           cwd=ROOT)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("native backend:", r.stdout)
+        self.assertIn("not supported yet", r.stdout)
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@
 #   sipc build FILE.sip [-o OUT]   исполняемый файл; единицы C модулей берутся из кэша, если не менялись
 #   sipc run FILE.sip [ARGS...]    собирает в кэш (~/.cache/sip) и запускает
 #   sipc c FILE.sip                печатает сгенерированный C
+#   sipc native FILE.sip [-o OUT]  исполняемый файл arm64 без C и clang (пока подмножество языка, см. ngen.sip)
 #
 # Стандартная библиотека и рантайм ищутся в --std, $SIP_STD или в siplang/std в текущей папке, папке
 # исходника или их родителях.
@@ -12,6 +13,7 @@ import path
 import modules
 import checker
 import cgen
+import ngen
 from modules import SipErr
 from checker import UNIT
 
@@ -88,6 +90,13 @@ fn compile_units(file str, std str) [(str, str)]
     c.check(body)
     runtime = read(path.normalize(std + "/../native/sip_rt.h"))
     cgen.generate_units(c, file, ld, runtime)
+
+fn build_native(file str, std str, out str)
+    ld = modules.Loader(std)
+    body = ld.load_root(file, read(file))
+    c = checker.Checker(file, std, ld, tys=[UNIT])
+    c.check(body)
+    ngen.build(c, ld, file, out)
 
 # ---------- C -> исполняемый файл ----------
 
@@ -167,7 +176,7 @@ fn where(p str, line int, col int) str
     "{p}:{line}:{col}"
 
 fn usage()
-    print "usage: sipc build FILE.sip [-o OUT] | sipc run FILE.sip [ARGS...] | sipc c FILE.sip  [--std DIR]"
+    print "usage: sipc build FILE.sip [-o OUT] | sipc run FILE.sip [ARGS...] | sipc c FILE.sip | sipc native FILE.sip [-o OUT]  [--std DIR]"
     exit(2)
 
 fn main(cmd str, *rest str, std = "")
@@ -180,7 +189,7 @@ fn main(cmd str, *rest str, std = "")
             for name, text in compile_units(file, sd)
                 out.append("// ---- {name}.c ----\n{text}")
             write("/dev/stdout", "".join(out))
-        elif cmd == "build"
+        elif cmd == "build" or cmd == "native"
             dst = path.stem(file)
             i = 1
             while i < len(rest)
@@ -189,6 +198,10 @@ fn main(cmd str, *rest str, std = "")
                     i += 2
                 else
                     fail SipErr("unexpected argument: {rest[i]}", "sip", 0, 0)
+            if cmd == "native"
+                build_native(file, sd, dst)
+                print dst
+                return
             units = compile_units(file, sd)
             got = build_units(units, dst)
             print "{len(units)} unit(s): {got[0]} compiled, {got[1]} cached"
