@@ -68,6 +68,7 @@ class CGen:
         self.reg.const_code = self.const_code
         self.uses_http = False
         self.uses_async = False
+        self.lam_rets: list = []  # тип результата многострочных лямбд, которые сейчас генерируются
         self.uid = 0
         self.fn_code: list[str] = []
         self.protos: list[str] = []
@@ -158,11 +159,14 @@ class CGen:
         m = self.p.main
         if m is not None:
             usage = Path(self.file).stem
-            for name, t, d in m.params:
+            star = getattr(m, "stars", {}).get("*")
+            for idx, (name, t, d) in enumerate(m.params):
                 flag = name.replace("_", "-")
                 if isinstance(prune(t), OptT):
                     t = prune(t).inner
-                if d is None:
+                if idx == star:
+                    usage += f" [{name.upper()}...]"
+                elif d is None:
                     usage += f" {name.upper()}"
                 elif prune(t) is BOOL:
                     usage += f" [--{flag}]"
@@ -173,13 +177,16 @@ class CGen:
             self.emit(f"sip_args_help({u});")
             args = []
             pos = 0
-            for name, t, d in m.params:
+            rest = None
+            for idx, (name, t, d) in enumerate(m.params):
                 flag = c_bytes(name.replace("_", "-").encode())
                 full = deep(t)
                 pt = prune(full.inner) if isinstance(full, OptT) else full
                 conv = {INT: "sip_arg_int", FLOAT: "sip_arg_float", BOOL: "sip_arg_bool"}.get(pt)
                 var = self.tmp(self.c(full), "a")
-                if d is None:
+                if idx == star:
+                    rest = (var, full, flag)  # заполняется после флагов: им нужны свои значения
+                elif d is None:
                     s = f"sip_positional({pos}, {c_bytes(name.encode())}, {u})"
                     pos += 1
                     self.emit(f"{var} = " + (f"{conv}({s}, {flag}, {u});" if conv else f"sip_cstr({s});"))
@@ -191,6 +198,15 @@ class CGen:
                     val = f"{conv}({s}, {flag}, {u})" if conv else f"sip_cstr({s})"
                     self.emit(f"{var} = {s} ? {self.convert(val, pt, full, 0)} : {self.ex(d)};")
                 args.append(var)
+            if rest is not None:
+                var, full, flag = rest
+                k = self.k(full)
+                et = deep(full.elem)
+                conv = {INT: "sip_arg_int", FLOAT: "sip_arg_float", BOOL: "sip_arg_bool"}.get(et)
+                s = self.tmp("const char *", "s")
+                val = f"{conv}({s}, {flag}, {u})" if conv else f"sip_cstr({s})"
+                self.emit(f"{var} = {k}_new(0);")
+                self.emit(f"while (({s} = sip_rest_next()) != NULL) {k}_push({var}, {val});")
             self.emit("sip_args_done(" + u + ");")
             call = f"{m.cname}({', '.join(args)})"
             if getattr(m, "is_async", False):  # async fn main: сразу выполнить задачу
@@ -542,14 +558,44 @@ class CGen:
             self.ctl.pop()
         self.loop(s.iter_kind, s.iter, body)
 
-    def pops(self, until_loop: bool) -> int:
-        n = 0
+    def pops(self, until_loop: bool) -> str:
+        """Код выхода из блоков try и with при return/break/continue (изнутри наружу)."""
+        out = ""
         for c in reversed(self.ctl):
             if c == "loop" and until_loop:
                 break
             if c == "try":
-                n += 1
-        return n
+                out += "sip_try_pop(); "
+            elif isinstance(c, tuple) and c[0] == "with":
+                out += f"sip_try_pop(); {c[1]}; "
+        return out
+
+    def s_With(self, s):
+        """with x as y: y = x.enter() (если есть), в конце — x.exit(), в том числе при ошибке."""
+        closes = []
+        for (expr, _), (ct, enter, exit_, var) in zip(s.items, s.info):
+            ctx = self.tmp(self.c(ct), "ctx")
+            self.emit(f"{ctx} = {self.ex(expr)};")
+            if var is not None:
+                self.emit(f"{var.cname} = " + (f"{enter.cname}({ctx});" if enter is not None else f"{ctx};"))
+            elif enter is not None:
+                self.emit(f"{enter.cname}({ctx});")
+            exit_code = f"{exit_.cname}({ctx})" if exit_ is not None else "((void)0)"
+            t = self.tmp("sip_try", "try")
+            self.emit(f"sip_try_push(&{t});")
+            self.emit(f"if (setjmp({t}.jb) == 0) {{")
+            self.depth += 1
+            self.ctl.append(("with", exit_code))
+            closes.append(exit_code)
+        self.block(s.body)
+        for exit_code in reversed(closes):
+            self.ctl.pop()
+            self.emit(f"sip_try_pop(); {exit_code};")
+            self.depth -= 1
+            self.emit("} else {")
+            self.emit(f"    {exit_code};")
+            self.emit("    sip_reraise();")
+            self.emit("}")
 
     def s_Return(self, s):
         n = self.pops(False)
@@ -558,18 +604,18 @@ class CGen:
                 code = self.ex(s.value)
                 if code:
                     self.emit(code + ";")
-            self.emit("sip_try_pop(); " * n + "return;")
+            self.emit(n + "return;")
             return
         code = self.ex(s.value)
         if n:
-            code = self.spill(code, self.fi.ret)
-        self.emit("sip_try_pop(); " * n + f"return {code};")
+            code = self.spill(code, self.lam_rets[-1] if self.lam_rets else self.fi.ret)
+        self.emit(n + f"return {code};")
 
     def s_Break(self, s):
-        self.emit("sip_try_pop(); " * self.pops(True) + "break;")
+        self.emit(self.pops(True) + "break;")
 
     def s_Continue(self, s):
-        self.emit("sip_try_pop(); " * self.pops(True) + "continue;")
+        self.emit(self.pops(True) + "continue;")
 
     def s_Pass(self, s):
         pass
@@ -867,14 +913,24 @@ class CGen:
             self.decls.append(f"struct env_{e.lid} *env = envp;")
             for v in caps:
                 self.decls.append(f"{self.c(v.ty)} {v.cname} = env->{v.cname};")
-        for v in e.extra:
-            self.decls.append(f"{self.c(v.ty)} {v.cname} = {{0}};")
-        code = self.ex(e.body)
-        if deep(ft.ret) is UNIT:
-            if code:
-                self.emit(code + ";")
+        vol = "volatile " if getattr(e, "has_try", False) else ""
+        for v in e.extra + getattr(e, "locals", []):
+            self.decls.append(f"{vol}{self.c(v.ty)} {v.cname} = {{0}};")
+        if e.block is not None:
+            self.lam_rets.append(deep(ft.ret))
+            try:
+                self.block(e.block)
+            finally:
+                self.lam_rets.pop()
+            if deep(ft.ret) is not UNIT:
+                self.emit(f'sip_raise(SIP_E_Error, SIP_LIT("the lambda ended without returning a value"), {e.line});')
         else:
-            self.emit(f"return {code};")
+            code = self.ex(e.body)
+            if deep(ft.ret) is UNIT:
+                if code:
+                    self.emit(code + ";")
+            else:
+                self.emit(f"return {code};")
         body = self.finish()
         self.lines, self.decls, self.depth, self.ctl = saved
         params = ["void *envp"] + [f"{self.c(v.ty)} {v.cname}" for v in e.pvars]

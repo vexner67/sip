@@ -368,8 +368,13 @@ class Checker:
             self.need_resolved(v.ty, None, f"global '{name}'")
         if "main" in p.fns:
             m = p.fns["main"]
-            for name, t, d in m.params:
+            stars = getattr(m, "stars", {})
+            if "**" in stars:
+                self.err("main cannot take **kwargs; use flags: fn main(name str, n = 1)", m.node)
+            for i, (name, t, d) in enumerate(m.params):
                 pt = prune(t)
+                if i == stars.get("*"):
+                    pt = prune(pt.elem)  # *files str — остальные позиционные аргументы
                 if isinstance(pt, OptT) and d is not None:
                     pt = prune(pt.inner)
                 if pt not in (INT, FLOAT, STR, BOOL):
@@ -434,9 +439,25 @@ class Checker:
                 fi.cache = True
             else:
                 self.err(f"decorator {UNSUPPORTED} (only @cache)", n)
+        fi.stars = {}
         for prm in n.params:
             if prm.star:
-                self.err(f"*args {UNSUPPORTED}", prm)
+                kind = prm.star
+                if kind in fi.stars:
+                    self.err(f"only one {kind}{prm.name} parameter is allowed", prm)
+                if kind == "*" and "**" in fi.stars:
+                    self.err("*args must come before **kwargs", prm)
+                if prm.type is None:
+                    ex = f"*{prm.name} int" if kind == "*" else f"**{prm.name} str"
+                    self.err(f"parameter '{kind}{prm.name}' needs the type of its items, e.g. {ex}", prm)
+                if prm.default is not None:
+                    self.err(f"'{kind}{prm.name}' cannot have a default value", prm)
+                et = self.to_type(prm.type)
+                fi.stars[kind] = len(fi.params)
+                fi.params.append((prm.name, ListT(et) if kind == "*" else DictT(STR, et), None))
+                continue
+            if "**" in fi.stars:
+                self.err("parameters cannot follow **kwargs", prm)
             if prm.type is not None:
                 t = self.to_type(prm.type)
                 if prm.default is not None:
@@ -552,6 +573,11 @@ class Checker:
                         walk(b)
                     if s.orelse:
                         walk(s.orelse)
+                elif isinstance(s, With):
+                    for _, name in s.items:
+                        if name:
+                            add(name)
+                    walk(s.body)
                 elif isinstance(s, Try):
                     walk(s.body)
                     for h in s.handlers:
@@ -722,7 +748,20 @@ class Checker:
         self.assign_to(s.target, elem, s)
         self.block(s.body)
 
+    def block_lambda(self):
+        """Многострочная лямбда, тело которой проверяется сейчас (или None)."""
+        if self.lambdas and self.lambdas[-1].block is not None:
+            return self.lambdas[-1]
+        return None
+
     def s_Return(self, s):
+        lam = self.block_lambda()
+        if lam is not None:
+            t = UNIT if s.value is None else self.expr(s.value, opt=True, want=lam.ret)
+            if is_nil(s.value) and isinstance(prune(lam.ret), TVar):
+                self.err("the lambda returns nil here, but its result type is unknown", s)
+            self.expect(lam.ret, t, s, "lambda result", src=s.value)
+            return
         if self.cur is self.p.top:
             self.err("return outside a function", s)
         if s.value is None:
@@ -752,8 +791,39 @@ class Checker:
         if s.msg is not None:
             self.expr(s.msg)
 
+    def s_With(self, s):
+        """with ctx as name: у ctx должен быть метод exit() (и, может быть, enter())."""
+        self.cur.has_try = True
+        if self.block_lambda() is not None:
+            self.block_lambda().has_try = True
+        s.info = []
+        for expr, name in s.items:
+            t = prune(self.expr(expr))
+            methods = t.methods if isinstance(t, (RecordT, SumT)) else {}
+            enter, exit_ = methods.get("enter"), methods.get("exit")
+            if exit_ is None and enter is None:
+                self.err(f"with needs a record with exit() (and optionally enter()) methods, not {show(t)}", expr)
+            for fi, mname in ((enter, "enter"), (exit_, "exit")):
+                if fi is None:
+                    continue
+                if fi.params:
+                    self.err(f"{show(t)}.{mname}() must take no arguments", expr)
+                if getattr(fi, "is_async", False):
+                    self.err(f"{show(t)}.{mname}() cannot be async", expr)
+                if fi.state == "new" and isinstance(prune(fi.ret), TVar):
+                    self.check_fn(fi)
+            var = None
+            if name:
+                var = self.lookup(name)
+                vt = enter.ret if enter is not None else t
+                self.expect(var.ty, vt, expr, f"with ... as {name}")
+            s.info.append((t, enter, exit_, var))
+        self.block(s.body)
+
     def s_Try(self, s):
         self.cur.has_try = True
+        if self.block_lambda() is not None:
+            self.block_lambda().has_try = True
         self.block(s.body)
         for h in s.handlers:
             if h.kind is not None and h.kind not in ERROR_KINDS and h.kind not in CATCH_ALL:
@@ -855,6 +925,8 @@ class Checker:
 
     def s_FnDef(self, s):
         """Вложенная функция: замыкание с телом-блоком, видит переменные снаружи."""
+        if self.lambdas:
+            self.err("a named fn cannot be declared inside a lambda; declare it before the lambda", s)
         if s.decorators:
             self.err(f"decorators on nested functions {UNSUPPORTED}", s)
         if s.is_async:
@@ -1016,20 +1088,47 @@ class Checker:
             self.err("cannot index a value of unknown type" + self.typed_hint(t), e)
         self.err(f"cannot index {show(t)}", e)
 
-    def bind_args(self, call, params, what):
-        if any(isinstance(a, Starred) for a in call.args):
-            self.err(f"*args {UNSUPPORTED}", call)
-        if len(call.args) > len(params):
-            self.err(f"{what} takes {len(params)} argument(s), got {len(call.args)}", call)
-        bound = list(call.args) + [None] * (len(params) - len(call.args))
+    def bind_args(self, call, params, what, stars=None):
+        stars = stars or {}
+        si, ki = stars.get("*"), stars.get("**")
+        args = list(call.args)
+        bound = [None] * len(params)
+        spread = [a for a in args if isinstance(a, Starred)]
+        if spread:
+            # f(a, *xs) и f(**opts): список или словарь целиком идёт в *args / **kwargs
+            a = spread[0]
+            want_i = ki if a.double else si
+            if want_i is None:
+                self.err(f"{what} has no {'**kwargs' if a.double else '*args'} parameter to unpack into", a)
+            if len(spread) > 1 or (not a.double and args[-1] is not a):
+                self.err("only one *list may be passed, as the last positional argument", a)
+            args = [x for x in args if x is not a]
+            bound[want_i] = a.value
+            if not a.double:
+                si = None  # *args уже заполнен
+        positional = [i for i in range(len(params)) if i not in (stars.get("*"), stars.get("**"))
+                      and (stars.get("*") is None or i < stars.get("*"))]
+        if len(args) > len(positional) and si is None:
+            self.err(f"{what} takes {len(positional)} argument(s), got {len(args)}", call)
+        for i, a in zip(positional, args):
+            bound[i] = a
+        if si is not None:
+            extra = args[len(positional):]
+            bound[si] = ListLit(extra, line=call.line)
         names = [n for n, _, _ in params]
+        extra_kw = []
         for k, v in call.kwargs:
-            if k not in names:
+            if k not in names or names.index(k) in (stars.get("*"), stars.get("**")):
+                if ki is not None:
+                    extra_kw.append((Str([k], line=call.line), v))
+                    continue
                 self.err(f"{what} has no parameter '{k}'", call)
             i = names.index(k)
             if bound[i] is not None:
                 self.err(f"argument '{k}' given twice", call)
             bound[i] = v
+        if ki is not None and bound[ki] is None:
+            bound[ki] = DictLit(extra_kw, line=call.line)
         for i, (n, t, default) in enumerate(params):
             if bound[i] is None:
                 if default is None:
@@ -1049,7 +1148,7 @@ class Checker:
                 return self.call_value(e)
             if name in self.p.fns:
                 fi = self.p.fns[name]
-                self.bind_args(e, fi.params, f"{name}()")
+                self.bind_args(e, fi.params, f"{name}()", getattr(fi, "stars", None))
                 e.ckind, e.fn = "fn", fi
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)  # вывести тип результата до использования
@@ -1078,7 +1177,7 @@ class Checker:
                 return self.e_Call(e)
             if isinstance(rt, (RecordT, SumT)) and f.name in rt.methods:
                 fi = rt.methods[f.name]
-                self.bind_args(e, fi.params, f"{rt.name}.{f.name}()")
+                self.bind_args(e, fi.params, f"{rt.name}.{f.name}()", getattr(fi, "stars", None))
                 e.ckind, e.fn = "method", fi
                 if fi.state == "new" and isinstance(prune(fi.ret), TVar):
                     self.check_fn(fi)
@@ -1383,7 +1482,10 @@ class Checker:
         e.extra = []
         e.pvars = [Var(n, t, f"a{e.lid}_{n}", "lparam") for n, t in zip(e.params, ptypes)]
         e.depth = len(self.scopes)
-        self.scopes.append({v.name: v for v in e.pvars})
+        scope = {v.name: v for v in e.pvars}
+        if e.block is not None:
+            return self.lambda_block(e, scope, ptypes, pw)
+        self.scopes.append(scope)
         self.lambdas.append(e)
         try:
             rt = self.expr(e.body, opt=True)
@@ -1394,6 +1496,43 @@ class Checker:
             self.expect(pw.ret, rt, e.body, "function result", src=e.body)
             rt = pw.ret
         return FnT(ptypes, rt)
+
+    def lambda_block(self, e, scope, ptypes, pw):
+        """fn(x) с телом на следующих строках: свои локальные переменные и return."""
+        if not getattr(e, "tailed", False):
+            e.block = tail(e.block)
+            e.tailed = True
+        augs: list = []
+        names = self.assigned(e.block, augs)
+        for n in augs:
+            if n in names or n in scope:
+                continue
+            outer = any(n in sc for sc in self.scopes) or (
+                self.cur is not None and self.cur is not self.p.top and n in self.cur.locals)
+            if outer:
+                self.err(f"a lambda cannot change the outer variable '{n}'; return the new value instead", e)
+        e.locals = []
+        for n in names:
+            if n not in scope:
+                v = Var(n, TVar(), f"a{e.lid}_{n}", "local")
+                scope[n] = v
+                e.locals.append(v)
+        e.ret = pw.ret if isinstance(pw, FnT) else TVar()
+        e.has_try = False
+        self.scopes.append(scope)
+        self.lambdas.append(e)
+        start = len(self.nils)
+        try:
+            self.block(e.block)
+        finally:
+            self.lambdas.pop()
+            self.scopes.pop()
+        self.default_nils(start)
+        if isinstance(prune(e.ret), TVar):
+            e.ret.ref = UNIT
+        for v in e.locals:
+            self.need_resolved(v.ty, e, f"variable '{v.name}' in the lambda")
+        return FnT(ptypes, e.ret)
 
     @staticmethod
     def call_ret(fi):

@@ -539,7 +539,7 @@ class TypeErrorTest(unittest.TestCase):
         self.assertEqual(run("xs = []\nprint len(xs), [], {}"), "0 [] {}\n")  # пустое без контекста — [int]
 
     def test_unsupported_feature_is_named(self):
-        self.assertIn("not supported by the native compiler", errors_of("fn f(*xs)\n    pass"))
+        self.assertIn("not supported by the native compiler", errors_of("xs = [1, 2]\nprint xs[::2]"))
 
     def test_method_calls_another_method(self):
         src = "type T(v int)\n    fn a() int = .v + 1\n    fn b() int = .a() * 2\nprint T(1).b()"
@@ -789,6 +789,74 @@ class AsyncTest(unittest.TestCase):
         self.assertIn("await is only allowed inside an async fn", errors_of("async fn f() int = 1\nprint await f()"))
         self.assertIn("'g' is not async", errors_of("async fn f() int = 1\nfn g() int = await f()"))
         self.assertIn("needs a list of tasks", errors_of("async fn main()\n    print await all(5)"))
+
+
+class BlockLambdaTest(unittest.TestCase):
+    def test_multiline_lambdas(self):
+        src = ("xs = [3, 1, 2]\nys = xs.map(fn(x)\n    y = x * 2\n    if y > 4 then return 0\n    y + 1\n)\nprint ys\n"
+               "f = fn(a int, b int)\n    s = a + b\n    s * s\nprint f(1, 2)\n"
+               "print sorted([\"bb\", \"a\", \"ccc\"], key: fn(w)\n    n = len(w)\n    -n\n)\n"
+               "fn apply(g fn(int) int, x int) int = g(x)\n"
+               "print apply(fn(v)\n    try\n        [1, 2][v]\n    catch IndexError\n        -1\n, 5)\n"
+               "fn mk(n int) fn(int) int = fn(x)\n    if x > n then return n\n    x\nprint mk(3)(5), mk(3)(1)\n"
+               "print [[1, 2], [3]].map(fn(row)\n    row.map(fn(v)\n        w = v * 10\n        w + 1\n    )\n)\n"
+               "fn run()\n    k = 10\n    h = fn(x int)\n        print \"got\", x + k\n    h(1)\nrun()")
+        self.assertEqual(run(src), "[0, 3, 5]\n9\n['ccc', 'bb', 'a']\n-1\n3 1\n[[11, 21], [31]]\ngot 11\n")
+
+    def test_errors(self):
+        self.assertIn("cannot change the outer variable 'k'",
+                      errors_of("fn g()\n    k = 1\n    h = fn()\n        k += 1\n    h()"))
+        self.assertIn("named fn cannot be declared inside a lambda",
+                      errors_of("xs = [1]\nxs.map(fn(x)\n    fn inner() int = 1\n    inner()\n)"))
+        self.assertIn("the lambda ended without returning a value",
+                      failure("f = fn(x int)\n    if x > 0 then return x\nprint f(0)"))
+
+
+class StarArgsTest(unittest.TestCase):
+    def test_args_kwargs(self):
+        src = ('fn total(*xs int) int = sum(xs)\nfn fmt(sep str, *parts str, end = "!") str = parts.join(sep) + end\n'
+               'fn opts(name str, **kw int) str = "{name} {kw}"\n'
+               'print total(), total(1), total(1, 2, 3), total(*[4, 5])\n'
+               'print fmt("-", "a", "b"), fmt(", ", "x", end: "."), fmt("+")\n'
+               'print opts("a"), opts("b", x: 1, y: 2), opts("c", **{"z": 9})\n'
+               'type Bag(items [str])\n    fn add(*xs str)\n        .items.extend(xs)\n'
+               'b = Bag([])\nb.add("p", "q")\nprint b')
+        self.assertEqual(run(src), "0 1 6 9\na-b! x. !\na {} b {'x': 1, 'y': 2} c {'z': 9}\nBag(items=['p', 'q'])\n")
+
+    def test_main_rest_args(self):
+        src = 'fn main(prefix str, *nums int, twice = false)\n    for n in nums\n        print "{prefix}{if twice then n * 2 else n}"'
+        self.assertEqual(run(src, ">", "1", "2", "--twice"), ">2\n>4\n")
+        self.assertEqual(run(src, "-"), "")
+        self.assertIn("usage: t PREFIX [NUMS...] [--twice]", run(src, "--help"))
+
+    def test_errors(self):
+        self.assertIn("needs the type of its items", errors_of("fn f(*xs) int = 1"))
+        self.assertIn("no *args parameter", errors_of("fn f(x int) int = x\nprint f(*[1])"))
+        self.assertIn("int and str do not match", errors_of('fn f(*xs int) int = len(xs)\nprint f(1, "a")'))
+
+
+class WithTest(unittest.TestCase):
+    SRC = ('log: [str] = []\ntype Res(name str, open bool = false)\n    fn enter() Res\n'
+           '        log.append("enter {.name}")\n        .open = true\n        self\n'
+           '    fn exit()\n        log.append("exit {.name}")\n        .open = false\n'
+           'type Lock(n int)\n    fn exit()\n        log.append("unlock {.n}")\n')
+
+    def test_enter_exit(self):
+        src = self.SRC + (
+            'fn find(xs [int]) int\n    with Res("f") as r\n        for x in xs\n'
+            '            if x > 2 then return x * 10\n    -1\n'
+            'with Res("a") as a, Lock(1)\n    log.append("body {a.open}")\nprint log\nlog.clear()\n'
+            'try\n    with Res("b")\n        fail "boom"\ncatch e\n    log.append("caught {e}")\nprint log\nlog.clear()\n'
+            'print find([1, 5]), find([1]), log\nlog.clear()\n'
+            'for i in 1..3\n    with Lock(i)\n        if i == 2 then break\nprint log')
+        self.assertEqual(run(src), "['enter a', 'body True', 'unlock 1', 'exit a']\n"
+                                   "['enter b', 'exit b', 'caught boom']\n"
+                                   "50 -1 ['enter f', 'exit f', 'enter f', 'exit f']\n['unlock 1', 'unlock 2']\n")
+
+    def test_errors(self):
+        self.assertIn("with needs a record with exit()", errors_of("with 5 as x\n    pass"))
+        self.assertIn("must take no arguments",
+                      errors_of("type T(n int)\n    fn exit(x int)\n        pass\nwith T(1)\n    pass"))
 
 
 class ExamplesTest(unittest.TestCase):

@@ -72,7 +72,7 @@ async fn main()
 
 ## Чего пока нет
 
-Многострочных лямбд (вместо них — вложенные `fn`), `with` и `*args`. Компилятор сообщает об этом явно: `... is not supported by the native compiler yet`.
+Шага в срезах (`xs[::2]`), декораторов, кроме `@cache`, значений по умолчанию у полей вариантов и вложенных `async fn`. Компилятор сообщает об этом явно: `... is not supported by the native compiler yet`.
 
 ## Устройство
 
@@ -92,7 +92,7 @@ async fn main()
 ## Документация
 
 - [docs/spec.md](docs/spec.md) — справочник языка.
-- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 1100 токенов.
+- [docs/prompt.md](docs/prompt.md) — сжатая спецификация для ИИ-модели, около 1200 токенов.
 - [bench/](bench/) — замер токенов, по которому выбирали синтаксис ([DECISION.md](bench/DECISION.md)), и замер скорости ([speed](bench/speed/)).
 
 ## Тесты

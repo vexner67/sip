@@ -574,7 +574,9 @@ class Parser:
             if not self.accept(","):
                 break
         self.expect(")")
-        self.expect("=", "'=' before the body of fn(...)")
+        if self.at("NEWLINE") and self.peek(1).kind == "INDENT":  # многострочная лямбда
+            return Lambda(names, None, types, self.parse_block(), line=tok.line)
+        self.expect("=", "'=' before the body of fn(...), or the body on the next lines")
         return Lambda(names, self.parse_expr(), types, line=tok.line)
 
     def _binary(self, sub, ops):

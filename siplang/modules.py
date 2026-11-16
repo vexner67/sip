@@ -222,7 +222,13 @@ class Renamer:
             return node
         if isinstance(node, Lambda):
             node.types = self.rn(node.types, local)
-            node.body = self.rn(node.body, local | set(node.params))
+            inner = local | set(node.params)
+            if node.block is not None:
+                from .checker import Checker
+                inner = inner | set(Checker().assigned(node.block))
+                node.block = self.rn(node.block, inner)
+            else:
+                node.body = self.rn(node.body, inner)
             return node
         if isinstance(node, Comp):
             bound = set()

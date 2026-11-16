@@ -607,6 +607,17 @@ static const char *sip_positional(int index, const char *name, const char *usage
     sip_usage_error(usage, "missing argument: ", name);
 }
 
+/* следующий ещё не разобранный позиционный аргумент (для *args у main) */
+static const char *sip_rest_next(void) {
+    for (int i = 1; i < sip_argc; i++) {
+        const char *a = sip_argv[i];
+        if (sip_used[i] || (a[0] == '-' && a[1] == '-' && a[2])) continue;
+        sip_used[i] = 1;
+        return a;
+    }
+    return NULL;
+}
+
 static void sip_args_done(const char *usage) {
     for (int i = 1; i < sip_argc; i++)
         if (!sip_used[i]) sip_usage_error(usage, "unexpected argument: ", sip_argv[i]);

@@ -189,6 +189,7 @@ class Lambda(Node):
     params: list  # имена
     body: Node
     types: list = field(default_factory=list)  # тип или None для каждого параметра
+    block: list | None = None  # тело из нескольких строк (тогда body = None)
 
 
 @dataclass
