@@ -63,7 +63,7 @@ pip install -e .
 
 ## Библиотека
 
-Модули `.sip` подключаются через `import`; имена на `_` видны только в своём модуле. Пакет — папка с `sip.toml`, зависимости в нём указываются папкой или git-репозиторием с ревизией. Каждый модуль компилируется отдельно и берётся из кэша, если не менялся. Встроенные модули `math`, `random`, `time`, `json`, `csv`, `http` есть всегда. Стандартная библиотека `os`, `path` и `re` и часть рантайма (`rt`: строковые функции, `int(s)`) написаны на самом Sip. Функции C вызываются напрямую: `extern fn strlen(s str) usize`, `extern "sqlite3" fn ...`, `extern "glue.c" fn ...`. JSON и CSV читаются сразу в нужный тип, без промежуточных словарей:
+Модули `.sip` подключаются через `import`; имена на `_` видны только в своём модуле. Пакет — папка с `sip.toml`, зависимости в нём указываются папкой или git-репозиторием с ревизией. Каждый модуль компилируется отдельно и берётся из кэша, если не менялся. Встроенные модули `math`, `random`, `time`, `json`, `csv`, `http` есть всегда. Стандартная библиотека `os`, `path` и `re` и рантайм (`rt`: строковые функции, разбор и печать чисел, JSON, CSV, аргументы `fn main`) написаны на самом Sip. Функции C вызываются напрямую: `extern fn strlen(s str) usize`, `extern "sqlite3" fn ...`, `extern "glue.c" fn ...`. JSON и CSV читаются сразу в нужный тип, без промежуточных словарей:
 
 ```
 type User(name str, age int, email str? = nil)
@@ -91,7 +91,7 @@ async fn main()
 | [siplang/cregistry.py](siplang/cregistry.py) | C-код для конкретных списков, словарей, кортежей, записей |
 | [siplang/modules.py](siplang/modules.py) | `import`, пакеты (`sip.toml`, зависимости), приватные имена |
 | [siplang/cgen.py](siplang/cgen.py) | AST с типами → C |
-| [siplang/native/sip_rt.h](siplang/native/sip_rt.h) | рантайм: строки, аллокатор, ошибки (setjmp), форматирование чисел как в Python, JSON, CSV, HTTP (libcurl), задачи |
+| [siplang/native/sip_rt.h](siplang/native/sip_rt.h) | ядро рантайма: сборщик мусора, ошибки (setjmp), задачи, примитивы для `rt.sip`, обёртки над libc и libcurl (HTTP) |
 | [siplang/fmt.py](siplang/fmt.py) | `sip fmt`: форматирование по токенам, комментарии сохраняются |
 | [siplang/lsp.py](siplang/lsp.py) | `sip lsp`: языковой сервер |
 | [siplang/std/](siplang/std/) | стандартная библиотека на Sip: `os`, `path`, `re`; `rt.sip` — рантайм на Sip, подключается к каждой программе |
