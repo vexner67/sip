@@ -1891,6 +1891,12 @@ NATIVE_ERRORS = {
     "rangemask": "fn f(a int) int\n    b = a % 1000\n    c = b * 9223372036854775\n    return c * 2\nprint f(1)\nprint f(999)\n",
     "doubling": "z = 3\nfor i in 1..80\n    z = z * 2 + 1\n    print z\n",
     "loopadd": "w = 0\nfor i in 0..9223372036854775806\n    w = i + 1\n    if i > 3 then w = 9223372036854775807 + i\nprint w\n",
+    "listindex": "x = [1, 2]\nprint(x[0])\nprint(x[2])\n",
+    "listneg": "x = [1, 2]\nk = -3\nprint(x[k])\n",
+    "strindex": "s = \"ab\"\nprint(s[-1])\nprint(s[5])\n",
+    "setindex": "x = [1]\ni = -2\nx[i] = 5\n",
+    "pop": "x: [int] = []\nx.append(1)\nprint(x.pop())\nprint(x.pop())\n",
+    "concatovf": "s = \"a\"\nn = 9223372036854775807\nprint(s + str(n + 1))\n",
 }
 
 
@@ -1943,6 +1949,18 @@ class NativeTest(unittest.TestCase):
                 _, _, rc = self.both(src)
                 self.assertEqual(rc, 0)
 
+    def test_strings_lists(self):
+        """строки и списки: срезы, сравнения, in, join, repr, append/pop, * и +"""
+        out, _, rc = self.both((ROOT / "tests" / "native_strings.sip").read_text())
+        self.assertEqual(rc, 0)
+        self.assertIn("['b', 'a', 'c', 'd'] True False ['a', 'c']", out)
+
+    def test_gc(self):
+        """сборщик мусора: память переиспользуется, живые объекты (стек, глобальные, вложенные) целы"""
+        out, _, rc = self.both((ROOT / "tests" / "native_gc.sip").read_text())
+        self.assertEqual(rc, 0)
+        self.assertIn("166000", out)
+
     def test_fib(self):
         out, _, _ = self.both((ROOT / "bench" / "speed" / "fib.sip").read_text())
         self.assertEqual(out, "9227465\n")
@@ -1955,8 +1973,8 @@ class NativeTest(unittest.TestCase):
                 self.assertIn("Error", err)
 
     def test_unsupported(self):
-        p = self.d / "list.sip"
-        p.write_text("xs = [1, 2]\nprint xs\n")
+        p = self.d / "dict.sip"
+        p.write_text("d = {\"a\": 1}\nprint d\n")
         r = subprocess.run([self.sipc, "native", str(p), "-o", str(self.d / "x")], capture_output=True, text=True,
                            cwd=ROOT)
         self.assertEqual(r.returncode, 1)

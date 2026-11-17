@@ -173,6 +173,9 @@ fn emit_file(a Asm, entry str, imports [str], path str, ident str)
     data_vmsize = align(align(data_len, 16) + a.bss, PAGE)
     link_off = data_off + data_size
     a.resolve(BASE + text_off, BASE + const_off, BASE + data_off, bss_addr)
+    if os.env("SIP_NMAP") != nil  # отладка: смещения меток кода в файле (для sample и lldb)
+        lines = ["{text_off + 4 * at} {name}" for name, at in a.tl.items()]
+        write(path + ".map", "\n".join(sorted(lines)) + "\n")
 
     # __LINKEDIT: привязка, строки символов, подпись
     link = Buf()

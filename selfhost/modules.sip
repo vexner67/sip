@@ -387,7 +387,7 @@ type Renamer(names {str: str}, mods {str: {str: str}}, natives {str: str}, file 
 # ---------- загрузчик ----------
 
 type Loader(std str, files [(int, str)] = [], srcs [[str]] = [], extra [str] = [], modules {str: {str: str}} = {}, loading {str: bool} = {},
-            bodies [N] = [], pkg_seen {str: bool} = {}, pkgs {str: Package} = {}, base str = ".")
+            bodies [N] = [], pkg_seen {str: bool} = {}, pkgs {str: Package} = {}, base str = ".", native bool = false)
 
     fn package_of(p str) Package?
         d = path.dirname(abspath(p))
@@ -460,8 +460,9 @@ type Loader(std str, files [(int, str)] = [], srcs [[str]] = [], extra [str] = [
 
     # рантайм на Sip (std/rt.sip): его функции вызывает сгенерированный C; подключается к каждой программе
     fn load_rt()
-        p = join_parts(.std, ["rt.sip"])
-        if p not in .loading and p not in .modules then .load_path(p, .prefix(p))
+        for name in (if .native then ["rt.sip", "nrt.sip"] else ["rt.sip"])  # nrt — рантайм sipc native
+            p = join_parts(.std, [name])
+            if p not in .loading and p not in .modules then .load_path(p, .prefix(p))
         pass
 
     fn load_module(name str, from_path str, node N) {str: str}

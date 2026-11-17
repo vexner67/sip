@@ -56,6 +56,30 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
         .code.append(w)
 
     # строка в __TEXT,__const (одна копия на текст); метка "c:..."
+    # строка Sip в __TEXT,__const: [длина: 8 байт][байты], выровнено на 8; метка "c:s..."
+    fn strlit(bytes [int]) str
+        key = "c:s" + ",".join([str(b) for b in bytes])
+        if key in .cl then return key
+        while len(.consts) % 8 != 0
+            .consts.append(0)
+        .cl[key] = len(.consts)
+        n = len(bytes)
+        for i in 0..7
+            .consts.append((n // P2[8 * i]) & 255)
+        .consts.extend(bytes)
+        key
+
+    # 256 строк из одного байта по 16 байт: s[i] без выделения памяти
+    fn chars() str
+        key = "c:chars"
+        if key in .cl then return key
+        while len(.consts) % 16 != 0
+            .consts.append(0)
+        .cl[key] = len(.consts)
+        for c in 0..255
+            .consts.extend([1, 0, 0, 0, 0, 0, 0, 0, c, 0, 0, 0, 0, 0, 0, 0])
+        key
+
     fn cstr(bytes [int]) str
         key = "c:" + ",".join([str(b) for b in bytes])
         if key in .cl then return key
@@ -128,6 +152,10 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
     fn eor(rd int, rn int, rm int) = .rrr(3388997632, rd, rn, rm)
     fn mul(rd int, rn int, rm int) = .rrr(2600500224, rd, rn, rm)
     fn smulh(rd int, rn int, rm int) = .rrr(2604694528, rd, rn, rm)
+    fn umulh(rd int, rn int, rm int) = .rrr(2613083136, rd, rn, rm)
+
+    # rd = rn >> k без знака, 1 <= k <= 63
+    fn lsr(rd int, rn int, k int) = .emit(3544251392 + sh(k, 16) + sh(rn, 5) + rd)
     fn sdiv(rd int, rn int, rm int) = .rrr(2596277248, rd, rn, rm)
 
     # rd = ra - rn * rm
@@ -172,6 +200,8 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
         if m23 == 2449473536 or m23 == 2466250752 then return true  # and (imm), asr
         if m23 == 2432696320 or m23 == 3506438144 then return (w // 32) & 31 != 31  # add/sub imm (не sp)
         if m23 == 3531603968 or m23 == 2457862144 then return true  # movz, movn
+        if (w & 4290772992) == 4181721088 or (w & 4290772992) == 960495616 then return true  # ldr, ldrb (imm)
+        if (w & 4292934656) == 4167071744 then return true  # ldr [rn, rm, lsl 3]
         (w & 4294905824) == 2594113504  # cset
 
     fn add_imm(rd int, rn int, imm int)
@@ -206,6 +236,12 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
     # cmp rn, rm, asr #63 — после mul и smulh: не равно — переполнение
     fn cmp_asr63(rn int, rm int) = .rrr(3951098911, 0, rn, rm)
 
+    # флаги rn - (rm >> k)
+    fn cmp_asr(rn int, rm int, k int) = .emit(3951034399 + sh(rm, 16) + sh(k, 10) + sh(rn, 5))
+
+    # rd = rn << k, 1 <= k <= 63
+    fn lsl(rd int, rn int, k int) = .emit(3544186880 + sh(64 - k, 16) + sh(63 - k, 10) + sh(rn, 5) + rd)
+
     # если cond: флаги от rn - imm, иначе флаги = nzcv
     fn ccmp_imm(rn int, imm int, nzcv int, cond int)
         .emit(4198500352 + sh(imm, 16) + sh(cond, 12) + sh(rn, 5) + nzcv)
@@ -219,6 +255,16 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
 
     fn str_(rt int, rn int, off int)
         .emit(4177526784 + sh(off // 8, 10) + sh(rn, 5) + rt)
+
+    # 8 байт: [rn + rm * 8]
+    fn ldr_x(rt int, rn int, rm int) = .rrr(4167071744, rt, rn, rm)
+    fn str_x(rt int, rn int, rm int) = .rrr(4162877440, rt, rn, rm)
+
+    # rd = rn + rm * 2**k
+    fn add_lsl(rd int, rn int, rm int, k int) = .rrr(2332033024 + sh(k, 10), rd, rn, rm)
+
+    # rd = младшие 32 бита rn со знаком (результат int из C)
+    fn sxtw(rd int, rn int) = .emit(2470476800 + sh(rn, 5) + rd)
 
     # байт: [rn + rm]
     fn ldrb_r(rt int, rn int, rm int) = .rrr(945842176, rt, rn, rm)
@@ -303,6 +349,8 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
             return t + 4 * .tl[label]
         if k == "c" then return c + .cl[label]
         if k == "d" then return d + .dl[label]
+        if label == "b:#end" then return b + .bss
+        if label == "b:#lo" then return b
         b + .bl[label]
 
     fn resolve(t int, c int, dt int, b int)

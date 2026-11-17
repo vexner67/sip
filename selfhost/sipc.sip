@@ -92,7 +92,7 @@ fn compile_units(file str, std str) [(str, str)]
     cgen.generate_units(c, file, ld, runtime)
 
 fn build_native(file str, std str, out str)
-    ld = modules.Loader(std)
+    ld = modules.Loader(std, native=true)
     body = ld.load_root(file, read(file))
     c = checker.Checker(file, std, ld, tys=[UNIT])
     c.check(body)
