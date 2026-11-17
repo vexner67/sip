@@ -1,6 +1,6 @@
 # Собственный бэкенд: проверенная программа -> машинный код arm64 -> Mach-O (без C, clang и ld).
 #
-# Подмножество: int, bool, str и списки (значение — регистр: число или адрес объекта), функции до 8
+# Подмножество: int, bool, str, списки, кортежи и record (значение — регистр: число или адрес объекта), функции до 8
 # аргументов, рекурсия, if/while/for по range, списку и строке, break/continue, return, print. Арифметика
 # проверяется так же, как в C-бэкенде: переполнение — OverflowError, деление и остаток — с округлением
 # вниз и ошибкой при нуле, индекс — IndexError; текст ошибки (файл:строка, вид, строка исходника)
@@ -44,7 +44,7 @@ INLINE_SIZE = 40  # узлов в теле встраиваемой функци
 INLINE_DEPTH = 3
 # встроенные функции рантайма nrt без вызова (команды на месте)
 PURE = ["sip_n_ld", "sip_n_st", "sip_n_ldb", "sip_n_stb", "sip_n_state", "sip_n_chars", "sip_n_addr",
-        "sip_n_stack_top", "sip_n_bss_lo", "sip_n_bss_hi"]
+        "sip_n_stack_top", "sip_n_bss_lo", "sip_n_bss_hi", "sip_n_cbase"]
 IMPORTS = ["write", "exit", "mmap", "memmove", "memcmp", "bzero", "memchr"]
 
 # имя extern-функции в C ("" — обычная функция)
@@ -221,7 +221,7 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
           frame int = 0, slot_base int = 0, tslot int = 0, facts {str: (int, int)} = {}, fstack [Undo] = [],
           mut {str: bool} = {}, inl [str] = [], shared {str: bool} = {},
           cold [(str, str, str, int, int, int)] = [], inv {str: (int, int)} = {}, cregs {int: int} = {},
-          trusted bool = false)
+          trusted bool = false, kinds {str: int} = {}, words {int: bool} = {})
 
     fn no(what str, node N?)
         line = if node == nil then 0 else node.line
@@ -239,9 +239,23 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
     fn scalar(t Ty) bool = t.id == INT.id or t.id == BOOL.id
 
     # значение в одном регистре: int, bool, str или список (адрес объекта)
+    # значение в одном регистре: int, bool или адрес объекта (str, список, кортеж, record)
     fn word(t Ty) bool
         if .scalar(t) or t.id == STR.id then return true
-        t.k == "list" and .word(deep(t.a[0]))
+        if t.k == "list" then return .word(deep(t.a[0]))
+        if t.k == "tuple"
+            for x in t.a
+                if not .word(deep(x)) then return false
+            return true
+        if t.k == "record" and t.base == nil and not t.params
+            if t.id in .words then return .words[t.id]
+            .words[t.id] = true  # рекурсивный тип: пока считаем подходящим
+            ok = true
+            for ft in t.fields.values()
+                if not .word(deep(ft)) then ok = false
+            .words[t.id] = ok
+            return ok
+        false
 
     fn need(n N)
         t = .ty(n)
@@ -251,15 +265,52 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
 
     fn is_list(n N) bool = .ty(n).k == "list"
 
-    # вид значения для рантайма: 0 int, 1 bool, 2 str, 3 + 4 * вид элемента — список
+    # вид значения для рантайма: 0 int, 1 bool, 2 str, иначе 16 + смещение описателя типа в __const
+    # (см. std/nrt.sip)
     fn kind_of(t Ty) int
         if t.id == INT.id then return 0
         if t.id == BOOL.id then return 1
         if t.id == STR.id then return 2
-        3 + 4 * .kind_of(deep(t.a[0]))
+        if .measuring then return 16  # пробный проход пишет в черновой ассемблер: описатели — только в чистовом
+        key = ""
+        if t.k == "record"
+            key = "R{t.id}"
+        elif t.k == "list"
+            key = "L{.kind_of(deep(t.a[0]))}"
+        else
+            key = "T" + ",".join([str(.kind_of(deep(x))) for x in t.a])
+        if key in .kinds then return .kinds[key]
+        label = ""
+        if t.k == "list"
+            label = .a.cwords("ty" + key, [3, .kind_of(deep(t.a[0]))])
+        elif t.k == "tuple"
+            label = .a.cwords("ty" + key, [4, len(t.a)] + [.kind_of(deep(x)) for x in t.a])
+        else
+            fs = [(n, deep(ft)) for n, ft in t.fields.items()]
+            label = .a.cwords("ty" + key, [5, len(fs), 0] + [0 for _x in 0..2 * len(fs) - 1])
+            .kinds[key] = 16 + .a.cl[label]  # до полей: тип может ссылаться на себя
+            .a.cpatch(label, 2, .a.cl[.a.strlit(bytes_of(checker.show(t)))])
+            for i, fp in enumerate(fs)
+                .a.cpatch(label, 3 + 2 * i, .a.cl[.a.strlit(bytes_of(fp[0]))])
+                .a.cpatch(label, 4 + 2 * i, .kind_of(fp[1]))
+        .kinds[key] = 16 + .a.cl[label]
+        .kinds[key]
 
     # флаги данных списка типа t: 2 — элементы не ссылки (сборщик их не сканирует)
     fn lflags(t Ty) int = if .scalar(deep(t.a[0])) then 2 else 0
+
+    # флаги объекта с полями типов ts
+    fn oflags(ts [Ty]) int
+        for x in ts
+            if not .scalar(deep(x)) then return 0
+        2
+
+    # номер поля name в record t
+    fn field_idx(t Ty, name str, node N) int
+        for i, n in enumerate(t.fields.keys())
+            if n == name then return i
+        .no("field {name}", node)
+        0
 
     # функция рантайма nrt
     fn nrt(name str) Fn
@@ -664,7 +715,7 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
                 if not .scalar(.ty(o.kids[1])) or o.kids[0].s == "in" or o.kids[0].s == "not in" then return true
         elif k == "Index"
             if n.s == "slice_str" or n.s == "slice_list" then return true
-        elif k == "ListLit" or k == "ListComp"
+        elif k == "ListLit" or k == "ListComp" or k == "TupleLit"
             return true
         for c in n.kids
             if .has_call(c) then return true
@@ -756,6 +807,12 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
             .index(e, r)
         elif k == "ListLit"
             .list_lit(e, r)
+        elif k == "TupleLit"
+            items = e.kids[0].kids
+            .obj_lit(items, .oflags([.ty(x) for x in items]), r)
+        elif k == "Attr" or k == "SelfAttr"
+            x = .recv(e, r)
+            .a.ldr(r, x, 8 * .field_of(e))
         else
             .no(k, e)
         pass
@@ -830,7 +887,7 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
                 .a.movz(r, 0, 0)
             elif c == 1
                 .a.mov(r, x)
-            elif exact("*", (lo, hi), (c, c))
+            elif exact("*", (lo, hi), (c, c)) or .trusted
                 if c == 2
                     .a.add(r, x, x)
                 elif c == 4
@@ -1004,6 +1061,15 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
             .rcall("list_has", [left, right], [.kind_of(lt)], r)
             .a.cmp_imm(r, 0)
             return if op == "in" then NE else EQ
+        if lt.k == "list" or lt.k == "tuple" or lt.k == "record"
+            if op == "==" or op == "!="
+                .rcall("eq", [left, right], [.kind_of(lt)], r)
+                .a.cmp_imm(r, 0)
+                return if op == "==" then NE else EQ
+            if op == "<" or op == "<=" or op == ">" or op == ">="
+                .rcall("cmp", [left, right], [.kind_of(lt)], r)
+                .a.cmp_imm(r, 0)
+                return cond_of(op)
         if lt.id == STR.id and rt.id == STR.id and op != "is" and op != "is not"
             if op == "==" or op == "!="
                 .rcall("str_eq", [left, right], [], r)
@@ -1148,6 +1214,25 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
         a = .an(e)
         if a.ckind == "bmethod"
             .method(e, r)
+            return
+        if a.ckind == "ctor"
+            rt0: Ty? = a.t
+            if rt0 == nil then .no("this constructor", e)
+            rty: Ty = rt0
+            rty = deep(rty)
+            if rty.k != "record" or not .word(rty) then .no("constructor of {checker.show(rty)}", e)
+            .obj_lit(a.bound, .oflags([x for x in rty.fields.values()]), r)
+            return
+        if a.ckind == "method"
+            fm: Fn = a.f
+            ow: Ty? = fm.owner
+            if ow == nil or fm.allparams or fm.is_async or fm.cache then .no("calling .{fm.name}()", e)
+            owt: Ty = ow
+            if not .word(deep(owt)) then .no("methods of {checker.show(owt)}", e)
+            margs = .opts([e.kids[0].kids[0]] + a.bound)
+            .emit_call("t:" + fm.cname, margs, [], r)
+            if deep(fm.ret).id != UNIT.id then .a.mov(r, 0)
+            .want(fm)
             return
         if a.ckind == "fn" and a.f != nil
             f0: Fn = a.f
@@ -1299,6 +1384,8 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
             .release(x)
         elif name == "sip_n_state"
             .a.addr(r, .a.bslot("nrt", 512))
+        elif name == "sip_n_cbase"
+            .a.adr(r, "c:#base")
         elif name == "sip_n_chars"
             .a.adr(r, .a.chars())
         elif name == "sip_n_addr"
@@ -1510,6 +1597,10 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
             else
                 .rcall_opt("list_slice", sa, [has, .lflags(.ty(obj))], r)
             return
+        if kind == "tuple"
+            x0 = .opnd(obj, r)
+            .a.ldr(r, x0, 8 * .an(e).i)
+            return
         if kind != "str" and kind != "list" then .no("index of {checker.show(.ty(obj))}", e)
         ie = e.kids[1]
         .need(ie)
@@ -1551,6 +1642,62 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
         .a.str_x(y, 16, idx)
         .release(i)
         .release(x)
+
+    # объект из полей items (кортеж, record)
+    fn obj_lit(items [N], flags int, r int)
+        n = len(items)
+        .rcall("obj_new", [], [n, flags], r)
+        if not items then return
+        calls = false
+        for item in items
+            .need(item)
+            if .has_call(item) then calls = true
+        .chk(r + 1, nil)
+        o = .protect(r, calls)
+        for i, item in enumerate(items)
+            y = .opnd(item, r + 1)
+            .a.str_(y, o, 8 * i)
+        .release(o)
+        .mv(r, o)
+
+    # объект record у x.f (Attr) или .f (SelfAttr): регистр с адресом
+    fn recv(e N, r int) int
+        if e.kind == "SelfAttr"
+            f = .cur()
+            return .load_var(f.locals["self"], r)
+        .need(e.kids[0])
+        .opnd(e.kids[0], r)
+
+    # номер поля у x.f или .f
+    fn field_of(e N) int
+        if e.kind == "SelfAttr"
+            ow: Ty = .cur().owner
+            return .field_idx(deep(ow), nm(e), e)
+        t = .ty(e.kids[0])
+        if t.k != "record" then .no("attribute of {checker.show(t)}", e)
+        .field_idx(t, e.kids[1].s, e)
+
+    # x.f = v или .f = v
+    fn set_field(t N, v N)
+        .need(v)
+        idx = .field_of(t)
+        y = .opnd(v, T0)
+        y = .protect(y, t.kind == "Attr" and .has_call(t.kids[0]))
+        .chk(T0 + 1, t)
+        x = .recv(t, T0 + 1)
+        .a.str_(y, x, 8 * idx)
+        .release(y)
+
+    # a, b = выражение-кортеж
+    fn unpack(names [N], v N)
+        .need(v)
+        x = .opnd(v, T0)
+        .chk(T0 + 1, v)
+        for i, nt in enumerate(names)
+            if nt.kind != "Name" then .no("this assignment", nt)
+            if nt.an == 0 or .an(nt).var == nil then continue
+            .a.ldr(T0 + 1, x, 8 * i)
+            .store_var(.var_of(nt), T0 + 1)
 
     # l[i] = значение из регистра y; l и i — без вызовов, считаются в sc и sc + 1
     fn store_index(t N, y int, sc int)
@@ -1733,6 +1880,12 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
             if len(targets) == 1 and targets[0].kind == "Index"
                 .set_index(targets[0], s.kids[1])
                 return
+            if len(targets) == 1 and (targets[0].kind == "Attr" or targets[0].kind == "SelfAttr")
+                .set_field(targets[0], s.kids[1])
+                return
+            if len(targets) == 1 and targets[0].kind == "TupleLit"
+                .unpack(targets[0].kids[0].kids, s.kids[1])
+                return
             if len(targets) != 1 or targets[0].kind != "Name" then .no("this assignment", s)
             .need(s.kids[1])
             .need(targets[0])
@@ -1754,6 +1907,13 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
                 .need(b)  # l[i] op= v: l и i без вызовов вычисляются ещё раз для записи
                 .gen(b, T0)
                 .store_index(t, T0, T0 + 1)
+                return
+            if (t.kind == "Attr" or t.kind == "SelfAttr") and (t.kind == "SelfAttr" or not .has_call(t.kids[0]))
+                .need(b)  # x.f op= v: x без вызовов вычисляется ещё раз для записи
+                .gen(b, T0)
+                .chk(T0 + 1, t)
+                x = .recv(t, T0 + 1)
+                .a.str_(T0, x, 8 * .field_of(t))
                 return
             if t.kind != "Name" then .no("this assignment", s)
             .need(t)
@@ -2081,10 +2241,11 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
     # for x in список или строка: индекс k, длина читается на каждом витке (как в C)
     fn for_seq(s N)
         it = s.kids[1]
-        if s.kids[0].kind != "Name" then .no("this loop target", s.kids[0])
+        tup = s.kids[0].kind == "TupleLit"
+        if s.kids[0].kind != "Name" and not tup then .no("this loop target", s.kids[0])
         .need(it)
         kv, hv = .hidden()
-        target = .var_of(s.kids[0])
+        target = if tup then hv else .var_of(s.kids[0])
         is_s = .an(s).kind == "str"
         .gen(it, T0)
         .store_var(hv, T0)
@@ -2098,7 +2259,7 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
         .a.here(ltop)
         q = .load_var(hv, T0)
         k = .load_var(kv, T0 + 1)
-        tr = .target_reg(target)
+        tr = if tup then T0 + 2 else .target_reg(target)
         if tr == T0 then tr = T0 + 2
         if is_s
             .a.add(16, q, k)
@@ -2108,7 +2269,14 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
         else
             .a.ldr(16, q, 16)
             .a.ldr_x(tr, 16, k)
-        .store_var(target, tr)
+        if tup  # for a, b in список кортежей
+            for i, nt in enumerate(s.kids[0].kids[0].kids)
+                if nt.kind != "Name" then .no("this loop target", nt)
+                if nt.an == 0 or .an(nt).var == nil then continue
+                .a.ldr(16, tr, 8 * i)
+                .store_var(.var_of(nt), 16)
+        else
+            .store_var(target, tr)
         .brk.append(lend)
         .cont.append(lnext)
         .block(s.kids[2].kids)
@@ -2232,9 +2400,11 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
         for s in fi.body
             .assigned_in(s, .mut)
         names: [Var] = []
+        if fi.owner != nil then names.append(fi.locals["self"])  # self — первый аргумент метода
         for p in fi.params
             if not .word(deep(p.ty)) then .no("parameter type {checker.show(deep(p.ty))}", fi.node)
             names.append(fi.locals[p.name])
+        nargs = len(names)
         for v in fi.locals.values()
             if v.kind == "local"
                 if not .word(deep(v.ty)) then .no("variable type {checker.show(deep(v.ty))}", fi.node)
@@ -2252,11 +2422,11 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
             names.append(Var("#hi", INT, "local", "#hi{i}"))
         pool: [int] = []
         if leaf
-            for i in 0..len(fi.params) - 1
+            for i in 0..nargs - 1
                 pool.append(i)
             pool.append(8)
             i = 7
-            while i >= len(fi.params)
+            while i >= nargs
                 pool.append(i)
                 i -= 1
         .nvreg = 0
@@ -2290,8 +2460,8 @@ type NGen(c checker.Checker, ld modules.Loader, file str, a Asm, homes {str: Hom
         .tslot = .slot_base + 8 * .nslots
         .a.here(label)
         .prologue()
-        for i, p in enumerate(fi.params)
-            .store_var(fi.locals[p.name], i)
+        for i in 0..nargs - 1
+            .store_var(names[i], i)
         for cv, reg in .cregs.items()
             .a.mov_imm(reg, cv)
         .block(fi.body)

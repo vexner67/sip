@@ -33,6 +33,15 @@ LE = 13
 
 fn sh(x int, n int) int = x * P2[n]
 
+# 8 байт числа w, младший первым (w может быть отрицательным)
+fn le64(w int) [int]
+    out: [int] = []
+    v = w
+    for i in 0..7
+        out.append(v & 255)
+        v = (v - (v & 255)) // 256
+    out
+
 type Fix(at int, label str, kind str)
 
 type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [], cl {str: int} = {},
@@ -68,6 +77,23 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
             .consts.append((n // P2[8 * i]) & 255)
         .consts.extend(bytes)
         key
+
+    # слова (8 байт, младший байт первым) в __TEXT,__const под меткой "c:" + key; смещение — .cl[метка]
+    fn cwords(key str, words [int]) str
+        label = "c:" + key
+        while len(.consts) % 8 != 0
+            .consts.append(0)
+        .cl[label] = len(.consts)
+        for w in words
+            .consts.extend(le64(w))
+        label
+
+    # заменить слово i данных метки label
+    fn cpatch(label str, i int, w int)
+        at = .cl[label] + 8 * i
+        bs = le64(w)
+        for j in 0..7
+            .consts[at + j] = bs[j]
 
     # 256 строк из одного байта по 16 байт: s[i] без выделения памяти
     fn chars() str
@@ -347,6 +373,7 @@ type Asm(code [int] = [], tl {str: int} = {}, fixes [Fix] = [], consts [int] = [
         if k == "t"
             if label not in .tl then fail ValueError("undefined label {label}")
             return t + 4 * .tl[label]
+        if label == "c:#base" then return c
         if k == "c" then return c + .cl[label]
         if k == "d" then return d + .dl[label]
         if label == "b:#end" then return b + .bss

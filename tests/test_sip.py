@@ -1955,6 +1955,12 @@ class NativeTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("['b', 'a', 'c', 'd'] True False ['a', 'c']", out)
 
+    def test_records(self):
+        """кортежи и record: поля, методы, рекурсивные типы, распаковка, ==, <, in, печать"""
+        out, _, rc = self.both((ROOT / "tests" / "native_records.sip").read_text())
+        self.assertEqual(rc, 0)
+        self.assertIn("Bag(name='b', items=['apple', 'kiwi'], counts=[5, 4]) 9 2", out)
+
     def test_gc(self):
         """сборщик мусора: память переиспользуется, живые объекты (стек, глобальные, вложенные) целы"""
         out, _, rc = self.both((ROOT / "tests" / "native_gc.sip").read_text())

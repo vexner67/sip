@@ -34,6 +34,12 @@ extern "sip" fn _stack_top() int = sip_n_stack_top
 extern "sip" fn _bss_lo() int = sip_n_bss_lo
 extern "sip" fn _bss_hi() int = sip_n_bss_hi
 extern "sip" fn _die(s int) = sip_n_die  # текст ошибки (строка) в stderr, exit(1)
+extern "sip" fn _cbase() int = sip_n_cbase  # начало __const: там описатели типов
+
+# Вид значения (kind) — для печати, == и <: 0 int, 1 bool, 2 str, иначе kind - 16 — смещение описателя
+# типа в __const. Описатель — слова: список [3, вид элемента]; кортеж [4, n, виды...];
+# record [5, n, смещение имени, (смещение имени поля, вид) * n]. Смещения строк — тоже от начала __const.
+fn _desc(kind int) int = _cbase() + kind - 16
 
 fn _heap_bytes() int = 17179869184  # 16 ГБ адресов: память берётся у системы по мере касания
 
@@ -415,21 +421,41 @@ fn sb_done(b int) int
     _move(r + 8, _ld(b + 16), n)
     r
 
-# запись значения; вид: 0 int, 1 bool, 2 str, 3 + 4 * вид элемента — список
+# запись значения вида kind (как str())
 fn sb_val(b int, v int, kind int)
-    k = kind % 4
-    if k == 0
+    if kind == 0
         sb_put(b, of_int(v))
-    elif k == 1
+    elif kind == 1
         sb_put(b, if v != 0 then _a("True") else _a("False"))
-    elif k == 2
+    elif kind == 2
         sb_put(b, v)
     else
-        sb_list(b, v, kind // 4)
+        d = _desc(kind)
+        tag = _ld(d)
+        if tag == 3
+            sb_list(b, v, _ld(d + 8))
+        elif tag == 4
+            n = _ld(d + 8)
+            sb_byte(b, 40)
+            for i in 0..n - 1
+                if i > 0 then sb_put(b, _a(", "))
+                sb_repr(b, _ld(v + 8 * i), _ld(d + 16 + 8 * i))
+            if n == 1 then sb_byte(b, 44)
+            sb_byte(b, 41)
+        else
+            n = _ld(d + 8)
+            sb_put(b, _cbase() + _ld(d + 16))
+            sb_byte(b, 40)
+            for i in 0..n - 1
+                if i > 0 then sb_put(b, _a(", "))
+                sb_put(b, _cbase() + _ld(d + 24 + 16 * i))
+                sb_byte(b, 61)
+                sb_repr(b, _ld(v + 8 * i), _ld(d + 32 + 16 * i))
+            sb_byte(b, 41)
     pass
 
 fn sb_repr(b int, v int, kind int)
-    if kind % 4 == 2 then repr_str(b, v) else sb_val(b, v, kind)
+    if kind == 2 then repr_str(b, v) else sb_val(b, v, kind)
 
 fn sb_list(b int, l int, ek int)
     sb_byte(b, 91)
@@ -441,13 +467,61 @@ fn sb_list(b int, l int, ek int)
     sb_byte(b, 93)
 
 fn to_str(v int, kind int) int
-    k = kind % 4
-    if k == 2 then return v
-    if k == 0 then return of_int(v)
-    if k == 1 then return if v != 0 then _a("True") else _a("False")
+    if kind == 2 then return v
+    if kind == 0 then return of_int(v)
+    if kind == 1 then return if v != 0 then _a("True") else _a("False")
     b = sb_new()
-    sb_list(b, v, kind // 4)
+    sb_val(b, v, kind)
     sb_done(b)
+
+# a == b для значений вида kind
+fn eq(a int, b int, kind int) bool
+    if a == b then return true
+    if kind < 2 then return false
+    if kind == 2 then return str_eq(a, b)
+    d = _desc(kind)
+    tag = _ld(d)
+    if tag == 3
+        n = _ld(a)
+        if n != _ld(b) then return false
+        ek = _ld(d + 8)
+        i = 0
+        while i < n
+            if not eq(_ld(_ld(a + 16) + 8 * i), _ld(_ld(b + 16) + 8 * i), ek) then return false
+            i += 1
+        return true
+    n = _ld(d + 8)
+    step = if tag == 4 then 8 else 16
+    at = if tag == 4 then d + 16 else d + 32
+    for i in 0..n - 1
+        if not eq(_ld(a + 8 * i), _ld(b + 8 * i), _ld(at + step * i)) then return false
+    true
+
+# знак сравнения a и b (числа, строки, списки и кортежи — по элементам, как в Python)
+fn cmp(a int, b int, kind int) int
+    if kind < 2
+        if a < b then return -1
+        return if a > b then 1 else 0
+    if kind == 2 then return str_cmp(a, b)
+    d = _desc(kind)
+    if _ld(d) == 3
+        na = _ld(a)
+        nb = _ld(b)
+        ek = _ld(d + 8)
+        i = 0
+        while i < na and i < nb
+            c = cmp(_ld(_ld(a + 16) + 8 * i), _ld(_ld(b + 16) + 8 * i), ek)
+            if c != 0 then return c
+            i += 1
+        return na - nb
+    n = _ld(d + 8)
+    for i in 0..n - 1
+        c = cmp(_ld(a + 8 * i), _ld(b + 8 * i), _ld(d + 16 + 8 * i))
+        if c != 0 then return c
+    0
+
+# объект из n слов (кортеж, record); flags 2 — в нём нет ссылок
+fn obj_new(n int, flags int) int = alloc(8 * n, flags)
 
 # как repr() в Python: кавычки, экранирование
 fn repr_str(b int, s int)
@@ -550,6 +624,6 @@ fn list_has(x int, l int, kind int) bool
     i = 0
     while i < _ld(l)
         y = _ld(_ld(l + 16) + 8 * i)
-        if y == x or (kind == 2 and str_eq(y, x)) then return true
+        if eq(y, x, kind) then return true
         i += 1
     false
